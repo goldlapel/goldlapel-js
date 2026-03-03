@@ -13,14 +13,14 @@ npm install goldlapel
 ## Quick Start
 
 ```js
-const goldlapel = require('goldlapel');
+import goldlapel from 'goldlapel';
 
 // Start the proxy — returns a connection string pointing at Gold Lapel
 const url = await goldlapel.start('postgresql://user:pass@localhost:5432/mydb');
 
 // Use the URL with any Postgres driver
-const { Client } = require('pg');
-const client = new Client({ connectionString: url });
+import pg from 'pg';
+const client = new pg.Client({ connectionString: url });
 await client.connect();
 
 // Or Prisma, Drizzle, Knex, TypeORM — anything that speaks Postgres
@@ -51,7 +51,9 @@ Returns the current proxy URL, or `null` if not running.
 Class interface for managing multiple instances:
 
 ```js
-const proxy = new goldlapel.GoldLapel('postgresql://user:pass@localhost:5432/mydb', { port: 7932 });
+import { GoldLapel } from 'goldlapel';
+
+const proxy = new GoldLapel('postgresql://user:pass@localhost:5432/mydb', { port: 7932 });
 const url = await proxy.start();
 // ...
 proxy.stop();

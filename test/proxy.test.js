@@ -1,22 +1,22 @@
-const { describe, it, before, after } = require('node:test');
-const assert = require('node:assert');
-const net = require('net');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import net from 'net';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
 
-const {
+import {
     GoldLapel,
     stop,
     proxyUrl,
     _findBinary,
     _replacePort,
     _waitForPort,
-} = require('../index');
+} from '../index.js';
 
 
 describe('findBinary', () => {
-    it('finds binary via env var', (t) => {
+    it('finds binary via env var', () => {
         const tmp = path.join(os.tmpdir(), 'goldlapel-test-binary');
         fs.writeFileSync(tmp, '');
 

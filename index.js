@@ -1,14 +1,17 @@
-const { spawn, execFileSync } = require('child_process');
-const { createConnection } = require('net');
-const { existsSync } = require('fs');
-const { join } = require('path');
-const { platform, arch, homedir } = require('os');
+import { spawn, execFileSync } from 'child_process';
+import { createConnection } from 'net';
+import { existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { platform, arch, homedir } from 'os';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_PORT = 7932;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
 
-function findBinary() {
+export function _findBinary() {
     // 1. Explicit override via env var
     const envPath = process.env.GOLDLAPEL_BINARY;
     if (envPath) {
@@ -45,11 +48,11 @@ function findBinary() {
 
     throw new Error(
         'Gold Lapel binary not found. Set GOLDLAPEL_BINARY env var, ' +
-        'install the platform-specific package, or ensure \'goldlapel\' is on PATH.'
+        "install the platform-specific package, or ensure 'goldlapel' is on PATH."
     );
 }
 
-function replacePort(upstream, port) {
+export function _replacePort(upstream, port) {
     try {
         const url = new URL(upstream);
         if (url.protocol === 'postgresql:' || url.protocol === 'postgres:') {
@@ -66,7 +69,7 @@ function replacePort(upstream, port) {
     return `${upstream}:${port}`;
 }
 
-function waitForPort(host, port, timeout) {
+export function _waitForPort(host, port, timeout) {
     return new Promise((resolve) => {
         const deadline = Date.now() + timeout;
 
@@ -96,7 +99,7 @@ function waitForPort(host, port, timeout) {
     });
 }
 
-class GoldLapel {
+export class GoldLapel {
     constructor(upstream, { port, extraArgs } = {}) {
         this._upstream = upstream;
         this._port = port || DEFAULT_PORT;
@@ -110,7 +113,7 @@ class GoldLapel {
             return this._proxyUrl;
         }
 
-        const binary = findBinary();
+        const binary = _findBinary();
         const args = [
             '--upstream', this._upstream,
             '--port', String(this._port),
@@ -124,7 +127,7 @@ class GoldLapel {
         let stderr = '';
         this._process.stderr.on('data', (chunk) => { stderr += chunk; });
 
-        const ready = await waitForPort('127.0.0.1', this._port, STARTUP_TIMEOUT);
+        const ready = await _waitForPort('127.0.0.1', this._port, STARTUP_TIMEOUT);
         if (!ready) {
             this._process.kill();
             throw new Error(
@@ -133,7 +136,7 @@ class GoldLapel {
             );
         }
 
-        this._proxyUrl = replacePort(this._upstream, this._port);
+        this._proxyUrl = _replacePort(this._upstream, this._port);
         return this._proxyUrl;
     }
 
@@ -162,7 +165,7 @@ class GoldLapel {
 // Module-level singleton
 let _instance = null;
 
-async function start(upstream, opts) {
+export async function start(upstream, opts) {
     if (_instance && _instance.running) {
         return _instance.url;
     }
@@ -171,14 +174,14 @@ async function start(upstream, opts) {
     return _instance.start();
 }
 
-function stop() {
+export function stop() {
     if (_instance) {
         _instance.stop();
         _instance = null;
     }
 }
 
-function proxyUrl() {
+export function proxyUrl() {
     return _instance ? _instance.url : null;
 }
 
@@ -189,7 +192,4 @@ function _cleanup() {
     }
 }
 
-module.exports = { GoldLapel, start, stop, proxyUrl };
-module.exports._findBinary = findBinary;
-module.exports._replacePort = replacePort;
-module.exports._waitForPort = waitForPort;
+export default { GoldLapel, start, stop, proxyUrl };
