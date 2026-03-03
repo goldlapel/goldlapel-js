@@ -13,6 +13,9 @@
     "url": "https://github.com/goldlapel/goldlapel-js"
   },
   "homepage": "https://goldlapel.com",
+  "scripts": {
+    "test": "node --test test/"
+  },
   "engines": {
     "node": ">=18.0.0"
   },

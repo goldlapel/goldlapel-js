@@ -10,7 +10,7 @@ import {
     stop,
     proxyUrl,
     _findBinary,
-    _replacePort,
+    _makeProxyUrl,
     _waitForPort,
 } from '../index.js';
 
@@ -50,47 +50,75 @@ describe('findBinary', () => {
 });
 
 
-describe('replacePort', () => {
-    it('replaces port in postgresql URL', () => {
+describe('makeProxyUrl', () => {
+    it('replaces host and port in postgresql URL', () => {
         assert.strictEqual(
-            _replacePort('postgresql://user:pass@localhost:5432/mydb', 7932),
+            _makeProxyUrl('postgresql://user:pass@dbhost:5432/mydb', 7932),
             'postgresql://user:pass@localhost:7932/mydb'
         );
     });
 
-    it('replaces port in postgres URL', () => {
+    it('replaces host and port in postgres URL', () => {
         assert.strictEqual(
-            _replacePort('postgres://user:pass@dbhost:5432/mydb', 7932),
-            'postgres://user:pass@dbhost:7932/mydb'
+            _makeProxyUrl('postgres://user:pass@remote.aws.com:5432/mydb', 7932),
+            'postgres://user:pass@localhost:7932/mydb'
+        );
+    });
+
+    it('handles pg URL without explicit port', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:pass@host.aws.com/mydb', 7932),
+            'postgresql://user:pass@localhost:7932/mydb'
+        );
+    });
+
+    it('handles pg URL without port or path', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:pass@host.aws.com', 7932),
+            'postgresql://user:pass@localhost:7932'
         );
     });
 
     it('replaces port in bare host:port', () => {
-        assert.strictEqual(_replacePort('localhost:5432', 7932), 'localhost:7932');
+        assert.strictEqual(_makeProxyUrl('dbhost:5432', 7932), 'localhost:7932');
     });
 
-    it('appends port to bare host', () => {
-        assert.strictEqual(_replacePort('localhost', 7932), 'localhost:7932');
+    it('replaces bare host', () => {
+        assert.strictEqual(_makeProxyUrl('dbhost', 7932), 'localhost:7932');
     });
 
     it('preserves query params', () => {
         assert.strictEqual(
-            _replacePort('postgresql://user:pass@localhost:5432/mydb?sslmode=require', 7932),
+            _makeProxyUrl('postgresql://user:pass@remote:5432/mydb?sslmode=require', 7932),
             'postgresql://user:pass@localhost:7932/mydb?sslmode=require'
         );
     });
 
     it('preserves percent-encoded characters in password', () => {
         assert.strictEqual(
-            _replacePort('postgresql://user:p%40ss@localhost:5432/mydb', 7932),
+            _makeProxyUrl('postgresql://user:p%40ss@remote:5432/mydb', 7932),
             'postgresql://user:p%40ss@localhost:7932/mydb'
         );
     });
 
     it('handles URL without userinfo', () => {
         assert.strictEqual(
-            _replacePort('postgresql://localhost:5432/mydb', 7932),
+            _makeProxyUrl('postgresql://dbhost:5432/mydb', 7932),
             'postgresql://localhost:7932/mydb'
+        );
+    });
+
+    it('handles URL without userinfo and without port', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://dbhost/mydb', 7932),
+            'postgresql://localhost:7932/mydb'
+        );
+    });
+
+    it('keeps localhost when upstream is already localhost', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:pass@localhost:5432/mydb', 7932),
+            'postgresql://user:pass@localhost:7932/mydb'
         );
     });
 });

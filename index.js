@@ -62,21 +62,30 @@ export function _findBinary() {
     );
 }
 
-export function _replacePort(upstream, port) {
-    // Node's URL class doesn't recognize postgresql:/postgres: as special protocols,
-    // so we use regex to replace the port in the connection string directly.
-    // Match: scheme://[userinfo@]host:PORT[/path][?query]
-    const pgMatch = upstream.match(/^(postgres(?:ql)?:\/\/(?:[^@]*@)?[^:/?#]+):(\d+)(.*)$/);
-    if (pgMatch) {
-        return `${pgMatch[1]}:${port}${pgMatch[3]}`;
+export function _makeProxyUrl(upstream, port) {
+    // Build a proxy URL: replace host with localhost and set the proxy port.
+    // Uses regex instead of URL class to avoid decoding percent-encoded characters
+    // in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
+
+    // pg URL with explicit port: scheme://[userinfo@]host:PORT[/path][?query]
+    const withPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:[^@]*@)?)([^:/?#]+):(\d+)(.*)$/);
+    if (withPort) {
+        return `${withPort[1]}localhost:${port}${withPort[4]}`;
     }
 
-    // bare host:port
-    if (upstream.includes(':')) {
-        const host = upstream.substring(0, upstream.lastIndexOf(':'));
-        return `${host}:${port}`;
+    // pg URL without port: scheme://[userinfo@]host[/path][?query]
+    const noPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:[^@]*@)?)([^:/?#]+)(.*)$/);
+    if (noPort) {
+        return `${noPort[1]}localhost:${port}${noPort[3]}`;
     }
-    return `${upstream}:${port}`;
+
+    // bare host:port (only if not a URL — guard against splitting on scheme colons)
+    if (!upstream.includes('://') && upstream.includes(':')) {
+        return `localhost:${port}`;
+    }
+
+    // bare host
+    return `localhost:${port}`;
 }
 
 export function _waitForPort(host, port, timeout) {
@@ -131,13 +140,21 @@ export class GoldLapel {
         ];
 
         this._process = spawn(binary, args, {
-            stdio: ['ignore', 'pipe', 'pipe'],
+            stdio: ['ignore', 'ignore', 'pipe'],
         });
 
         let stderr = '';
-        this._process.stderr.on('data', (chunk) => { stderr += chunk; });
+        const onData = (chunk) => { stderr += chunk; };
+        this._process.stderr.on('data', onData);
 
-        const ready = await _waitForPort('127.0.0.1', this._port, STARTUP_TIMEOUT);
+        this._process.on('error', (err) => { stderr += err.message; });
+
+        const ready = await Promise.race([
+            _waitForPort('127.0.0.1', this._port, STARTUP_TIMEOUT),
+            new Promise((resolve) => {
+                this._process.on('exit', () => resolve(false));
+            }),
+        ]);
         if (!ready) {
             this._process.kill();
             throw new Error(
@@ -146,7 +163,9 @@ export class GoldLapel {
             );
         }
 
-        this._proxyUrl = _replacePort(this._upstream, this._port);
+        this._process.stderr.removeListener('data', onData);
+
+        this._proxyUrl = _makeProxyUrl(this._upstream, this._port);
         return this._proxyUrl;
     }
 
