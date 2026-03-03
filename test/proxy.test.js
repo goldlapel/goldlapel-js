@@ -182,6 +182,21 @@ describe('GoldLapel class', () => {
         assert.strictEqual(gl.running, false);
         assert.strictEqual(gl.url, null);
     });
+
+    it('stop() is no-op when never started', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        gl.stop();
+        assert.strictEqual(gl.running, false);
+        assert.strictEqual(gl.url, null);
+    });
+
+    it('stop() is idempotent', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        gl.stop();
+        gl.stop();
+        assert.strictEqual(gl.running, false);
+        assert.strictEqual(gl.url, null);
+    });
 });
 
 

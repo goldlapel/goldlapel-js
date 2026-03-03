@@ -2,7 +2,7 @@ import { spawn, execFileSync } from 'child_process';
 import { createConnection } from 'net';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
-import { platform, arch, homedir } from 'os';
+import { platform, arch } from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 
@@ -51,10 +51,6 @@ export function _findBinary() {
         const onPath = execFileSync('which', ['goldlapel'], { encoding: 'utf8' }).trim();
         if (onPath && existsSync(onPath)) return onPath;
     } catch {}
-
-    // 5. Local dev: check the Rust project's build output
-    const devBinary = join(homedir(), 'dev', 'goldlapel', 'target', 'release', 'goldlapel');
-    if (existsSync(devBinary)) return devBinary;
 
     throw new Error(
         'Gold Lapel binary not found. Set GOLDLAPEL_BINARY env var, ' +
@@ -156,6 +152,7 @@ export class GoldLapel {
             }),
         ]);
         if (!ready) {
+            this._process.stderr.removeListener('data', onData);
             this._process.kill();
             throw new Error(
                 `Gold Lapel failed to start on port ${this._port} ` +
