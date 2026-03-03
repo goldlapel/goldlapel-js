@@ -52,16 +52,17 @@ describe('findBinary', () => {
 
 describe('replacePort', () => {
     it('replaces port in postgresql URL', () => {
-        const result = _replacePort('postgresql://user:pass@localhost:5432/mydb', 7932);
-        assert.match(result, /7932/);
-        assert.match(result, /postgresql/);
-        assert.match(result, /user:pass/);
+        assert.strictEqual(
+            _replacePort('postgresql://user:pass@localhost:5432/mydb', 7932),
+            'postgresql://user:pass@localhost:7932/mydb'
+        );
     });
 
     it('replaces port in postgres URL', () => {
-        const result = _replacePort('postgres://user:pass@dbhost:5432/mydb', 7932);
-        assert.match(result, /7932/);
-        assert.match(result, /user:pass/);
+        assert.strictEqual(
+            _replacePort('postgres://user:pass@dbhost:5432/mydb', 7932),
+            'postgres://user:pass@dbhost:7932/mydb'
+        );
     });
 
     it('replaces port in bare host:port', () => {
@@ -73,9 +74,24 @@ describe('replacePort', () => {
     });
 
     it('preserves query params', () => {
-        const result = _replacePort('postgresql://user:pass@localhost:5432/mydb?sslmode=require', 7932);
-        assert.match(result, /7932/);
-        assert.match(result, /sslmode=require/);
+        assert.strictEqual(
+            _replacePort('postgresql://user:pass@localhost:5432/mydb?sslmode=require', 7932),
+            'postgresql://user:pass@localhost:7932/mydb?sslmode=require'
+        );
+    });
+
+    it('preserves percent-encoded characters in password', () => {
+        assert.strictEqual(
+            _replacePort('postgresql://user:p%40ss@localhost:5432/mydb', 7932),
+            'postgresql://user:p%40ss@localhost:7932/mydb'
+        );
+    });
+
+    it('handles URL without userinfo', () => {
+        assert.strictEqual(
+            _replacePort('postgresql://localhost:5432/mydb', 7932),
+            'postgresql://localhost:7932/mydb'
+        );
     });
 });
 
