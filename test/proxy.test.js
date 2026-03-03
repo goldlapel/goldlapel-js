@@ -121,6 +121,27 @@ describe('makeProxyUrl', () => {
             'postgresql://user:pass@localhost:7932/mydb'
         );
     });
+
+    it('handles @ in password with port', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:p@ss@host:5432/mydb', 7932),
+            'postgresql://user:p@ss@localhost:7932/mydb'
+        );
+    });
+
+    it('handles @ in password without port', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:p@ss@host/mydb', 7932),
+            'postgresql://user:p@ss@localhost:7932/mydb'
+        );
+    });
+
+    it('handles @ in password with query params', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue', 7932),
+            'postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue'
+        );
+    });
 });
 
 

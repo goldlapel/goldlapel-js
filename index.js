@@ -68,13 +68,13 @@ export function _makeProxyUrl(upstream, port) {
     // in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
 
     // pg URL with explicit port: scheme://[userinfo@]host:PORT[/path][?query]
-    const withPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:[^@]*@)?)([^:/?#]+):(\d+)(.*)$/);
+    const withPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:.*@)?)([^:/?#]+):(\d+)(.*)$/);
     if (withPort) {
         return `${withPort[1]}localhost:${port}${withPort[4]}`;
     }
 
     // pg URL without port: scheme://[userinfo@]host[/path][?query]
-    const noPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:[^@]*@)?)([^:/?#]+)(.*)$/);
+    const noPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:.*@)?)([^:/?#]+)(.*)$/);
     if (noPort) {
         return `${noPort[1]}localhost:${port}${noPort[3]}`;
     }
