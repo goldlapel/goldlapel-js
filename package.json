@@ -4,12 +4,13 @@
   "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "module",
   "main": "index.js",
+  "files": ["index.js", "bin/", "README.md"],
   "keywords": ["postgres", "proxy", "optimization", "materialized-views", "database"],
   "author": "Stephen Gibson",
   "license": "Proprietary",
   "repository": {
     "type": "git",
-    "url": "https://github.com/goldlapel/goldlapel"
+    "url": "https://github.com/goldlapel/goldlapel-js"
   },
   "homepage": "https://goldlapel.com",
   "engines": {

@@ -2,6 +2,7 @@
   "name": "@goldlapel/linux-arm64",
   "version": "0.1.0",
   "description": "Gold Lapel binary for Linux ARM64",
+  "files": ["goldlapel"],
   "os": ["linux"],
   "cpu": ["arm64"],
   "license": "Proprietary"

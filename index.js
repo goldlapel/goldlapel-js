@@ -63,13 +63,13 @@ export function _findBinary() {
 }
 
 export function _replacePort(upstream, port) {
-    try {
-        const url = new URL(upstream);
-        if (url.protocol === 'postgresql:' || url.protocol === 'postgres:') {
-            url.port = port;
-            return url.toString();
-        }
-    } catch {}
+    // Node's URL class doesn't recognize postgresql:/postgres: as special protocols,
+    // so we use regex to replace the port in the connection string directly.
+    // Match: scheme://[userinfo@]host:PORT[/path][?query]
+    const pgMatch = upstream.match(/^(postgres(?:ql)?:\/\/(?:[^@]*@)?[^:/?#]+):(\d+)(.*)$/);
+    if (pgMatch) {
+        return `${pgMatch[1]}:${port}${pgMatch[3]}`;
+    }
 
     // bare host:port
     if (upstream.includes(':')) {
@@ -112,7 +112,7 @@ export function _waitForPort(host, port, timeout) {
 export class GoldLapel {
     constructor(upstream, { port, extraArgs } = {}) {
         this._upstream = upstream;
-        this._port = port || DEFAULT_PORT;
+        this._port = port ?? DEFAULT_PORT;
         this._extraArgs = extraArgs || [];
         this._process = null;
         this._proxyUrl = null;
@@ -151,16 +151,17 @@ export class GoldLapel {
     }
 
     stop() {
-        if (this._process && this._process.exitCode === null) {
-            this._process.kill('SIGTERM');
+        const proc = this._process;
+        this._process = null;
+        this._proxyUrl = null;
+        if (proc && proc.exitCode === null) {
+            proc.kill('SIGTERM');
             setTimeout(() => {
-                if (this._process && this._process.exitCode === null) {
-                    this._process.kill('SIGKILL');
+                if (proc.exitCode === null) {
+                    proc.kill('SIGKILL');
                 }
             }, 5000);
         }
-        this._process = null;
-        this._proxyUrl = null;
     }
 
     get url() {
@@ -174,13 +175,17 @@ export class GoldLapel {
 
 // Module-level singleton
 let _instance = null;
+let _cleanupRegistered = false;
 
 export async function start(upstream, opts) {
     if (_instance && _instance.running) {
         return _instance.url;
     }
     _instance = new GoldLapel(upstream, opts);
-    process.on('exit', _cleanup);
+    if (!_cleanupRegistered) {
+        process.on('exit', _cleanup);
+        _cleanupRegistered = true;
+    }
     return _instance.start();
 }
 
