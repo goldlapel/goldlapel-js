@@ -14,5 +14,10 @@
   "homepage": "https://goldlapel.com",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "optionalDependencies": {
+    "@goldlapel/linux-x64": "0.1.0",
+    "@goldlapel/linux-arm64": "0.1.0",
+    "@goldlapel/darwin-arm64": "0.1.0"
   }
 }
