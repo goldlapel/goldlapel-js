@@ -14,7 +14,7 @@
   },
   "homepage": "https://goldlapel.com",
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/*.js"
   },
   "engines": {
     "node": ">=18.0.0"

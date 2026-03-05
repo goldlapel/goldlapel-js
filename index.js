@@ -195,6 +195,12 @@ let _cleanupRegistered = false;
 
 export async function start(upstream, opts) {
     if (_instance && _instance.running) {
+        if (_instance._upstream !== upstream) {
+            throw new Error(
+                'Gold Lapel is already running for a different upstream. ' +
+                'Call goldlapel.stop() before starting with a new upstream.'
+            );
+        }
         return _instance.url;
     }
     _instance = new GoldLapel(upstream, opts);
