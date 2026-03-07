@@ -26,11 +26,14 @@ export function _findBinary() {
     const machine = arch();
     const archName = machine === 'x64' ? 'x86_64' : machine === 'arm64' ? 'aarch64' : machine;
 
+    const isWindows = sys === 'win32';
     let binaryName;
     if (sys === 'linux') {
         binaryName = `goldlapel-linux-${archName}`;
     } else if (sys === 'darwin') {
         binaryName = `goldlapel-darwin-${archName}`;
+    } else if (isWindows) {
+        binaryName = `goldlapel-windows-${archName}.exe`;
     } else {
         binaryName = `goldlapel-${sys}-${archName}`;
     }
@@ -39,16 +42,19 @@ export function _findBinary() {
     if (existsSync(bundled)) return bundled;
 
     // 3. Platform-specific npm package (@goldlapel/linux-x64, etc.)
-    const npmPkgName = `@goldlapel/${sys === 'darwin' ? 'darwin' : 'linux'}-${machine}`;
+    const npmPlatform = sys === 'darwin' ? 'darwin' : isWindows ? 'win' : 'linux';
+    const npmPkgName = `@goldlapel/${npmPlatform}-${machine}`;
+    const npmBinaryName = isWindows ? 'goldlapel.exe' : 'goldlapel';
     try {
         const pkgDir = dirname(require.resolve(`${npmPkgName}/package.json`));
-        const npmBinary = join(pkgDir, 'goldlapel');
+        const npmBinary = join(pkgDir, npmBinaryName);
         if (existsSync(npmBinary)) return npmBinary;
     } catch {}
 
     // 4. On PATH
     try {
-        const onPath = execFileSync('which', ['goldlapel'], { encoding: 'utf8' }).trim();
+        const whichCmd = isWindows ? 'where' : 'which';
+        const onPath = execFileSync(whichCmd, [isWindows ? 'goldlapel.exe' : 'goldlapel'], { encoding: 'utf8' }).trim().split('\n')[0].trim();
         if (onPath && existsSync(onPath)) return onPath;
     } catch {}
 

@@ -1,0 +1,9 @@
+{
+  "name": "@goldlapel/win-x64",
+  "version": "0.1.0",
+  "description": "Gold Lapel binary for Windows x64",
+  "files": ["goldlapel.exe"],
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "license": "Proprietary"
+}
