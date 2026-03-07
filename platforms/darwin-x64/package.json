@@ -1,0 +1,9 @@
+{
+  "name": "@goldlapel/darwin-x64",
+  "version": "0.1.0",
+  "description": "Gold Lapel binary for macOS x64 (Intel)",
+  "files": ["goldlapel"],
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "license": "Proprietary"
+}

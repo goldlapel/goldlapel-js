@@ -1,0 +1,10 @@
+{
+  "name": "@goldlapel/linux-arm64-musl",
+  "version": "0.1.0",
+  "description": "Gold Lapel binary for Linux ARM64 (musl)",
+  "files": ["goldlapel"],
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["musl"],
+  "license": "Proprietary"
+}

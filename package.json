@@ -22,7 +22,10 @@
   "optionalDependencies": {
     "@goldlapel/linux-x64": "0.1.0",
     "@goldlapel/linux-arm64": "0.1.0",
+    "@goldlapel/linux-x64-musl": "0.1.0",
+    "@goldlapel/linux-arm64-musl": "0.1.0",
     "@goldlapel/darwin-arm64": "0.1.0",
+    "@goldlapel/darwin-x64": "0.1.0",
     "@goldlapel/win-x64": "0.1.0"
   }
 }

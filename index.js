@@ -13,6 +13,12 @@ const DEFAULT_PORT = 7932;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
 
+export function _isMusl() {
+    const machine = arch();
+    const linkerArch = machine === 'x64' ? 'x86_64' : machine === 'arm64' ? 'aarch64' : machine;
+    return existsSync(`/lib/ld-musl-${linkerArch}.so.1`);
+}
+
 export function _findBinary() {
     // 1. Explicit override via env var
     const envPath = process.env.GOLDLAPEL_BINARY;
@@ -29,7 +35,7 @@ export function _findBinary() {
     const isWindows = sys === 'win32';
     let binaryName;
     if (sys === 'linux') {
-        binaryName = `goldlapel-linux-${archName}`;
+        binaryName = `goldlapel-linux-${archName}${_isMusl() ? '-musl' : ''}`;
     } else if (sys === 'darwin') {
         binaryName = `goldlapel-darwin-${archName}`;
     } else if (isWindows) {
@@ -43,7 +49,8 @@ export function _findBinary() {
 
     // 3. Platform-specific npm package (@goldlapel/linux-x64, etc.)
     const npmPlatform = sys === 'darwin' ? 'darwin' : isWindows ? 'win' : 'linux';
-    const npmPkgName = `@goldlapel/${npmPlatform}-${machine}`;
+    let npmPkgName = `@goldlapel/${npmPlatform}-${machine}`;
+    if (sys === 'linux' && _isMusl()) npmPkgName += '-musl';
     const npmBinaryName = isWindows ? 'goldlapel.exe' : 'goldlapel';
     try {
         const pkgDir = dirname(require.resolve(`${npmPkgName}/package.json`));
