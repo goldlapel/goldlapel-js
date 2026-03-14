@@ -12,6 +12,7 @@ import {
     _findBinary,
     _makeProxyUrl,
     _waitForPort,
+    _configToArgs,
 } from '../index.js';
 
 
@@ -196,6 +197,83 @@ describe('GoldLapel class', () => {
         gl.stop();
         assert.strictEqual(gl.running, false);
         assert.strictEqual(gl.url, null);
+    });
+});
+
+
+describe('configToArgs', () => {
+    it('converts string value to correct flags', () => {
+        const args = _configToArgs({ mode: 'butler' });
+        assert.deepStrictEqual(args, ['--mode', 'butler']);
+    });
+
+    it('converts numeric value to stringified flag', () => {
+        const args = _configToArgs({ poolSize: 10 });
+        assert.deepStrictEqual(args, ['--pool-size', '10']);
+    });
+
+    it('includes flag for boolean true', () => {
+        const args = _configToArgs({ disableMatviews: true });
+        assert.deepStrictEqual(args, ['--disable-matviews']);
+    });
+
+    it('omits flag for boolean false', () => {
+        const args = _configToArgs({ disableMatviews: false });
+        assert.deepStrictEqual(args, []);
+    });
+
+    it('repeats flags for array values', () => {
+        const args = _configToArgs({ replica: ['host1:5432', 'host2:5432'] });
+        assert.deepStrictEqual(args, [
+            '--replica', 'host1:5432',
+            '--replica', 'host2:5432',
+        ]);
+    });
+
+    it('repeats --exclude-tables for array', () => {
+        const args = _configToArgs({ excludeTables: ['logs', 'sessions'] });
+        assert.deepStrictEqual(args, [
+            '--exclude-tables', 'logs',
+            '--exclude-tables', 'sessions',
+        ]);
+    });
+
+    it('throws Error for unknown key', () => {
+        assert.throws(
+            () => _configToArgs({ bogusKey: 'value' }),
+            { name: 'Error', message: /Unknown config keys: bogusKey/ }
+        );
+    });
+
+    it('converts multiple keys to all flags', () => {
+        const args = _configToArgs({ mode: 'butler', poolSize: 5, disablePool: true });
+        assert.ok(args.includes('--mode'));
+        assert.ok(args.includes('butler'));
+        assert.ok(args.includes('--pool-size'));
+        assert.ok(args.includes('5'));
+        assert.ok(args.includes('--disable-pool'));
+    });
+
+    it('returns empty array for empty config', () => {
+        assert.deepStrictEqual(_configToArgs({}), []);
+    });
+
+    it('returns empty array for undefined config', () => {
+        assert.deepStrictEqual(_configToArgs(undefined), []);
+    });
+
+    it('throws TypeError for boolean key with non-boolean value', () => {
+        assert.throws(
+            () => _configToArgs({ disableRewrite: 'yes' }),
+            { name: 'TypeError', message: /expects a boolean, got string/ }
+        );
+    });
+
+    it('config passed through constructor is stored', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            config: { mode: 'butler', disablePool: true },
+        });
+        assert.deepStrictEqual(gl._config, { mode: 'butler', disablePool: true });
     });
 });
 

@@ -13,6 +13,66 @@ const DEFAULT_PORT = 7932;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
 
+const VALID_CONFIG_KEYS = new Set([
+    'mode', 'minPatternCount', 'refreshIntervalSecs', 'patternTtlSecs',
+    'maxTablesPerView', 'maxColumnsPerView', 'deepPaginationThreshold',
+    'reportIntervalSecs', 'resultCacheSize', 'batchCacheSize',
+    'batchCacheTtlSecs', 'redisUrl', 'poolSize', 'poolTimeoutSecs',
+    'poolMode', 'mgmtIdleTimeout', 'fallback', 'readAfterWriteSecs',
+    'n1Threshold', 'n1WindowMs', 'n1CrossThreshold',
+    'tlsCert', 'tlsKey', 'tlsClientCa', 'config', 'dashboardPort',
+    'disableMatviews', 'disableConsolidation', 'disableBtreeIndexes',
+    'disableTrigramIndexes', 'disableExpressionIndexes',
+    'disablePartialIndexes', 'disableRewrite', 'disablePreparedCache',
+    'disableResultCache', 'disableRedisCache', 'disablePool',
+    'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
+    'enableCoalescing', 'replica', 'excludeTables',
+]);
+
+const BOOLEAN_KEYS = new Set([
+    'disableMatviews', 'disableConsolidation', 'disableBtreeIndexes',
+    'disableTrigramIndexes', 'disableExpressionIndexes',
+    'disablePartialIndexes', 'disableRewrite', 'disablePreparedCache',
+    'disableResultCache', 'disableRedisCache', 'disablePool',
+    'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
+    'enableCoalescing',
+]);
+
+const LIST_KEYS = new Set([
+    'replica', 'excludeTables',
+]);
+
+export function _configToArgs(config) {
+    if (!config || Object.keys(config).length === 0) return [];
+
+    const unknown = Object.keys(config).filter(k => !VALID_CONFIG_KEYS.has(k));
+    if (unknown.length > 0) {
+        throw new Error(`Unknown config keys: ${unknown.sort().join(', ')}`);
+    }
+
+    const args = [];
+    for (const [key, value] of Object.entries(config)) {
+        const flag = '--' + key.replace(/[A-Z]/g, m => '-' + m.toLowerCase());
+
+        if (BOOLEAN_KEYS.has(key)) {
+            if (typeof value !== 'boolean') {
+                throw new TypeError(
+                    `Config key '${key}' expects a boolean, got ${typeof value}`
+                );
+            }
+            if (value) args.push(flag);
+        } else if (LIST_KEYS.has(key)) {
+            for (const item of value) {
+                args.push(flag, String(item));
+            }
+        } else {
+            args.push(flag, String(value));
+        }
+    }
+
+    return args;
+}
+
 export function _isMusl() {
     const machine = arch();
     const linkerArch = machine === 'x64' ? 'x86_64' : machine === 'arm64' ? 'aarch64' : machine;
@@ -128,9 +188,10 @@ export function _waitForPort(host, port, timeout) {
 }
 
 export class GoldLapel {
-    constructor(upstream, { port, extraArgs } = {}) {
+    constructor(upstream, { port, config, extraArgs } = {}) {
         this._upstream = upstream;
         this._port = port ?? DEFAULT_PORT;
+        this._config = config || {};
         this._extraArgs = extraArgs || [];
         this._process = null;
         this._proxyUrl = null;
@@ -145,6 +206,7 @@ export class GoldLapel {
         const args = [
             '--upstream', this._upstream,
             '--port', String(this._port),
+            ..._configToArgs(this._config),
             ...this._extraArgs,
         ];
 
@@ -242,4 +304,4 @@ function _cleanup() {
     }
 }
 
-export default { GoldLapel, start, stop, proxyUrl };
+export default { GoldLapel, start, stop, proxyUrl, _configToArgs };
