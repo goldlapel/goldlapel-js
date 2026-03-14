@@ -36,6 +36,7 @@ Starts the Gold Lapel proxy and returns the proxy connection string. Returns a P
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `opts.port` — proxy port (default: 7932)
+- `opts.config` — config object (see [Configuration](#configuration))
 - `opts.extraArgs` — additional CLI flags passed to the binary (e.g. `['--threshold-impact', '5000']`)
 
 ### `goldlapel.stop()`
@@ -61,7 +62,35 @@ proxy.stop();
 
 ## Configuration
 
-The proxy binary accepts all standard Gold Lapel flags. Pass them via `extraArgs`:
+Pass a config object to configure the proxy:
+
+```js
+import goldlapel from 'goldlapel'
+
+const url = await goldlapel.start('postgresql://user:pass@localhost/mydb', {
+  config: {
+    mode: 'butler',
+    poolSize: 50,
+    disableMatviews: true,
+    replica: ['postgresql://user:pass@replica1/mydb'],
+  },
+})
+```
+
+Keys use `camelCase` and map to CLI flags (`poolSize` → `--pool-size`). Boolean keys are flags — `true` enables them. Array keys produce repeated flags.
+
+Unknown keys throw immediately. To see all valid keys:
+
+```js
+import { configKeys } from 'goldlapel'
+console.log(configKeys())
+```
+
+For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
+
+### Raw CLI flags
+
+You can also pass raw CLI flags via `extraArgs`:
 
 ```js
 const url = await goldlapel.start(

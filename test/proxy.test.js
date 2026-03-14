@@ -9,6 +9,7 @@ import {
     GoldLapel,
     stop,
     proxyUrl,
+    configKeys,
     _findBinary,
     _makeProxyUrl,
     _waitForPort,
@@ -274,6 +275,23 @@ describe('configToArgs', () => {
             config: { mode: 'butler', disablePool: true },
         });
         assert.deepStrictEqual(gl._config, { mode: 'butler', disablePool: true });
+    });
+});
+
+
+describe('configKeys', () => {
+    it('returns a Set of valid config keys', () => {
+        const keys = configKeys();
+        assert.ok(keys instanceof Set);
+        assert.ok(keys.has('mode'));
+        assert.ok(keys.has('poolSize'));
+        assert.strictEqual(keys.size, 43);
+    });
+
+    it('returns a new Set each call (not the internal reference)', () => {
+        const a = configKeys();
+        const b = configKeys();
+        assert.notStrictEqual(a, b);
     });
 });
 

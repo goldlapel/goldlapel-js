@@ -42,6 +42,10 @@ const LIST_KEYS = new Set([
     'replica', 'excludeTables',
 ]);
 
+export function configKeys() {
+    return new Set(VALID_CONFIG_KEYS);
+}
+
 export function _configToArgs(config) {
     if (!config || Object.keys(config).length === 0) return [];
 
@@ -304,4 +308,4 @@ function _cleanup() {
     }
 }
 
-export default { GoldLapel, start, stop, proxyUrl, _configToArgs };
+export default { GoldLapel, start, stop, proxyUrl, configKeys, _configToArgs };
