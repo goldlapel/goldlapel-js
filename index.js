@@ -10,6 +10,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 const DEFAULT_PORT = 7932;
+const DEFAULT_DASHBOARD_PORT = 7933;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
 
@@ -195,6 +196,9 @@ export class GoldLapel {
     constructor(upstream, { port, config, extraArgs } = {}) {
         this._upstream = upstream;
         this._port = port ?? DEFAULT_PORT;
+        this._dashboardPort = config && config.dashboardPort !== undefined
+            ? Number(config.dashboardPort)
+            : DEFAULT_DASHBOARD_PORT;
         this._config = config || {};
         this._extraArgs = extraArgs || [];
         this._process = null;
@@ -242,6 +246,13 @@ export class GoldLapel {
         this._process.stderr.removeListener('data', onData);
 
         this._proxyUrl = _makeProxyUrl(this._upstream, this._port);
+
+        if (this._dashboardPort) {
+            console.log(`goldlapel → :${this._port} (proxy) | http://127.0.0.1:${this._dashboardPort} (dashboard)`);
+        } else {
+            console.log(`goldlapel → :${this._port} (proxy)`);
+        }
+
         return this._proxyUrl;
     }
 
@@ -265,6 +276,13 @@ export class GoldLapel {
 
     get running() {
         return this._process !== null && this._process.exitCode === null;
+    }
+
+    get dashboardUrl() {
+        if (this._dashboardPort && this._process && !this._process.killed) {
+            return `http://127.0.0.1:${this._dashboardPort}`;
+        }
+        return null;
     }
 }
 
@@ -301,6 +319,10 @@ export function proxyUrl() {
     return _instance ? _instance.url : null;
 }
 
+export function dashboardUrl() {
+    return _instance ? _instance.dashboardUrl : null;
+}
+
 function _cleanup() {
     if (_instance) {
         _instance.stop();
@@ -308,4 +330,4 @@ function _cleanup() {
     }
 }
 
-export default { GoldLapel, start, stop, proxyUrl, configKeys, _configToArgs };
+export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };

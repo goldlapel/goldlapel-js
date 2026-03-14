@@ -9,6 +9,7 @@ import {
     GoldLapel,
     stop,
     proxyUrl,
+    dashboardUrl,
     configKeys,
     _findBinary,
     _makeProxyUrl,
@@ -198,6 +199,39 @@ describe('GoldLapel class', () => {
         gl.stop();
         assert.strictEqual(gl.running, false);
         assert.strictEqual(gl.url, null);
+    });
+});
+
+
+describe('dashboardUrl', () => {
+    it('default dashboard port is 7933', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.strictEqual(gl._dashboardPort, 7933);
+    });
+
+    it('custom port from config', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            config: { dashboardPort: 8080 },
+        });
+        assert.strictEqual(gl._dashboardPort, 8080);
+    });
+
+    it('port 0 means disabled (dashboardUrl returns null)', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            config: { dashboardPort: 0 },
+        });
+        assert.strictEqual(gl._dashboardPort, 0);
+        assert.strictEqual(gl.dashboardUrl, null);
+    });
+
+    it('not running returns null', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.strictEqual(gl.dashboardUrl, null);
+    });
+
+    it('module-level dashboardUrl returns null when not started', () => {
+        stop();
+        assert.strictEqual(dashboardUrl(), null);
     });
 });
 

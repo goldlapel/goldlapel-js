@@ -28,6 +28,13 @@ await client.connect();
 
 Gold Lapel is driver-agnostic. `start()` returns a connection string (`postgresql://...@localhost:7932/...`) that works with any Postgres driver or ORM.
 
+After startup, Gold Lapel prints a one-line summary and serves a dashboard at `http://127.0.0.1:7933` by default:
+
+```js
+const dashUrl = goldlapel.dashboardUrl();
+// => "http://127.0.0.1:7933" (or null if not running / dashboard disabled)
+```
+
 ## API
 
 ### `goldlapel.start(upstream, opts)`
@@ -46,6 +53,10 @@ Stops the proxy. Also called automatically on process exit.
 ### `goldlapel.proxyUrl()`
 
 Returns the current proxy URL, or `null` if not running.
+
+### `goldlapel.dashboardUrl()`
+
+Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `null` if not running or the dashboard is disabled (`dashboardPort: 0`).
 
 ### `new goldlapel.GoldLapel(upstream, opts)`
 
