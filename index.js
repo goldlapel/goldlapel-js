@@ -240,8 +240,11 @@ export class GoldLapel {
             ...this._extraArgs,
         ];
 
+        const env = { ...process.env };
+        if (!env.GOLDLAPEL_CLIENT) env.GOLDLAPEL_CLIENT = 'node';
         this._process = spawn(binary, args, {
             stdio: ['ignore', 'ignore', 'pipe'],
+            env,
         });
 
         let stderr = '';
