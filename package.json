@@ -4,7 +4,10 @@
   "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "module",
   "main": "index.js",
-  "files": ["index.js", "bin/", "README.md"],
+  "files": ["index.js", "cli.js", "bin/", "README.md"],
+  "bin": {
+    "goldlapel": "cli.js"
+  },
   "keywords": ["postgres", "proxy", "optimization", "materialized-views", "database"],
   "author": "Stephen Gibson",
   "license": "Proprietary",
