@@ -145,6 +145,34 @@ describe('makeProxyUrl', () => {
             'postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue'
         );
     });
+
+    it('handles password starting with digits without explicit port', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:1pass@host/mydb', 7932),
+            'postgresql://user:1pass@localhost:7932/mydb'
+        );
+    });
+
+    it('handles all-digit password without explicit port', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:5432@host/mydb', 7932),
+            'postgresql://user:5432@localhost:7932/mydb'
+        );
+    });
+
+    it('handles password starting with digits with explicit port', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:9999@host:5432/mydb', 7932),
+            'postgresql://user:9999@localhost:7932/mydb'
+        );
+    });
+
+    it('handles all-digit password without port or path', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://user:12345@host', 7932),
+            'postgresql://user:12345@localhost:7932'
+        );
+    });
 });
 
 
@@ -229,6 +257,20 @@ describe('dashboardUrl', () => {
         assert.strictEqual(gl.dashboardUrl, null);
     });
 
+    it('returns null when process exited on its own', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        // Simulate a process that exited naturally (not via .kill())
+        gl._process = { exitCode: 1, killed: false, kill() {} };
+        assert.strictEqual(gl.dashboardUrl, null);
+    });
+
+    it('returns URL when process is still running', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        // Simulate a running process
+        gl._process = { exitCode: null, killed: false, kill() {} };
+        assert.strictEqual(gl.dashboardUrl, 'http://127.0.0.1:7933');
+    });
+
     it('module-level dashboardUrl returns null when not started', () => {
         stop();
         assert.strictEqual(dashboardUrl(), null);
@@ -301,6 +343,23 @@ describe('configToArgs', () => {
         assert.throws(
             () => _configToArgs({ disableRewrite: 'yes' }),
             { name: 'TypeError', message: /expects a boolean, got string/ }
+        );
+    });
+
+    it('wraps string value in array for list keys (replica)', () => {
+        const args = _configToArgs({ replica: 'host1:5432' });
+        assert.deepStrictEqual(args, ['--replica', 'host1:5432']);
+    });
+
+    it('wraps string value in array for list keys (excludeTables)', () => {
+        const args = _configToArgs({ excludeTables: 'logs' });
+        assert.deepStrictEqual(args, ['--exclude-tables', 'logs']);
+    });
+
+    it('throws TypeError for non-array non-string list key value', () => {
+        assert.throws(
+            () => _configToArgs({ replica: 42 }),
+            { name: 'TypeError', message: /expects an array or string, got number/ }
         );
     });
 

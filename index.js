@@ -67,7 +67,13 @@ export function _configToArgs(config) {
             }
             if (value) args.push(flag);
         } else if (LIST_KEYS.has(key)) {
-            for (const item of value) {
+            const items = typeof value === 'string' ? [value] : value;
+            if (!Array.isArray(items)) {
+                throw new TypeError(
+                    `Config key '${key}' expects an array or string, got ${typeof value}`
+                );
+            }
+            for (const item of items) {
                 args.push(flag, String(item));
             }
         } else {
@@ -141,16 +147,32 @@ export function _makeProxyUrl(upstream, port) {
     // Uses regex instead of URL class to avoid decoding percent-encoded characters
     // in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
 
-    // pg URL with explicit port: scheme://[userinfo@]host:PORT[/path][?query]
-    const withPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:.*@)?)([^:/?#]+):(\d+)(.*)$/);
-    if (withPort) {
-        return `${withPort[1]}localhost:${port}${withPort[4]}`;
-    }
+    // Split userinfo from host at the LAST @ (passwords may contain literal @).
+    // This two-step approach avoids backtracking issues where (?:.*@)? is optional
+    // and the regex engine drops the @ anchor, misinterpreting password digits as a port.
+    const schemeMatch = upstream.match(/^(postgres(?:ql)?:\/\/)(.*)/);
+    if (schemeMatch) {
+        const scheme = schemeMatch[1];
+        const rest = schemeMatch[2];
 
-    // pg URL without port: scheme://[userinfo@]host[/path][?query]
-    const noPort = upstream.match(/^(postgres(?:ql)?:\/\/(?:.*@)?)([^:/?#]+)(.*)$/);
-    if (noPort) {
-        return `${noPort[1]}localhost:${port}${noPort[3]}`;
+        // The authority ends at the first / ? or # — only look for @ within it
+        const authEnd = rest.search(/[/?#]/);
+        const authority = authEnd === -1 ? rest : rest.slice(0, authEnd);
+        const pathEtc = authEnd === -1 ? '' : rest.slice(authEnd);
+
+        // Find the last @ within the authority to split userinfo from host
+        const atIdx = authority.lastIndexOf('@');
+        let userinfo, hostPart;
+        if (atIdx !== -1) {
+            userinfo = authority.slice(0, atIdx + 1);  // includes trailing @
+            hostPart = authority.slice(atIdx + 1);
+        } else {
+            userinfo = '';
+            hostPart = authority;
+        }
+
+        // Replace host[:port] with localhost:proxyPort
+        return `${scheme}${userinfo}localhost:${port}${pathEtc}`;
     }
 
     // bare host:port (only if not a URL — guard against splitting on scheme colons)
@@ -279,7 +301,7 @@ export class GoldLapel {
     }
 
     get dashboardUrl() {
-        if (this._dashboardPort && this._process && !this._process.killed) {
+        if (this._dashboardPort && this._process && this._process.exitCode === null) {
             return `http://127.0.0.1:${this._dashboardPort}`;
         }
         return null;
