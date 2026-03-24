@@ -22,16 +22,6 @@ const conn = goldlapel.start('postgresql://user:pass@localhost:5432/mydb');
 const result = conn.query('SELECT * FROM users WHERE id = $1', [42]);
 ```
 
-For async applications:
-
-```js
-import goldlapel from 'goldlapel';
-
-const conn = await goldlapel.startAsync('postgresql://user:pass@localhost:5432/mydb');
-
-const result = await conn.query('SELECT * FROM users WHERE id = $1', [42]);
-```
-
 After startup, Gold Lapel prints a one-line summary and serves a dashboard at `http://127.0.0.1:7933` by default:
 
 ```js
@@ -49,10 +39,6 @@ Starts the Gold Lapel proxy and returns a database connection with L1 cache.
 - `opts.port` — proxy port (default: 7932)
 - `opts.config` — config object (see [Configuration](#configuration))
 - `opts.extraArgs` — additional CLI flags passed to the binary (e.g. `['--threshold-impact', '5000']`)
-
-### `goldlapel.startAsync(upstream, opts)`
-
-Async version of `start()`. Returns a Promise that resolves to an async database connection with L1 cache.
 
 ### `goldlapel.stop()`
 
@@ -74,7 +60,7 @@ Class interface for managing multiple instances:
 import { GoldLapel } from 'goldlapel';
 
 const proxy = new GoldLapel('postgresql://user:pass@localhost:5432/mydb', { port: 7932 });
-const conn = await proxy.startAsync();
+const conn = await proxy.start();
 // ...
 proxy.stop();
 ```
@@ -86,7 +72,7 @@ Pass a config object to configure the proxy:
 ```js
 import goldlapel from 'goldlapel'
 
-const conn = await goldlapel.startAsync('postgresql://user:pass@localhost/mydb', {
+const conn = await goldlapel.start('postgresql://user:pass@localhost/mydb', {
   config: {
     mode: 'butler',
     poolSize: 50,
@@ -112,7 +98,7 @@ For the full configuration reference, see the [main documentation](https://githu
 You can also pass raw CLI flags via `extraArgs`:
 
 ```js
-const conn = await goldlapel.startAsync(
+const conn = await goldlapel.start(
     'postgresql://user:pass@localhost:5432/mydb',
     { extraArgs: ['--threshold-duration-ms', '200', '--refresh-interval-secs', '30'] }
 );
