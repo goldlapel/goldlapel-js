@@ -4,7 +4,7 @@
   "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "module",
   "main": "index.js",
-  "files": ["index.js", "cli.js", "bin/", "README.md"],
+  "files": ["index.js", "cli.js", "cache.js", "wrap.js", "bin/", "README.md"],
   "bin": {
     "goldlapel": "cli.js"
   },

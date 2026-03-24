@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from 'child_process';
+import { NativeCache } from './cache.js';
 import { createConnection } from 'net';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
@@ -28,6 +29,7 @@ const VALID_CONFIG_KEYS = new Set([
     'disableResultCache', 'disablePool',
     'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
     'enableCoalescing', 'replica', 'excludeTables',
+    'invalidationPort',
 ]);
 
 const BOOLEAN_KEYS = new Set([
@@ -323,14 +325,29 @@ export async function start(upstream, opts) {
                 'Call goldlapel.stop() before starting with a new upstream.'
             );
         }
-        return _instance.url;
+        return _instance._wrappedClient || _instance.url;
     }
     _instance = new GoldLapel(upstream, opts);
     if (!_cleanupRegistered) {
         process.on('exit', _cleanup);
         _cleanupRegistered = true;
     }
-    return _instance.start();
+    const url = await _instance.start();
+
+    // Auto-detect pg and return wrapped client with L1 cache
+    try {
+        const pg = await import('pg');
+        const Client = pg.default?.Client ?? pg.Client;
+        const { wrap } = await import('./wrap.js');
+        const client = new Client({ connectionString: url });
+        await client.connect();
+        const invPort = opts?.config?.invalidationPort ?? (_instance._port + 2);
+        const wrapped = wrap(client, invPort);
+        _instance._wrappedClient = wrapped;
+        return wrapped;
+    } catch {
+        return url;
+    }
 }
 
 export function stop() {
@@ -338,6 +355,7 @@ export function stop() {
         _instance.stop();
         _instance = null;
     }
+    NativeCache._reset();
 }
 
 export function proxyUrl() {
@@ -354,5 +372,8 @@ function _cleanup() {
         _instance = null;
     }
 }
+
+export { wrap } from './wrap.js';
+export { NativeCache } from './cache.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };

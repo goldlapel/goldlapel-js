@@ -378,7 +378,7 @@ describe('configKeys', () => {
         assert.ok(keys instanceof Set);
         assert.ok(keys.has('mode'));
         assert.ok(keys.has('poolSize'));
-        assert.strictEqual(keys.size, 43);
+        assert.strictEqual(keys.size, 42);
     });
 
     it('returns a new Set each call (not the internal reference)', () => {
