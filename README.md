@@ -1,6 +1,6 @@
 # Gold Lapel
 
-Self-optimizing Postgres proxy — automatic materialized views and indexes. Zero code changes required.
+Self-optimizing Postgres proxy — automatic materialized views and indexes, with an L1 native cache that serves repeated reads in microseconds. Zero code changes required.
 
 Gold Lapel sits between your app and Postgres, watches query patterns, and automatically creates materialized views and indexes to make your database faster. Port 7932 (79 = atomic number for gold, 32 from Postgres).
 
@@ -15,18 +15,22 @@ npm install goldlapel
 ```js
 import goldlapel from 'goldlapel';
 
-// Start the proxy — returns a connection string pointing at Gold Lapel
-const url = await goldlapel.start('postgresql://user:pass@localhost:5432/mydb');
+// Start the proxy — returns a database connection with L1 cache built in
+const conn = goldlapel.start('postgresql://user:pass@localhost:5432/mydb');
 
-// Use the URL with any Postgres driver
-import pg from 'pg';
-const client = new pg.Client({ connectionString: url });
-await client.connect();
-
-// Or Prisma, Drizzle, Knex, TypeORM — anything that speaks Postgres
+// Use the connection directly — no driver setup needed
+const result = conn.query('SELECT * FROM users WHERE id = $1', [42]);
 ```
 
-Gold Lapel is driver-agnostic. `start()` returns a connection string (`postgresql://...@localhost:7932/...`) that works with any Postgres driver or ORM.
+For async applications:
+
+```js
+import goldlapel from 'goldlapel';
+
+const conn = await goldlapel.startAsync('postgresql://user:pass@localhost:5432/mydb');
+
+const result = await conn.query('SELECT * FROM users WHERE id = $1', [42]);
+```
 
 After startup, Gold Lapel prints a one-line summary and serves a dashboard at `http://127.0.0.1:7933` by default:
 
@@ -39,12 +43,16 @@ const dashUrl = goldlapel.dashboardUrl();
 
 ### `goldlapel.start(upstream, opts)`
 
-Starts the Gold Lapel proxy and returns the proxy connection string. Returns a Promise.
+Starts the Gold Lapel proxy and returns a database connection with L1 cache.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `opts.port` — proxy port (default: 7932)
 - `opts.config` — config object (see [Configuration](#configuration))
 - `opts.extraArgs` — additional CLI flags passed to the binary (e.g. `['--threshold-impact', '5000']`)
+
+### `goldlapel.startAsync(upstream, opts)`
+
+Async version of `start()`. Returns a Promise that resolves to an async database connection with L1 cache.
 
 ### `goldlapel.stop()`
 
@@ -66,7 +74,7 @@ Class interface for managing multiple instances:
 import { GoldLapel } from 'goldlapel';
 
 const proxy = new GoldLapel('postgresql://user:pass@localhost:5432/mydb', { port: 7932 });
-const url = await proxy.start();
+const conn = await proxy.startAsync();
 // ...
 proxy.stop();
 ```
@@ -78,7 +86,7 @@ Pass a config object to configure the proxy:
 ```js
 import goldlapel from 'goldlapel'
 
-const url = await goldlapel.start('postgresql://user:pass@localhost/mydb', {
+const conn = await goldlapel.startAsync('postgresql://user:pass@localhost/mydb', {
   config: {
     mode: 'butler',
     poolSize: 50,
@@ -104,7 +112,7 @@ For the full configuration reference, see the [main documentation](https://githu
 You can also pass raw CLI flags via `extraArgs`:
 
 ```js
-const url = await goldlapel.start(
+const conn = await goldlapel.startAsync(
     'postgresql://user:pass@localhost:5432/mydb',
     { extraArgs: ['--threshold-duration-ms', '200', '--refresh-interval-secs', '30'] }
 );
@@ -119,7 +127,7 @@ This package bundles the Gold Lapel Rust binary for your platform. When you call
 1. Locates the binary (bundled in package, on PATH, or via `GOLDLAPEL_BINARY` env var)
 2. Spawns it as a subprocess listening on localhost
 3. Waits for the port to be ready
-4. Returns a connection string pointing at the proxy
+4. Returns a database connection with L1 native cache built in
 5. Cleans up automatically on process exit
 
 The binary does all the work — this wrapper just manages its lifecycle.
