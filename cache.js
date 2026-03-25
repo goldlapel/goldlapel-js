@@ -47,8 +47,35 @@ function detectWrite(sql) {
             return bareTable(tokens[2]);
         }
         return bareTable(tokens[1]);
-    } else if (first === 'CREATE' || first === 'ALTER' || first === 'DROP') {
+    } else if (first === 'CREATE' || first === 'ALTER' || first === 'DROP' || first === 'REFRESH' || first === 'DO' || first === 'CALL') {
         return DDL_SENTINEL;
+    } else if (first === 'MERGE') {
+        if (tokens.length < 3 || tokens[1].toUpperCase() !== 'INTO') return null;
+        return bareTable(tokens[2]);
+    } else if (first === 'SELECT') {
+        let sawInto = false;
+        let intoTarget = null;
+        for (let i = 1; i < tokens.length; i++) {
+            const upper = tokens[i].toUpperCase();
+            if (upper === 'INTO' && !sawInto) {
+                sawInto = true;
+                continue;
+            }
+            if (sawInto && intoTarget === null) {
+                if (upper === 'TEMPORARY' || upper === 'TEMP' || upper === 'UNLOGGED') {
+                    continue;
+                }
+                intoTarget = tokens[i];
+                continue;
+            }
+            if (sawInto && intoTarget !== null && upper === 'FROM') {
+                return DDL_SENTINEL;
+            }
+            if (upper === 'FROM') {
+                return null;
+            }
+        }
+        return null;
     } else if (first === 'COPY') {
         if (tokens.length < 2) return null;
         const raw = tokens[1];
