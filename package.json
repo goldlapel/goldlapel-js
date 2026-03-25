@@ -4,13 +4,26 @@
   "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "module",
   "main": "index.js",
-  "files": ["index.js", "cli.js", "cache.js", "wrap.js", "bin/", "README.md"],
+  "files": [
+    "index.js",
+    "cli.js",
+    "cache.js",
+    "wrap.js",
+    "bin/",
+    "README.md"
+  ],
   "bin": {
     "goldlapel": "cli.js"
   },
-  "keywords": ["postgres", "proxy", "optimization", "materialized-views", "database"],
+  "keywords": [
+    "postgres",
+    "proxy",
+    "optimization",
+    "materialized-views",
+    "database"
+  ],
   "author": "Stephen Gibson",
-  "license": "Proprietary",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/goldlapel/goldlapel-js"
@@ -23,12 +36,15 @@
     "node": ">=18.0.0"
   },
   "optionalDependencies": {
-    "@goldlapel/linux-x64": "0.1.0",
-    "@goldlapel/linux-arm64": "0.1.0",
-    "@goldlapel/linux-x64-musl": "0.1.0",
-    "@goldlapel/linux-arm64-musl": "0.1.0",
     "@goldlapel/darwin-arm64": "0.1.0",
     "@goldlapel/darwin-x64": "0.1.0",
+    "@goldlapel/linux-arm64": "0.1.0",
+    "@goldlapel/linux-arm64-musl": "0.1.0",
+    "@goldlapel/linux-x64": "0.1.0",
+    "@goldlapel/linux-x64-musl": "0.1.0",
     "@goldlapel/win-x64": "0.1.0"
+  },
+  "dependencies": {
+    "pg": "^8.20.0"
   }
 }
