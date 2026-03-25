@@ -352,6 +352,9 @@ export async function start(upstream, opts) {
 
 export function stop() {
     if (_instance) {
+        if (_instance._wrappedClient && typeof _instance._wrappedClient.end === 'function') {
+            _instance._wrappedClient.end();
+        }
         _instance.stop();
         _instance = null;
     }
@@ -368,6 +371,9 @@ export function dashboardUrl() {
 
 function _cleanup() {
     if (_instance) {
+        if (_instance._wrappedClient && typeof _instance._wrappedClient.end === 'function') {
+            _instance._wrappedClient.end();
+        }
         _instance.stop();
         _instance = null;
     }
