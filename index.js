@@ -335,19 +335,24 @@ export async function start(upstream, opts) {
     const url = await _instance.start();
 
     // Auto-detect pg and return wrapped client with L1 cache
+    let pg;
     try {
-        const pg = await import('pg');
-        const Client = pg.default?.Client ?? pg.Client;
-        const { wrap } = await import('./wrap.js');
-        const client = new Client({ connectionString: url });
-        await client.connect();
-        const invPort = opts?.config?.invalidationPort ?? (_instance._port + 2);
-        const wrapped = wrap(client, invPort);
-        _instance._wrappedClient = wrapped;
-        return wrapped;
+        pg = await import('pg');
     } catch {
-        return url;
+        throw new Error(
+            'No supported database driver found. ' +
+            'Install one (e.g. npm install pg) ' +
+            'or use proxyUrl() if you only need the connection string.'
+        );
     }
+    const Client = pg.default?.Client ?? pg.Client;
+    const { wrap } = await import('./wrap.js');
+    const client = new Client({ connectionString: url });
+    await client.connect();
+    const invPort = opts?.config?.invalidationPort ?? (_instance._port + 2);
+    const wrapped = wrap(client, invPort);
+    _instance._wrappedClient = wrapped;
+    return wrapped;
 }
 
 export function stop() {
