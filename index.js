@@ -386,5 +386,11 @@ function _cleanup() {
 
 export { wrap } from './wrap.js';
 export { NativeCache } from './cache.js';
+export {
+    publish, subscribe, enqueue, dequeue,
+    incr, getCounter,
+    zadd, zincrby, zrange, zrank, zscore, zrem,
+    geoadd, georadius, geodist,
+} from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };
