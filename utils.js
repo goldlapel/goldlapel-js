@@ -173,3 +173,51 @@ export async function geodist(client, table, geomColumn, nameColumn, nameA, name
     if (result.rows.length === 0) return null;
     return result.rows[0].st_distance;
 }
+
+export async function hset(client, table, key, field, value) {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS ${table} (
+            key TEXT PRIMARY KEY,
+            data JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    `);
+    await client.query(`
+        INSERT INTO ${table} (key, data) VALUES ($1, jsonb_build_object($2, $3::jsonb))
+        ON CONFLICT (key) DO UPDATE SET data = ${table}.data || jsonb_build_object($4, $5::jsonb)
+    `, [key, field, JSON.stringify(value), field, JSON.stringify(value)]);
+}
+
+export async function hget(client, table, key, field) {
+    const result = await client.query(
+        `SELECT data->>$1 AS val FROM ${table} WHERE key = $2`, [field, key]
+    );
+    if (result.rows.length === 0) return null;
+    const val = result.rows[0].val;
+    if (val === null || val === undefined) return null;
+    try {
+        return JSON.parse(val);
+    } catch {
+        return val;
+    }
+}
+
+export async function hgetall(client, table, key) {
+    const result = await client.query(
+        `SELECT data FROM ${table} WHERE key = $1`, [key]
+    );
+    if (result.rows.length === 0) return {};
+    const val = result.rows[0].data;
+    if (!val) return {};
+    return typeof val === 'object' ? val : JSON.parse(val);
+}
+
+export async function hdel(client, table, key, field) {
+    const result = await client.query(
+        `SELECT data ? $1 AS existed FROM ${table} WHERE key = $2`, [field, key]
+    );
+    if (result.rows.length === 0 || !result.rows[0].existed) return false;
+    await client.query(
+        `UPDATE ${table} SET data = data - $1 WHERE key = $2`, [field, key]
+    );
+    return true;
+}

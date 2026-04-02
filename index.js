@@ -391,6 +391,7 @@ export {
     incr, getCounter,
     zadd, zincrby, zrange, zrank, zscore, zrem,
     geoadd, georadius, geodist,
+    hset, hget, hgetall, hdel,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };
