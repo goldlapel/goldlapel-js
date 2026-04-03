@@ -211,6 +211,13 @@ export async function hgetall(client, table, key) {
     return typeof val === 'object' ? val : JSON.parse(val);
 }
 
+export async function countDistinct(client, table, column) {
+    const result = await client.query(
+        `SELECT COUNT(DISTINCT ${column}) AS cnt FROM ${table}`
+    );
+    return Number(result.rows[0].cnt);
+}
+
 export async function hdel(client, table, key, field) {
     const result = await client.query(
         `SELECT data ? $1 AS existed FROM ${table} WHERE key = $2`, [field, key]
