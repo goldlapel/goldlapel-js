@@ -393,6 +393,7 @@ export {
     geoadd, georadius, geodist,
     hset, hget, hgetall, hdel,
     countDistinct,
+    script,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };

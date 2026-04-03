@@ -228,3 +228,22 @@ export async function hdel(client, table, key, field) {
     );
     return true;
 }
+
+export async function script(client, luaCode, ...args) {
+    await client.query('CREATE EXTENSION IF NOT EXISTS pllua');
+    const funcName = '_gl_lua_' + Math.random().toString(36).slice(2, 10);
+    const n = args.length;
+    const params = Array.from({length: n}, (_, i) => `p${i + 1} text`).join(', ');
+    await client.query(`
+        CREATE OR REPLACE FUNCTION pg_temp.${funcName}(${params})
+        RETURNS text LANGUAGE pllua AS $pllua$
+        ${luaCode}
+        $pllua$
+    `);
+    const placeholders = Array.from({length: n}, (_, i) => `$${i + 1}`).join(', ');
+    const result = await client.query(
+        `SELECT pg_temp.${funcName}(${placeholders})`,
+        args.map(String)
+    );
+    return result.rows[0] ? result.rows[0][funcName] : null;
+}
