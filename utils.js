@@ -229,6 +229,111 @@ export async function hdel(client, table, key, field) {
     return true;
 }
 
+export async function streamAdd(client, stream, payload) {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS ${stream} (
+            id BIGSERIAL PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    const result = await client.query(
+        `INSERT INTO ${stream} (payload) VALUES ($1) RETURNING id`,
+        [JSON.stringify(payload)]
+    );
+    return Number(result.rows[0].id);
+}
+
+export async function streamCreateGroup(client, stream, group) {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS ${stream}_groups (
+            group_name TEXT PRIMARY KEY,
+            last_delivered_id BIGINT NOT NULL DEFAULT 0
+        )
+    `);
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS ${stream}_pending (
+            message_id BIGINT NOT NULL,
+            group_name TEXT NOT NULL,
+            consumer TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            delivery_count INT NOT NULL DEFAULT 1,
+            PRIMARY KEY (group_name, message_id)
+        )
+    `);
+    await client.query(
+        `INSERT INTO ${stream}_groups (group_name) VALUES ($1) ON CONFLICT DO NOTHING`,
+        [group]
+    );
+}
+
+export async function streamRead(client, stream, group, consumer, count = 1) {
+    const cursorResult = await client.query(
+        `SELECT last_delivered_id FROM ${stream}_groups WHERE group_name = $1 FOR UPDATE`,
+        [group]
+    );
+    if (cursorResult.rows.length === 0) return [];
+    const lastId = Number(cursorResult.rows[0].last_delivered_id);
+    const msgResult = await client.query(
+        `SELECT id, payload, created_at FROM ${stream} WHERE id > $1 ORDER BY id LIMIT $2`,
+        [lastId, count]
+    );
+    const messages = msgResult.rows.map(row => ({
+        id: Number(row.id),
+        payload: typeof row.payload === 'object' ? row.payload : JSON.parse(row.payload),
+        created_at: String(row.created_at),
+    }));
+    if (messages.length > 0) {
+        const newLast = messages[messages.length - 1].id;
+        await client.query(
+            `UPDATE ${stream}_groups SET last_delivered_id = $1 WHERE group_name = $2`,
+            [newLast, group]
+        );
+        for (const msg of messages) {
+            await client.query(
+                `INSERT INTO ${stream}_pending (message_id, group_name, consumer)
+                 VALUES ($1, $2, $3) ON CONFLICT (group_name, message_id) DO NOTHING`,
+                [msg.id, group, consumer]
+            );
+        }
+    }
+    return messages;
+}
+
+export async function streamAck(client, stream, group, messageId) {
+    const result = await client.query(
+        `DELETE FROM ${stream}_pending WHERE group_name = $1 AND message_id = $2`,
+        [group, messageId]
+    );
+    return result.rowCount > 0;
+}
+
+export async function streamClaim(client, stream, group, consumer, minIdleMs = 60000) {
+    const claimResult = await client.query(`
+        UPDATE ${stream}_pending
+        SET consumer = $1, claimed_at = NOW(), delivery_count = delivery_count + 1
+        WHERE group_name = $2 AND claimed_at < NOW() - INTERVAL '${Number(minIdleMs)} milliseconds'
+        RETURNING message_id
+    `, [consumer, group]);
+    const claimedIds = claimResult.rows.map(r => Number(r.message_id));
+    const messages = [];
+    for (const msgId of claimedIds) {
+        const result = await client.query(
+            `SELECT id, payload, created_at FROM ${stream} WHERE id = $1`,
+            [msgId]
+        );
+        if (result.rows.length > 0) {
+            const row = result.rows[0];
+            messages.push({
+                id: Number(row.id),
+                payload: typeof row.payload === 'object' ? row.payload : JSON.parse(row.payload),
+                created_at: String(row.created_at),
+            });
+        }
+    }
+    return messages;
+}
+
 export async function script(client, luaCode, ...args) {
     await client.query('CREATE EXTENSION IF NOT EXISTS pllua');
     const funcName = '_gl_lua_' + Math.random().toString(36).slice(2, 10);

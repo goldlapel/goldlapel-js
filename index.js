@@ -394,6 +394,7 @@ export {
     hset, hget, hgetall, hdel,
     countDistinct,
     script,
+    streamAdd, streamCreateGroup, streamRead, streamAck, streamClaim,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };
