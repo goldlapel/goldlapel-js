@@ -16,7 +16,7 @@ export async function search(client, table, column, query, { limit = 50, lang = 
     const tsv = `to_tsvector($1, ${tsvector})`;
     const tsq = `plainto_tsquery($2, $3)`;
     const fields = highlight
-        ? `*, ts_rank(${tsv}, ${tsq}) AS _score, ts_headline($4, ${tsvector}, ${tsq}) AS _highlight`
+        ? `*, ts_rank(${tsv}, ${tsq}) AS _score, ts_headline($4, ${tsvector}, ${tsq}, 'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15') AS _highlight`
         : `*, ts_rank(${tsv}, ${tsq}) AS _score`;
     const params = highlight
         ? [lang, lang, query, lang, limit]
