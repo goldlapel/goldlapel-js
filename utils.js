@@ -465,6 +465,55 @@ export async function createSearchConfig(client, name, { copyFrom = 'english' } 
     }
 }
 
+export async function percolateAdd(client, name, queryId, query, { lang = 'english', metadata = null } = {}) {
+    validateIdentifier(name);
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS ${name} (
+            query_id TEXT PRIMARY KEY,
+            query_text TEXT NOT NULL,
+            tsquery TSQUERY NOT NULL,
+            lang TEXT NOT NULL DEFAULT 'english',
+            metadata JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await client.query(
+        `CREATE INDEX IF NOT EXISTS ${name}_tsq_idx ON ${name} USING GIN (tsquery)`
+    );
+    await client.query(
+        `INSERT INTO ${name} (query_id, query_text, tsquery, lang, metadata)
+         VALUES ($1, $2, plainto_tsquery($3, $2), $3, $4)
+         ON CONFLICT (query_id) DO UPDATE SET
+             query_text = EXCLUDED.query_text,
+             tsquery = EXCLUDED.tsquery,
+             lang = EXCLUDED.lang,
+             metadata = EXCLUDED.metadata`,
+        [queryId, query, lang, metadata ? JSON.stringify(metadata) : null]
+    );
+}
+
+export async function percolate(client, name, text, { lang = 'english', limit = 50 } = {}) {
+    validateIdentifier(name);
+    const result = await client.query(
+        `SELECT query_id, query_text, metadata, ts_rank(to_tsvector($1, $2), tsquery) AS _score
+         FROM ${name}
+         WHERE to_tsvector($1, $2) @@ tsquery
+         ORDER BY _score DESC
+         LIMIT $3`,
+        [lang, text, limit]
+    );
+    return result.rows;
+}
+
+export async function percolateDelete(client, name, queryId) {
+    validateIdentifier(name);
+    const result = await client.query(
+        `DELETE FROM ${name} WHERE query_id = $1 RETURNING query_id`,
+        [queryId]
+    );
+    return result.rowCount > 0;
+}
+
 export async function script(client, luaCode, ...args) {
     await client.query('CREATE EXTENSION IF NOT EXISTS pllua');
     const funcName = '_gl_lua_' + Math.random().toString(36).slice(2, 10);
