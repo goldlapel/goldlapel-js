@@ -237,7 +237,7 @@ export class GoldLapel {
         const binary = _findBinary();
         const args = [
             '--upstream', this._upstream,
-            '--port', String(this._port),
+            '--proxy-port', String(this._port),
             ..._configToArgs(this._config),
             ...this._extraArgs,
         ];
