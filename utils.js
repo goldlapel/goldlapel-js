@@ -411,6 +411,60 @@ export async function streamClaim(client, stream, group, consumer, minIdleMs = 6
     return messages;
 }
 
+export async function facets(client, table, column, { limit = 50, query = null, queryColumn = null, lang = 'english' } = {}) {
+    validateIdentifier(table);
+    validateIdentifier(column);
+    if (query && queryColumn) {
+        const columns = Array.isArray(queryColumn) ? queryColumn : [queryColumn];
+        columns.forEach(validateIdentifier);
+        const tsvector = columns.map(c => `coalesce(${c}, '')`).join(" || ' ' || ");
+        const result = await client.query(
+            `SELECT ${column} AS value, COUNT(*) AS count FROM ${table} WHERE to_tsvector($1, ${tsvector}) @@ plainto_tsquery($2, $3) GROUP BY ${column} ORDER BY count DESC, ${column} LIMIT $4`,
+            [lang, lang, query, limit]
+        );
+        return result.rows;
+    }
+    const result = await client.query(
+        `SELECT ${column} AS value, COUNT(*) AS count FROM ${table} GROUP BY ${column} ORDER BY count DESC, ${column} LIMIT $1`,
+        [limit]
+    );
+    return result.rows;
+}
+
+export async function aggregate(client, table, column, func, { groupBy = null, limit = 50 } = {}) {
+    validateIdentifier(table);
+    validateIdentifier(column);
+    const allowed = new Set(['count', 'sum', 'avg', 'min', 'max']);
+    if (!allowed.has(func)) {
+        throw new Error(`func must be one of ${[...allowed].join(', ')}`);
+    }
+    const aggExpr = func === 'count' ? 'COUNT(*)' : `${func.toUpperCase()}(${column})`;
+    if (groupBy) {
+        validateIdentifier(groupBy);
+        const result = await client.query(
+            `SELECT ${groupBy}, ${aggExpr} AS value FROM ${table} GROUP BY ${groupBy} ORDER BY value DESC LIMIT $1`,
+            [limit]
+        );
+        return result.rows;
+    }
+    const result = await client.query(
+        `SELECT ${aggExpr} AS value FROM ${table}`
+    );
+    return result.rows;
+}
+
+export async function createSearchConfig(client, name, { copyFrom = 'english' } = {}) {
+    validateIdentifier(name);
+    validateIdentifier(copyFrom);
+    const check = await client.query(
+        'SELECT 1 FROM pg_ts_config WHERE cfgname = $1',
+        [name]
+    );
+    if (check.rows.length === 0) {
+        await client.query(`CREATE TEXT SEARCH CONFIGURATION ${name} (COPY = ${copyFrom})`);
+    }
+}
+
 export async function script(client, luaCode, ...args) {
     await client.query('CREATE EXTENSION IF NOT EXISTS pllua');
     const funcName = '_gl_lua_' + Math.random().toString(36).slice(2, 10);

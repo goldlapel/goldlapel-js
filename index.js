@@ -396,6 +396,7 @@ export {
     script,
     streamAdd, streamCreateGroup, streamRead, streamAck, streamClaim,
     search, searchFuzzy, searchPhonetic, similar, suggest,
+    facets, aggregate, createSearchConfig,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };
