@@ -1,3 +1,80 @@
+function validateIdentifier(name) {
+    if (typeof name !== 'string' || name.length === 0) {
+        throw new Error('Identifier must be a non-empty string');
+    }
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+        throw new Error(`Invalid identifier: ${name}`);
+    }
+    return name;
+}
+
+export async function search(client, table, column, query, { limit = 50, lang = 'english', highlight = false } = {}) {
+    validateIdentifier(table);
+    const columns = Array.isArray(column) ? column : [column];
+    columns.forEach(validateIdentifier);
+    const tsvector = columns.map(c => `coalesce(${c}, '')`).join(" || ' ' || ");
+    const tsv = `to_tsvector($1, ${tsvector})`;
+    const tsq = `plainto_tsquery($2, $3)`;
+    const fields = highlight
+        ? `*, ts_rank(${tsv}, ${tsq}) AS _score, ts_headline($4, ${tsvector}, ${tsq}) AS _highlight`
+        : `*, ts_rank(${tsv}, ${tsq}) AS _score`;
+    const params = highlight
+        ? [lang, lang, query, lang, limit]
+        : [lang, lang, query, limit];
+    const limitIdx = highlight ? '$5' : '$4';
+    const result = await client.query(
+        `SELECT ${fields} FROM ${table} WHERE ${tsv} @@ ${tsq} ORDER BY _score DESC LIMIT ${limitIdx}`,
+        params
+    );
+    return result.rows;
+}
+
+export async function searchFuzzy(client, table, column, query, { limit = 50, threshold = 0.3 } = {}) {
+    validateIdentifier(table);
+    validateIdentifier(column);
+    await client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+    const result = await client.query(
+        `SELECT *, similarity(${column}, $1) AS _score FROM ${table} WHERE similarity(${column}, $1) > $2 ORDER BY _score DESC LIMIT $3`,
+        [query, threshold, limit]
+    );
+    return result.rows;
+}
+
+export async function searchPhonetic(client, table, column, query, { limit = 50 } = {}) {
+    validateIdentifier(table);
+    validateIdentifier(column);
+    await client.query('CREATE EXTENSION IF NOT EXISTS fuzzystrmatch');
+    await client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+    const result = await client.query(
+        `SELECT *, similarity(${column}, $1) AS _score FROM ${table} WHERE soundex(${column}) = soundex($1) ORDER BY _score DESC, ${column} LIMIT $2`,
+        [query, limit]
+    );
+    return result.rows;
+}
+
+export async function similar(client, table, column, vector, { limit = 10 } = {}) {
+    validateIdentifier(table);
+    validateIdentifier(column);
+    await client.query('CREATE EXTENSION IF NOT EXISTS vector');
+    const vectorLiteral = '[' + vector.join(',') + ']';
+    const result = await client.query(
+        `SELECT *, (${column} <=> $1::vector) AS _score FROM ${table} ORDER BY _score LIMIT $2`,
+        [vectorLiteral, limit]
+    );
+    return result.rows;
+}
+
+export async function suggest(client, table, column, prefix, { limit = 10 } = {}) {
+    validateIdentifier(table);
+    validateIdentifier(column);
+    await client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+    const result = await client.query(
+        `SELECT *, similarity(${column}, $1) AS _score FROM ${table} WHERE ${column} ILIKE $2 ORDER BY _score DESC, ${column} LIMIT $3`,
+        [prefix, prefix + '%', limit]
+    );
+    return result.rows;
+}
+
 export async function publish(client, channel, message) {
     await client.query('SELECT pg_notify($1, $2)', [channel, String(message)]);
 }
