@@ -398,6 +398,7 @@ export {
     search, searchFuzzy, searchPhonetic, similar, suggest,
     facets, aggregate, createSearchConfig,
     percolateAdd, percolate, percolateDelete,
+    analyze, explainScore,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };

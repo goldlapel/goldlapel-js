@@ -514,6 +514,34 @@ export async function percolateDelete(client, name, queryId) {
     return result.rowCount > 0;
 }
 
+export async function analyze(client, text, { lang = 'english' } = {}) {
+    const result = await client.query(
+        'SELECT alias, description, token, dictionaries, dictionary, lexemes FROM ts_debug($1, $2)',
+        [lang, text]
+    );
+    return result.rows;
+}
+
+export async function explainScore(client, table, column, query, idColumn, idValue, { lang = 'english' } = {}) {
+    validateIdentifier(table);
+    validateIdentifier(column);
+    validateIdentifier(idColumn);
+    const result = await client.query(
+        `SELECT
+            ${column} AS document_text,
+            to_tsvector($1, ${column})::text AS document_tokens,
+            plainto_tsquery($1, $2)::text AS query_tokens,
+            to_tsvector($1, ${column}) @@ plainto_tsquery($1, $2) AS matches,
+            ts_rank(to_tsvector($1, ${column}), plainto_tsquery($1, $2)) AS score,
+            ts_headline($1, ${column}, plainto_tsquery($1, $2),
+                'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') AS headline
+        FROM ${table}
+        WHERE ${idColumn} = $3`,
+        [lang, query, idValue]
+    );
+    return result.rows[0] || null;
+}
+
 export async function script(client, luaCode, ...args) {
     await client.query('CREATE EXTENSION IF NOT EXISTS pllua');
     const funcName = '_gl_lua_' + Math.random().toString(36).slice(2, 10);
