@@ -1,6 +1,6 @@
 {
   "name": "goldlapel",
-  "version": "0.1.0",
+  "version": "0.1.0-rc16",
   "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "module",
   "main": "index.js",
@@ -37,13 +37,13 @@
     "node": ">=18.0.0"
   },
   "optionalDependencies": {
-    "@goldlapel/darwin-arm64": "0.1.0",
-    "@goldlapel/darwin-x64": "0.1.0",
-    "@goldlapel/linux-arm64": "0.1.0",
-    "@goldlapel/linux-arm64-musl": "0.1.0",
-    "@goldlapel/linux-x64": "0.1.0",
-    "@goldlapel/linux-x64-musl": "0.1.0",
-    "@goldlapel/win-x64": "0.1.0"
+    "@goldlapel/darwin-arm64": "0.1.0-rc16",
+    "@goldlapel/darwin-x64": "0.1.0-rc16",
+    "@goldlapel/linux-arm64": "0.1.0-rc16",
+    "@goldlapel/linux-arm64-musl": "0.1.0-rc16",
+    "@goldlapel/linux-x64": "0.1.0-rc16",
+    "@goldlapel/linux-x64-musl": "0.1.0-rc16",
+    "@goldlapel/win-x64": "0.1.0-rc16"
   },
   "dependencies": {
     "pg": "^8.20.0"

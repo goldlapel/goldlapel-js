@@ -1,6 +1,6 @@
 {
   "name": "@goldlapel/darwin-arm64",
-  "version": "0.1.0",
+  "version": "0.1.0-rc16",
   "description": "Gold Lapel binary for macOS ARM64",
   "files": ["goldlapel"],
   "os": ["darwin"],
