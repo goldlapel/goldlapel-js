@@ -280,8 +280,8 @@ describe('dashboardUrl', () => {
 
 describe('configToArgs', () => {
     it('converts string value to correct flags', () => {
-        const args = _configToArgs({ mode: 'butler' });
-        assert.deepStrictEqual(args, ['--mode', 'butler']);
+        const args = _configToArgs({ mode: 'waiter' });
+        assert.deepStrictEqual(args, ['--mode', 'waiter']);
     });
 
     it('converts numeric value to stringified flag', () => {
@@ -323,9 +323,9 @@ describe('configToArgs', () => {
     });
 
     it('converts multiple keys to all flags', () => {
-        const args = _configToArgs({ mode: 'butler', poolSize: 5, disablePool: true });
+        const args = _configToArgs({ mode: 'waiter', poolSize: 5, disablePool: true });
         assert.ok(args.includes('--mode'));
-        assert.ok(args.includes('butler'));
+        assert.ok(args.includes('waiter'));
         assert.ok(args.includes('--pool-size'));
         assert.ok(args.includes('5'));
         assert.ok(args.includes('--disable-pool'));
@@ -365,9 +365,9 @@ describe('configToArgs', () => {
 
     it('config passed through constructor is stored', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            config: { mode: 'butler', disablePool: true },
+            config: { mode: 'waiter', disablePool: true },
         });
-        assert.deepStrictEqual(gl._config, { mode: 'butler', disablePool: true });
+        assert.deepStrictEqual(gl._config, { mode: 'waiter', disablePool: true });
     });
 });
 

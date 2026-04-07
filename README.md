@@ -74,7 +74,7 @@ import goldlapel from 'goldlapel'
 
 const conn = await goldlapel.start('postgresql://user:pass@localhost/mydb', {
   config: {
-    mode: 'butler',
+    mode: 'waiter',
     poolSize: 50,
     disableMatviews: true,
     replica: ['postgresql://user:pass@replica1/mydb'],
