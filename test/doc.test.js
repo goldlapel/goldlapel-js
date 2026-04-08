@@ -509,8 +509,8 @@ describe('docAggregate', () => {
     it('throws on unsupported pipeline stage', async () => {
         const client = mockClient();
         await assert.rejects(
-            () => docAggregate(client, 'users', [{ $lookup: { from: 'other' } }]),
-            /Unsupported pipeline stage: \$lookup/
+            () => docAggregate(client, 'users', [{ $graphLookup: { from: 'other' } }]),
+            /Unsupported pipeline stage: \$graphLookup/
         );
     });
 
@@ -769,5 +769,142 @@ describe('$push and $addToSet accumulators', () => {
         assert.ok(sql.includes("json_build_object('region', data->>'region', 'year', data->>'year') AS _id"));
         assert.ok(sql.includes("array_agg(DISTINCT data->>'brand') AS brands"));
         assert.ok(sql.includes("GROUP BY data->>'region', data->>'year'"));
+    });
+});
+
+// ─── $project ─────────────────────────────────────────────────────────────
+
+describe('$project', () => {
+    it('include fields with 1', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'users', [
+            { $project: { name: 1, email: 1 } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data->>'name' AS name"));
+        assert.ok(sql.includes("data->>'email' AS email"));
+        assert.ok(!sql.includes('_id, data, created_at'));
+    });
+
+    it('exclude _id with 0', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'users', [
+            { $project: { _id: 0, name: 1 } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data->>'name' AS name"));
+        assert.ok(!sql.includes("data->>'_id'"));
+    });
+
+    it('rename via field reference', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'users', [
+            { $project: { username: '$name', age: 1 } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data->>'name' AS username"));
+        assert.ok(sql.includes("data->>'age' AS age"));
+    });
+
+    it('$project after $group uses aliases', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $group: { _id: '$category', total: { $sum: '$amount' } } },
+            { $project: { _id: 1, total: 1 } },
+        ]);
+        const sql = client._calls[0].text;
+        // After $group, _id and total are aliases — project should reference them directly
+        assert.ok(sql.includes('_id'));
+        assert.ok(sql.includes('total'));
+        assert.ok(sql.includes("GROUP BY data->>'category'"));
+    });
+});
+
+// ─── $unwind ──────────────────────────────────────────────────────────────
+
+describe('$unwind', () => {
+    it('string path adds jsonb_array_elements_text to FROM', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $unwind: '$items' },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("jsonb_array_elements_text(data->'items') AS _unwound_items"));
+        assert.ok(sql.includes('FROM orders,'));
+    });
+
+    it('object path with path key', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $unwind: { path: '$tags' } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("jsonb_array_elements_text(data->'tags') AS _unwound_tags"));
+    });
+
+    it('$unwind + $group resolves field via unwind alias', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $unwind: '$items' },
+            { $group: { _id: '$items', count: { $sum: 1 } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('_unwound_items AS _id'));
+        assert.ok(sql.includes('GROUP BY _unwound_items'));
+        assert.ok(sql.includes('COUNT(*) AS count'));
+    });
+
+    it('$unwind + $group with $sum on unwound field', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $unwind: '$scores' },
+            { $group: { _id: null, total: { $sum: '$scores' } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SUM((_unwound_scores)::numeric) AS total'));
+        assert.ok(!sql.includes('GROUP BY'));
+    });
+
+    it('throws on invalid $unwind path', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docAggregate(client, 'orders', [{ $unwind: 'no_dollar' }]),
+            /\$unwind path must start with \$/
+        );
+    });
+});
+
+// ─── $lookup ──────────────────────────────────────────────────────────────
+
+describe('$lookup', () => {
+    it('generates correlated subquery', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $lookup: { from: 'customers', localField: 'customer_id', foreignField: 'cid', as: 'customer' } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("COALESCE((SELECT json_agg(b.data) FROM customers b WHERE b.data->>'cid' = orders.data->>'customer_id'), '[]'::json) AS customer"));
+    });
+
+    it('$match + $lookup combined', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $match: { status: 'active' } },
+            { $lookup: { from: 'products', localField: 'product_id', foreignField: 'pid', as: 'product' } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('WHERE data @> $1::jsonb'));
+        assert.ok(sql.includes("COALESCE((SELECT json_agg(b.data) FROM products b WHERE b.data->>'pid' = orders.data->>'product_id'), '[]'::json) AS product"));
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ status: 'active' })]);
+    });
+
+    it('throws on missing $lookup fields', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docAggregate(client, 'orders', [
+                { $lookup: { from: 'customers' } },
+            ]),
+            /\$lookup requires from, localField, foreignField, and as/
+        );
     });
 });

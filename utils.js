@@ -817,26 +817,73 @@ export async function docCount(client, collection, filter) {
     return parseInt(result.rows[0].count);
 }
 
-function validateFieldRef(ref) {
-    const field = ref.slice(1);
+function resolveFieldRef(ref, unwindMap) {
+    const field = ref.startsWith('$') ? ref.slice(1) : ref;
     if (!fieldKeyPattern.test(field)) {
-        throw new Error(`Invalid field reference: ${ref}`);
+        throw new Error(`Invalid field reference: $${field}`);
     }
-    return field;
+    if (unwindMap && unwindMap[field]) {
+        return unwindMap[field];
+    }
+    return `data->>'${field}'`;
 }
 
-function buildGroup(group) {
+function buildProject(project, groupAliases) {
+    const parts = [];
+    const aliases = new Set();
+
+    for (const [key, val] of Object.entries(project)) {
+        if (!fieldKeyPattern.test(key)) {
+            throw new Error(`Invalid project key: ${key}`);
+        }
+
+        if (val === 0) {
+            // Exclusion — skip this field
+            continue;
+        }
+
+        if (val === 1) {
+            // Inclusion
+            if (groupAliases && groupAliases.has(key)) {
+                parts.push(key);
+            } else {
+                parts.push(`data->>'${key}' AS ${key}`);
+            }
+            aliases.add(key);
+        } else if (typeof val === 'string' && val.startsWith('$')) {
+            // Rename: {alias: "$field"}
+            const field = val.slice(1);
+            if (!fieldKeyPattern.test(field)) {
+                throw new Error(`Invalid field reference: ${val}`);
+            }
+            if (groupAliases && groupAliases.has(field)) {
+                parts.push(`${field} AS ${key}`);
+            } else {
+                parts.push(`data->>'${field}' AS ${key}`);
+            }
+            aliases.add(key);
+        } else {
+            throw new Error(`Unsupported $project value for ${key}: ${val}`);
+        }
+    }
+
+    return { parts, aliases };
+}
+
+function buildGroup(group, unwindMap) {
     const selectParts = [];
     const supportedAccumulators = new Set(['$sum', '$avg', '$min', '$max', '$count', '$push', '$addToSet']);
+    const aliases = new Set();
 
     // Handle _id (GROUP BY key)
     let groupBy = null;
     if (group._id !== null && group._id !== undefined) {
         const idRef = group._id;
         if (typeof idRef === 'string' && idRef.startsWith('$')) {
-            const field = validateFieldRef(idRef);
-            selectParts.push(`data->>'${field}' AS _id`);
-            groupBy = `data->>'${field}'`;
+            const resolved = resolveFieldRef(idRef, unwindMap);
+            selectParts.push(`${resolved} AS _id`);
+            groupBy = resolved;
+            aliases.add('_id');
         } else if (typeof idRef === 'object' && !Array.isArray(idRef)) {
             const entries = Object.entries(idRef);
             if (entries.length === 0) {
@@ -851,12 +898,13 @@ function buildGroup(group) {
                 if (typeof ref !== 'string' || !ref.startsWith('$')) {
                     throw new Error(`Composite _id values must be field references: ${ref}`);
                 }
-                const field = validateFieldRef(ref);
-                jsonParts.push(`'${alias}', data->>'${field}'`);
-                groupByParts.push(`data->>'${field}'`);
+                const resolved = resolveFieldRef(ref, unwindMap);
+                jsonParts.push(`'${alias}', ${resolved}`);
+                groupByParts.push(resolved);
             }
             selectParts.push(`json_build_object(${jsonParts.join(', ')}) AS _id`);
             groupBy = groupByParts.join(', ');
+            aliases.add('_id');
         } else {
             throw new Error(`Unsupported $group _id: ${idRef}`);
         }
@@ -884,56 +932,58 @@ function buildGroup(group) {
             throw new Error(`Unsupported accumulator: ${acc}`);
         }
 
+        aliases.add(alias);
+
         if (acc === '$count') {
             selectParts.push(`COUNT(*) AS ${alias}`);
         } else if (acc === '$sum') {
             if (val === 1) {
                 selectParts.push(`COUNT(*) AS ${alias}`);
             } else if (typeof val === 'string' && val.startsWith('$')) {
-                const field = validateFieldRef(val);
-                selectParts.push(`SUM((data->>'${field}')::numeric) AS ${alias}`);
+                const resolved = resolveFieldRef(val, unwindMap);
+                selectParts.push(`SUM((${resolved})::numeric) AS ${alias}`);
             } else {
                 throw new Error(`Unsupported $sum value: ${val}`);
             }
         } else if (acc === '$avg') {
             if (typeof val === 'string' && val.startsWith('$')) {
-                const field = validateFieldRef(val);
-                selectParts.push(`AVG((data->>'${field}')::numeric) AS ${alias}`);
+                const resolved = resolveFieldRef(val, unwindMap);
+                selectParts.push(`AVG((${resolved})::numeric) AS ${alias}`);
             } else {
                 throw new Error(`Unsupported $avg value: ${val}`);
             }
         } else if (acc === '$min') {
             if (typeof val === 'string' && val.startsWith('$')) {
-                const field = validateFieldRef(val);
-                selectParts.push(`MIN((data->>'${field}')::numeric) AS ${alias}`);
+                const resolved = resolveFieldRef(val, unwindMap);
+                selectParts.push(`MIN((${resolved})::numeric) AS ${alias}`);
             } else {
                 throw new Error(`Unsupported $min value: ${val}`);
             }
         } else if (acc === '$max') {
             if (typeof val === 'string' && val.startsWith('$')) {
-                const field = validateFieldRef(val);
-                selectParts.push(`MAX((data->>'${field}')::numeric) AS ${alias}`);
+                const resolved = resolveFieldRef(val, unwindMap);
+                selectParts.push(`MAX((${resolved})::numeric) AS ${alias}`);
             } else {
                 throw new Error(`Unsupported $max value: ${val}`);
             }
         } else if (acc === '$push') {
             if (typeof val === 'string' && val.startsWith('$')) {
-                const field = validateFieldRef(val);
-                selectParts.push(`array_agg(data->>'${field}') AS ${alias}`);
+                const resolved = resolveFieldRef(val, unwindMap);
+                selectParts.push(`array_agg(${resolved}) AS ${alias}`);
             } else {
                 throw new Error(`Unsupported $push value: ${val}`);
             }
         } else if (acc === '$addToSet') {
             if (typeof val === 'string' && val.startsWith('$')) {
-                const field = validateFieldRef(val);
-                selectParts.push(`array_agg(DISTINCT data->>'${field}') AS ${alias}`);
+                const resolved = resolveFieldRef(val, unwindMap);
+                selectParts.push(`array_agg(DISTINCT ${resolved}) AS ${alias}`);
             } else {
                 throw new Error(`Unsupported $addToSet value: ${val}`);
             }
         }
     }
 
-    return { selectParts, groupBy };
+    return { selectParts, groupBy, aliases };
 }
 
 export async function docAggregate(client, collection, pipeline) {
@@ -944,12 +994,18 @@ export async function docAggregate(client, collection, pipeline) {
     let whereClauses = [];
     let selectParts = null;
     let groupBy = null;
+    let groupAliases = null;
     let orderClauses = [];
     let limitClause = '';
     let offsetClause = '';
     let hasGroup = false;
+    let hasProject = false;
+    let projectParts = null;
+    const unwindMap = {};
+    const fromClauses = [];
+    const lookupParts = [];
 
-    const supportedStages = new Set(['$match', '$group', '$sort', '$limit', '$skip']);
+    const supportedStages = new Set(['$match', '$group', '$sort', '$limit', '$skip', '$project', '$unwind', '$lookup']);
 
     for (const stage of pipeline) {
         const stageKeys = Object.keys(stage);
@@ -969,11 +1025,56 @@ export async function docAggregate(client, collection, pipeline) {
                 params.push(...bf.params);
                 paramIdx = bf.nextParam;
             }
+        } else if (op === '$unwind') {
+            const spec = stage.$unwind;
+            let field;
+            if (typeof spec === 'string') {
+                if (!spec.startsWith('$')) {
+                    throw new Error(`$unwind path must start with $: ${spec}`);
+                }
+                field = spec.slice(1);
+            } else if (typeof spec === 'object' && spec !== null && spec.path) {
+                if (!spec.path.startsWith('$')) {
+                    throw new Error(`$unwind path must start with $: ${spec.path}`);
+                }
+                field = spec.path.slice(1);
+            } else {
+                throw new Error(`Invalid $unwind spec: ${JSON.stringify(spec)}`);
+            }
+            if (!fieldKeyPattern.test(field)) {
+                throw new Error(`Invalid field reference: $${field}`);
+            }
+            const alias = `_unwound_${field}`;
+            fromClauses.push(`jsonb_array_elements_text(data->'${field}') AS ${alias}`);
+            unwindMap[field] = alias;
         } else if (op === '$group') {
             hasGroup = true;
-            const result = buildGroup(stage.$group);
+            const result = buildGroup(stage.$group, unwindMap);
             selectParts = result.selectParts;
             groupBy = result.groupBy;
+            groupAliases = result.aliases;
+        } else if (op === '$project') {
+            hasProject = true;
+            const result = buildProject(stage.$project, groupAliases);
+            projectParts = result.parts;
+        } else if (op === '$lookup') {
+            const spec = stage.$lookup;
+            if (!spec.from || !spec.localField || !spec.foreignField || !spec.as) {
+                throw new Error('$lookup requires from, localField, foreignField, and as');
+            }
+            validateIdentifier(spec.from);
+            if (!fieldKeyPattern.test(spec.localField)) {
+                throw new Error(`Invalid localField: ${spec.localField}`);
+            }
+            if (!fieldKeyPattern.test(spec.foreignField)) {
+                throw new Error(`Invalid foreignField: ${spec.foreignField}`);
+            }
+            if (!fieldKeyPattern.test(spec.as)) {
+                throw new Error(`Invalid as: ${spec.as}`);
+            }
+            lookupParts.push(
+                `COALESCE((SELECT json_agg(b.data) FROM ${spec.from} b WHERE b.data->>'${spec.foreignField}' = ${collection}.data->>'${spec.localField}'), '[]'::json) AS ${spec.as}`
+            );
         } else if (op === '$sort') {
             const sortEntries = Object.entries(stage.$sort);
             for (const [key, dir] of sortEntries) {
@@ -998,11 +1099,25 @@ export async function docAggregate(client, collection, pipeline) {
         }
     }
 
-    const select = selectParts && selectParts.length > 0
-        ? selectParts.join(', ')
-        : '_id, data, created_at';
+    // Determine SELECT clause
+    let select;
+    if (hasProject && projectParts && projectParts.length > 0) {
+        select = projectParts.join(', ');
+    } else if (selectParts && selectParts.length > 0) {
+        const allParts = [...selectParts, ...lookupParts];
+        select = allParts.join(', ');
+    } else {
+        const baseParts = ['_id', 'data', 'created_at', ...lookupParts];
+        select = baseParts.join(', ');
+    }
 
-    let sql = `SELECT ${select} FROM ${collection}`;
+    // Build FROM clause
+    let fromClause = collection;
+    if (fromClauses.length > 0) {
+        fromClause = `${collection}, ${fromClauses.join(', ')}`;
+    }
+
+    let sql = `SELECT ${select} FROM ${fromClause}`;
 
     if (whereClauses.length > 0) {
         sql += ` WHERE ${whereClauses.join(' AND ')}`;
