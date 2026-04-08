@@ -598,6 +598,172 @@ function fieldPath(key) {
     return `data${arrows}->>'${parts[parts.length - 1]}'`;
 }
 
+function fieldPathJson(key) {
+    const parts = key.split('.');
+    for (const part of parts) {
+        if (!fieldKeyPattern.test(part)) {
+            throw new Error(`Invalid field key: ${key}`);
+        }
+    }
+    return `data${parts.map(p => `->'${p}'`).join('')}`;
+}
+
+function jsonbPath(key) {
+    const parts = key.split('.');
+    for (const part of parts) {
+        if (!fieldKeyPattern.test(part)) {
+            throw new Error(`Invalid field key: ${key}`);
+        }
+    }
+    return `{${parts.join(',')}}`;
+}
+
+function toJsonbExpr(value, paramIdx) {
+    if (typeof value === 'boolean') {
+        return { expr: `to_jsonb($${paramIdx}::boolean)`, param: value, nextParam: paramIdx + 1 };
+    } else if (typeof value === 'number') {
+        return { expr: `to_jsonb($${paramIdx}::numeric)`, param: value, nextParam: paramIdx + 1 };
+    } else if (typeof value === 'string') {
+        return { expr: `to_jsonb($${paramIdx}::text)`, param: value, nextParam: paramIdx + 1 };
+    } else {
+        return { expr: `$${paramIdx}::jsonb`, param: JSON.stringify(value), nextParam: paramIdx + 1 };
+    }
+}
+
+function buildUpdate(update, startParam = 1) {
+    if (!update || Object.keys(update).length === 0) {
+        return { expr: `data || $${startParam}::jsonb`, params: [JSON.stringify(update || {})], nextParam: startParam + 1 };
+    }
+
+    const hasOps = Object.keys(update).some(k => k.startsWith('$'));
+    if (!hasOps) {
+        return { expr: `data || $${startParam}::jsonb`, params: [JSON.stringify(update)], nextParam: startParam + 1 };
+    }
+
+    let expr = 'data';
+    const params = [];
+    let paramIdx = startParam;
+
+    // $set
+    if (update.$set) {
+        expr = `(${expr} || $${paramIdx}::jsonb)`;
+        params.push(JSON.stringify(update.$set));
+        paramIdx++;
+    }
+
+    // $unset
+    if (update.$unset) {
+        for (const field of update.$unset) {
+            const parts = field.split('.');
+            for (const part of parts) {
+                if (!fieldKeyPattern.test(part)) {
+                    throw new Error(`Invalid field key: ${field}`);
+                }
+            }
+            if (parts.length === 1) {
+                expr = `(${expr} - $${paramIdx})`;
+                params.push(field);
+                paramIdx++;
+            } else {
+                const path = `{${parts.join(',')}}`;
+                expr = `(${expr} #- $${paramIdx}::text[])`;
+                params.push(path);
+                paramIdx++;
+            }
+        }
+    }
+
+    // $inc
+    if (update.$inc) {
+        for (const [field, amount] of Object.entries(update.$inc)) {
+            const jp = jsonbPath(field);
+            const fp = fieldPath(field);
+            expr = `jsonb_set(${expr}, $${paramIdx}::text[], to_jsonb(COALESCE((${fp})::numeric, 0) + $${paramIdx + 1}))`;
+            params.push(jp, amount);
+            paramIdx += 2;
+        }
+    }
+
+    // $mul
+    if (update.$mul) {
+        for (const [field, factor] of Object.entries(update.$mul)) {
+            const jp = jsonbPath(field);
+            const fp = fieldPath(field);
+            expr = `jsonb_set(${expr}, $${paramIdx}::text[], to_jsonb(COALESCE((${fp})::numeric, 0) * $${paramIdx + 1}))`;
+            params.push(jp, factor);
+            paramIdx += 2;
+        }
+    }
+
+    // $rename
+    if (update.$rename) {
+        for (const [oldName, newName] of Object.entries(update.$rename)) {
+            for (const part of oldName.split('.')) {
+                if (!fieldKeyPattern.test(part)) {
+                    throw new Error(`Invalid field key: ${oldName}`);
+                }
+            }
+            for (const part of newName.split('.')) {
+                if (!fieldKeyPattern.test(part)) {
+                    throw new Error(`Invalid field key: ${newName}`);
+                }
+            }
+            const oldJson = fieldPathJson(oldName);
+            const newJp = jsonbPath(newName);
+            if (oldName.includes('.')) {
+                const oldPath = `{${oldName.split('.').join(',')}}`;
+                expr = `jsonb_set((${expr} #- $${paramIdx}::text[]), $${paramIdx + 1}::text[], ${oldJson})`;
+                params.push(oldPath, newJp);
+                paramIdx += 2;
+            } else {
+                expr = `jsonb_set((${expr} - $${paramIdx}), $${paramIdx + 1}::text[], ${oldJson})`;
+                params.push(oldName, newJp);
+                paramIdx += 2;
+            }
+        }
+    }
+
+    // $push
+    if (update.$push) {
+        for (const [field, value] of Object.entries(update.$push)) {
+            const jp = jsonbPath(field);
+            const fj = fieldPathJson(field);
+            const val = toJsonbExpr(value, paramIdx + 1);
+            expr = `jsonb_set(${expr}, $${paramIdx}::text[], COALESCE(${fj}, '[]'::jsonb) || ${val.expr})`;
+            params.push(jp, val.param);
+            paramIdx = val.nextParam;
+        }
+    }
+
+    // $pull
+    if (update.$pull) {
+        for (const [field, value] of Object.entries(update.$pull)) {
+            const jp = jsonbPath(field);
+            const fj = fieldPathJson(field);
+            const val = toJsonbExpr(value, paramIdx + 1);
+            expr = `jsonb_set(${expr}, $${paramIdx}::text[], COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements(${fj}) AS elem WHERE elem != ${val.expr}), '[]'::jsonb))`;
+            params.push(jp, val.param);
+            paramIdx = val.nextParam;
+        }
+    }
+
+    // $addToSet
+    if (update.$addToSet) {
+        for (const [field, value] of Object.entries(update.$addToSet)) {
+            const jp = jsonbPath(field);
+            const fj = fieldPathJson(field);
+            const val = toJsonbExpr(value, paramIdx + 1);
+            expr = `jsonb_set(${expr}, $${paramIdx}::text[], CASE WHEN COALESCE(${fj}, '[]'::jsonb) @> ${val.expr} THEN ${fj} ELSE COALESCE(${fj}, '[]'::jsonb) || ${val.expr} END)`;
+            params.push(jp, val.param);
+            // $addToSet uses the value param TWICE (for @> check and for append)
+            // but it's the same placeholder in SQL, so we only push it once
+            paramIdx = val.nextParam;
+        }
+    }
+
+    return { expr, params, nextParam: paramIdx };
+}
+
 function hasOperators(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
         && Object.keys(value).some(k => k.startsWith('$'));
@@ -614,6 +780,38 @@ function buildFilter(filterDict, startParam = 1) {
     let paramIdx = startParam;
 
     for (const [key, value] of Object.entries(filterDict)) {
+        // Logical operators at top level
+        if (key === '$or' || key === '$and') {
+            if (!Array.isArray(value) || value.length === 0) {
+                throw new Error(`${key} value must be a non-empty array`);
+            }
+            const joiner = key === '$or' ? ' OR ' : ' AND ';
+            const subClauses = [];
+            for (const subFilter of value) {
+                const sub = buildFilter(subFilter, paramIdx);
+                if (sub.clause) {
+                    subClauses.push(sub.clause);
+                    params.push(...sub.params);
+                    paramIdx = sub.nextParam;
+                }
+            }
+            if (subClauses.length) opClauses.push('(' + subClauses.join(joiner) + ')');
+            continue;
+        }
+
+        if (key === '$not') {
+            if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+                throw new Error('$not value must be a filter object');
+            }
+            const sub = buildFilter(value, paramIdx);
+            if (sub.clause) {
+                opClauses.push(`NOT (${sub.clause})`);
+                params.push(...sub.params);
+                paramIdx = sub.nextParam;
+            }
+            continue;
+        }
+
         if (!fieldKeyPattern.test(key)) {
             throw new Error(`Invalid filter key: ${key}`);
         }
@@ -771,29 +969,29 @@ export async function docFindOne(client, collection, filter) {
 
 export async function docUpdate(client, collection, filter, update) {
     validateIdentifier(collection);
-    const { clause, params, nextParam } = buildFilter(filter);
-    const updateParam = `$${nextParam}::jsonb`;
-    params.push(JSON.stringify(update));
+    const { clause, params: filterParams, nextParam } = buildFilter(filter);
+    const upd = buildUpdate(update, nextParam);
+    const allParams = [...filterParams, ...upd.params];
     const where = clause || 'TRUE';
     const result = await client.query(
-        `UPDATE ${collection} SET data = data || ${updateParam} WHERE ${where}`,
-        params
+        `UPDATE ${collection} SET data = ${upd.expr} WHERE ${where}`,
+        allParams
     );
     return result.rowCount;
 }
 
 export async function docUpdateOne(client, collection, filter, update) {
     validateIdentifier(collection);
-    const { clause, params, nextParam } = buildFilter(filter);
-    const updateParam = `$${nextParam}::jsonb`;
-    params.push(JSON.stringify(update));
+    const { clause, params: filterParams, nextParam } = buildFilter(filter);
+    const upd = buildUpdate(update, nextParam);
+    const allParams = [...filterParams, ...upd.params];
     const where = clause || 'TRUE';
     const result = await client.query(
         `WITH target AS (` +
         `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
-        `) UPDATE ${collection} SET data = data || ${updateParam} ` +
+        `) UPDATE ${collection} SET data = ${upd.expr} ` +
         `FROM target WHERE ${collection}._id = target._id`,
-        params
+        allParams
     );
     return result.rowCount;
 }
@@ -820,6 +1018,56 @@ export async function docDeleteOne(client, collection, filter) {
         params
     );
     return result.rowCount;
+}
+
+export async function docFindOneAndUpdate(client, collection, filter, update) {
+    validateIdentifier(collection);
+    const { clause, params: filterParams, nextParam } = buildFilter(filter);
+    const upd = buildUpdate(update, nextParam);
+    const allParams = [...filterParams, ...upd.params];
+    const where = clause || 'TRUE';
+    const result = await client.query(
+        `WITH target AS (` +
+        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
+        `) UPDATE ${collection} SET data = ${upd.expr} ` +
+        `FROM target WHERE ${collection}._id = target._id ` +
+        `RETURNING ${collection}._id, ${collection}.data, ${collection}.created_at`,
+        allParams
+    );
+    return result.rows[0] || null;
+}
+
+export async function docFindOneAndDelete(client, collection, filter) {
+    validateIdentifier(collection);
+    const { clause, params } = buildFilter(filter);
+    const where = clause || 'TRUE';
+    const result = await client.query(
+        `WITH target AS (` +
+        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
+        `) DELETE FROM ${collection} USING target ` +
+        `WHERE ${collection}._id = target._id ` +
+        `RETURNING ${collection}._id, ${collection}.data, ${collection}.created_at`,
+        params
+    );
+    return result.rows[0] || null;
+}
+
+export async function docDistinct(client, collection, field, filter = null) {
+    validateIdentifier(collection);
+    for (const part of field.split('.')) {
+        if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(part)) {
+            throw new Error(`Invalid field key: ${field}`);
+        }
+    }
+    const fp = fieldPath(field);
+    const whereParts = [`${fp} IS NOT NULL`];
+    const { clause, params } = buildFilter(filter);
+    if (clause) {
+        whereParts.push(clause);
+    }
+    const sql = `SELECT DISTINCT ${fp} FROM ${collection} WHERE ${whereParts.join(' AND ')}`;
+    const result = await client.query(sql, params.length > 0 ? params : undefined);
+    return result.rows.map(row => Object.values(row)[0]);
 }
 
 export async function docCount(client, collection, filter) {

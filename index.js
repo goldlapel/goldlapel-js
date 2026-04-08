@@ -21,6 +21,8 @@ import {
     analyze, explainScore,
     docInsert, docInsertMany, docFind, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
+    docFindOneAndUpdate, docFindOneAndDelete,
+    docDistinct,
     docCount, docCreateIndex, docAggregate,
     docWatch, docUnwatch,
     docCreateTtlIndex, docRemoveTtlIndex,
@@ -361,6 +363,9 @@ export class GoldLapel {
     async docUpdateOne(...args) { return docUpdateOne(this.client, ...args); }
     async docDelete(...args) { return docDelete(this.client, ...args); }
     async docDeleteOne(...args) { return docDeleteOne(this.client, ...args); }
+    async docFindOneAndUpdate(...args) { return docFindOneAndUpdate(this.client, ...args); }
+    async docFindOneAndDelete(...args) { return docFindOneAndDelete(this.client, ...args); }
+    async docDistinct(...args) { return docDistinct(this.client, ...args); }
     async docCount(...args) { return docCount(this.client, ...args); }
     async docCreateIndex(...args) { return docCreateIndex(this.client, ...args); }
     async docAggregate(...args) { return docAggregate(this.client, ...args); }
@@ -519,6 +524,8 @@ export {
     analyze, explainScore,
     docInsert, docInsertMany, docFind, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
+    docFindOneAndUpdate, docFindOneAndDelete,
+    docDistinct,
     docCount, docCreateIndex, docAggregate,
     docWatch, docUnwatch,
     docCreateTtlIndex, docRemoveTtlIndex,

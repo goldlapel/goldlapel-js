@@ -9,6 +9,9 @@ import {
     docUpdateOne,
     docDelete,
     docDeleteOne,
+    docFindOneAndUpdate,
+    docFindOneAndDelete,
+    docDistinct,
     docCount,
     docCreateIndex,
     docAggregate,
@@ -1156,6 +1159,400 @@ describe('docRemoveCap', () => {
         const client = mockClient();
         await assert.rejects(
             () => docRemoveCap(client, 'bad table'),
+            /Invalid identifier/
+        );
+    });
+});
+
+// ─── Logical Operators ($or, $and, $not) ─────────────────────────────────
+
+describe('logical operators', () => {
+    it('$or generates OR clause', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { $or: [{ status: 'active' }, { role: 'admin' }] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('WHERE'));
+        assert.ok(sql.includes('OR'));
+        assert.ok(sql.includes('data @>'));
+    });
+
+    it('$and generates AND clause', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { $and: [{ status: 'active' }, { role: 'admin' }] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('WHERE'));
+        assert.ok(sql.includes('AND'));
+    });
+
+    it('$not at top level negates filter', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { $not: { status: 'banned' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('NOT ('));
+        assert.ok(sql.includes('data @>'));
+    });
+
+    it('nested $or inside $and', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', {
+            $and: [
+                { $or: [{ role: 'admin' }, { role: 'editor' }] },
+                { active: true },
+            ],
+        });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('AND'));
+        assert.ok(sql.includes('OR'));
+    });
+
+    it('$or with comparison operators threads paramIdx', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { $or: [{ age: { $gt: 18 } }, { age: { $lt: 5 } }] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('$1'));
+        assert.ok(sql.includes('$2'));
+        assert.deepEqual(client._calls[0].values, [18, 5]);
+    });
+
+    it('mixed logical operators with field filters', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { name: 'Alice', $or: [{ age: { $gt: 18 } }, { role: 'admin' }] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('data @>'));
+        assert.ok(sql.includes('OR'));
+    });
+
+    it('$or rejects non-array', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { $or: { a: 1 } }),
+            /\$or value must be a non-empty array/
+        );
+    });
+
+    it('$or rejects empty array', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { $or: [] }),
+            /\$or value must be a non-empty array/
+        );
+    });
+
+    it('$and rejects non-array', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { $and: 'bad' }),
+            /\$and value must be a non-empty array/
+        );
+    });
+
+    it('$not rejects non-object', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { $not: [1, 2] }),
+            /\$not value must be a filter object/
+        );
+    });
+
+    it('logical operators work with docCount', async () => {
+        const client = mockClient({ rows: [{ count: '3' }], rowCount: 1 });
+        const result = await docCount(client, 'users', { $or: [{ active: true }, { role: 'admin' }] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT COUNT(*)'));
+        assert.ok(sql.includes('OR'));
+        assert.equal(result, 3);
+    });
+
+    it('logical operators work with docDelete', async () => {
+        const client = mockClient({ rows: [], rowCount: 2 });
+        const result = await docDelete(client, 'users', { $or: [{ status: 'banned' }, { status: 'spam' }] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('DELETE FROM users'));
+        assert.ok(sql.includes('OR'));
+        assert.equal(result, 2);
+    });
+});
+
+// ─── Update Operators ($set, $inc, $unset, $mul, $rename) ────────────────
+
+describe('update operators', () => {
+    it('$set generates jsonb merge', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $set: { age: 30 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SET data = (data || $2::jsonb)'));
+        assert.ok(sql.includes('WHERE data @> $1::jsonb'));
+        assert.deepEqual(client._calls[0].values, [
+            JSON.stringify({ name: 'Alice' }),
+            JSON.stringify({ age: 30 }),
+        ]);
+    });
+
+    it('$inc generates numeric increment', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $inc: { score: 10 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('jsonb_set(data'));
+        assert.ok(sql.includes('::text[]'));
+        assert.ok(sql.includes('COALESCE'));
+        assert.ok(sql.includes('+ $'));
+    });
+
+    it('$unset top-level field', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $unset: ['temp'] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('(data - $2)'));
+    });
+
+    it('$unset nested field uses #-', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $unset: ['addr.temp'] });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('#- $2::text[]'));
+        assert.ok(client._calls[0].values.includes('{addr,temp}'));
+    });
+
+    it('$mul generates multiply', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $mul: { score: 2 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('* $'));
+    });
+
+    it('$rename moves field', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $rename: { old_name: 'new_name' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('jsonb_set'));
+        assert.ok(sql.includes('- $'));
+    });
+
+    it('combined $set and $inc', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $set: { status: 'active' }, $inc: { loginCount: 1 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('||'));
+        assert.ok(sql.includes('jsonb_set'));
+        assert.ok(sql.includes('COALESCE'));
+    });
+
+    it('nested field in $inc', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $inc: { 'stats.views': 1 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('jsonb_set'));
+        assert.ok(client._calls[0].values.some(v => v === '{stats,views}'));
+    });
+
+    it('plain update (no $operators) still works', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { age: 31 });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('data || $2::jsonb'));
+        assert.deepEqual(client._calls[0].values, [
+            JSON.stringify({ name: 'Alice' }),
+            JSON.stringify({ age: 31 }),
+        ]);
+    });
+
+    it('update operators work with docUpdateOne', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdateOne(client, 'users', { name: 'Alice' }, { $set: { age: 30 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('WITH target AS'));
+        assert.ok(sql.includes('(data || $2::jsonb)'));
+    });
+});
+
+// ─── Array Update Operators ($push, $pull, $addToSet) ────────────────────
+
+describe('array update operators', () => {
+    it('$push appends to array', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $push: { tags: 'vip' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('jsonb_set'));
+        assert.ok(sql.includes('COALESCE'));
+        assert.ok(sql.includes("'[]'::jsonb"));
+        assert.ok(sql.includes('to_jsonb'));
+    });
+
+    it('$pull removes from array', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $pull: { tags: 'temp' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('jsonb_agg'));
+        assert.ok(sql.includes('jsonb_array_elements'));
+        assert.ok(sql.includes('WHERE elem !='));
+    });
+
+    it('$addToSet adds only if not present', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $addToSet: { tags: 'unique' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('CASE WHEN'));
+        assert.ok(sql.includes('@>'));
+        assert.ok(sql.includes('ELSE'));
+    });
+
+    it('$push with numeric value', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'items', {}, { $push: { scores: 99 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('to_jsonb($2::numeric)'));
+    });
+
+    it('combined $set and $push', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { name: 'Alice' }, { $set: { updated: true }, $push: { log: 'action' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('||'));
+        assert.ok(sql.includes('jsonb_set'));
+    });
+});
+
+// ─── docFindOneAndUpdate ─────────────────────────────────────────────────
+
+describe('docFindOneAndUpdate', () => {
+    it('returns updated document with RETURNING', async () => {
+        const row = { _id: 'abc', data: { name: 'Alice', age: 30 }, created_at: '2026-01-01' };
+        const client = mockClient({ rows: [row], rowCount: 1 });
+        const result = await docFindOneAndUpdate(client, 'users', { name: 'Alice' }, { $set: { age: 30 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('WITH target AS'));
+        assert.ok(sql.includes('RETURNING'));
+        assert.ok(sql.includes('users._id'));
+        assert.ok(sql.includes('users.data'));
+        assert.ok(sql.includes('users.created_at'));
+        assert.deepEqual(result, row);
+    });
+
+    it('returns null when no match', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        const result = await docFindOneAndUpdate(client, 'users', { name: 'Nobody' }, { $set: { age: 0 } });
+        assert.equal(result, null);
+    });
+
+    it('works with plain update (no $operators)', async () => {
+        const row = { _id: 'x', data: { a: 1 }, created_at: 'now' };
+        const client = mockClient({ rows: [row], rowCount: 1 });
+        const result = await docFindOneAndUpdate(client, 'items', { a: 1 }, { a: 2 });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('data || $2::jsonb'));
+        assert.ok(sql.includes('RETURNING'));
+        assert.deepEqual(result, row);
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFindOneAndUpdate(client, 'bad table', {}, {}),
+            /Invalid identifier/
+        );
+    });
+
+    it('works with $inc operator', async () => {
+        const row = { _id: 'abc', data: { score: 11 }, created_at: 'now' };
+        const client = mockClient({ rows: [row], rowCount: 1 });
+        await docFindOneAndUpdate(client, 'users', { name: 'Alice' }, { $inc: { score: 1 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('jsonb_set'));
+        assert.ok(sql.includes('RETURNING'));
+    });
+});
+
+// ─── docFindOneAndDelete ─────────────────────────────────────────────────
+
+describe('docFindOneAndDelete', () => {
+    it('returns deleted document with RETURNING', async () => {
+        const row = { _id: 'abc', data: { name: 'Alice' }, created_at: '2026-01-01' };
+        const client = mockClient({ rows: [row], rowCount: 1 });
+        const result = await docFindOneAndDelete(client, 'users', { name: 'Alice' });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('WITH target AS'));
+        assert.ok(sql.includes('DELETE FROM users USING target'));
+        assert.ok(sql.includes('RETURNING'));
+        assert.ok(sql.includes('users._id'));
+        assert.ok(sql.includes('users.data'));
+        assert.ok(sql.includes('users.created_at'));
+        assert.deepEqual(result, row);
+    });
+
+    it('returns null when no match', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        const result = await docFindOneAndDelete(client, 'users', { name: 'Nobody' });
+        assert.equal(result, null);
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFindOneAndDelete(client, '1bad', {}),
+            /Invalid identifier/
+        );
+    });
+
+    it('uses filter with comparison operators', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFindOneAndDelete(client, 'logs', { age: { $gt: 90 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("(data->>'age')::numeric > $1"));
+        assert.ok(sql.includes('RETURNING'));
+    });
+});
+
+// ─── docDistinct ─────────────────────────────────────────────────────────
+
+describe('docDistinct', () => {
+    it('generates SELECT DISTINCT', async () => {
+        const client = mockClient({ rows: [{ '?column?': 'admin' }, { '?column?': 'user' }], rowCount: 2 });
+        const result = await docDistinct(client, 'users', 'role');
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT DISTINCT'));
+        assert.ok(sql.includes("data->>'role'"));
+        assert.ok(sql.includes('IS NOT NULL'));
+        assert.deepEqual(result, ['admin', 'user']);
+    });
+
+    it('handles dot-notation field', async () => {
+        const client = mockClient({ rows: [{ '?column?': 'NY' }], rowCount: 1 });
+        const result = await docDistinct(client, 'users', 'addr.city');
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data->'addr'->>'city'"));
+        assert.deepEqual(result, ['NY']);
+    });
+
+    it('applies filter when provided', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docDistinct(client, 'users', 'role', { active: true });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT DISTINCT'));
+        assert.ok(sql.includes('IS NOT NULL'));
+        assert.ok(sql.includes('data @> $1::jsonb'));
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ active: true })]);
+    });
+
+    it('returns empty array when no results', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        const result = await docDistinct(client, 'users', 'role');
+        assert.deepEqual(result, []);
+    });
+
+    it('works without filter', async () => {
+        const client = mockClient({ rows: [{ '?column?': 'a' }], rowCount: 1 });
+        const result = await docDistinct(client, 'items', 'category');
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT DISTINCT'));
+        assert.ok(sql.includes('IS NOT NULL'));
+        // No filter-related clause besides IS NOT NULL
+        assert.ok(!sql.includes('data @>'));
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docDistinct(client, 'bad table', 'field'),
             /Invalid identifier/
         );
     });
