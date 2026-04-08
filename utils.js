@@ -563,6 +563,121 @@ export async function script(client, luaCode, ...args) {
 
 // ─── Document Store ────────────────────────────────────────────────────────
 
+const fieldKeyPattern = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
+
+const COMPARISON_OPS = {
+    $gt:  '>',
+    $gte: '>=',
+    $lt:  '<',
+    $lte: '<=',
+    $ne:  '!=',
+};
+
+function fieldPath(key) {
+    const parts = key.split('.');
+    if (parts.length === 1) {
+        return `data->>'${parts[0]}'`;
+    }
+    const arrows = parts.slice(0, -1).map(p => `->'${p}'`).join('');
+    return `data${arrows}->>'${parts[parts.length - 1]}'`;
+}
+
+function hasOperators(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        && Object.keys(value).some(k => k.startsWith('$'));
+}
+
+function buildFilter(filterDict, startParam = 1) {
+    if (!filterDict || Object.keys(filterDict).length === 0) {
+        return { clause: '', params: [], nextParam: startParam };
+    }
+
+    const plainKeys = {};
+    const opClauses = [];
+    const params = [];
+    let paramIdx = startParam;
+
+    for (const [key, value] of Object.entries(filterDict)) {
+        if (!fieldKeyPattern.test(key)) {
+            throw new Error(`Invalid filter key: ${key}`);
+        }
+
+        if (!hasOperators(value)) {
+            plainKeys[key] = value;
+            continue;
+        }
+
+        const fp = fieldPath(key);
+
+        for (const [op, opVal] of Object.entries(value)) {
+            if (op in COMPARISON_OPS) {
+                opClauses.push(`(${fp})::numeric ${COMPARISON_OPS[op]} $${paramIdx}`);
+                params.push(opVal);
+                paramIdx++;
+            } else if (op === '$in') {
+                if (!Array.isArray(opVal) || opVal.length === 0) {
+                    throw new Error('$in requires a non-empty array');
+                }
+                const placeholders = opVal.map((_, i) => `$${paramIdx + i}`);
+                opClauses.push(`${fp} IN (${placeholders.join(', ')})`);
+                for (const item of opVal) {
+                    params.push(String(item));
+                    paramIdx++;
+                }
+            } else if (op === '$nin') {
+                if (!Array.isArray(opVal) || opVal.length === 0) {
+                    throw new Error('$nin requires a non-empty array');
+                }
+                const placeholders = opVal.map((_, i) => `$${paramIdx + i}`);
+                opClauses.push(`${fp} NOT IN (${placeholders.join(', ')})`);
+                for (const item of opVal) {
+                    params.push(String(item));
+                    paramIdx++;
+                }
+            } else if (op === '$exists') {
+                if (opVal) {
+                    opClauses.push(`data ? '${key}'`);
+                } else {
+                    opClauses.push(`NOT (data ? '${key}')`);
+                }
+            } else if (op === '$regex') {
+                opClauses.push(`${fp} ~ $${paramIdx}`);
+                params.push(opVal);
+                paramIdx++;
+            } else if (op === '$not') {
+                if (typeof opVal === 'object' && opVal !== null && !Array.isArray(opVal)) {
+                    const inner = buildFilter({ [key]: opVal }, paramIdx);
+                    if (inner.clause) {
+                        opClauses.push(`NOT (${inner.clause})`);
+                        params.push(...inner.params);
+                        paramIdx = inner.nextParam;
+                    }
+                } else {
+                    throw new Error('$not requires an operator object');
+                }
+            } else {
+                throw new Error(`Unknown operator: ${op}`);
+            }
+        }
+    }
+
+    const allClauses = [];
+
+    if (Object.keys(plainKeys).length > 0) {
+        allClauses.push(`data @> $${paramIdx}::jsonb`);
+        params.push(JSON.stringify(plainKeys));
+        paramIdx++;
+    }
+
+    allClauses.push(...opClauses);
+
+    return {
+        clause: allClauses.join(' AND '),
+        params,
+        nextParam: paramIdx,
+    };
+}
+
 async function ensureCollection(client, collection) {
     await client.query(
         `CREATE TABLE IF NOT EXISTS ${collection} (` +
@@ -596,11 +711,11 @@ export async function docInsertMany(client, collection, documents) {
 
 export async function docFind(client, collection, filter, { sort, limit, skip } = {}) {
     validateIdentifier(collection);
-    const params = [];
+    const { clause, params, nextParam } = buildFilter(filter);
+    let paramIdx = nextParam;
     let sql = `SELECT _id, data, created_at FROM ${collection}`;
-    if (filter && Object.keys(filter).length > 0) {
-        params.push(JSON.stringify(filter));
-        sql += ` WHERE data @> $${params.length}::jsonb`;
+    if (clause) {
+        sql += ` WHERE ${clause}`;
     }
     if (sort && Object.keys(sort).length > 0) {
         const sortKeyPattern = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
@@ -614,11 +729,13 @@ export async function docFind(client, collection, filter, { sort, limit, skip } 
     }
     if (limit !== undefined) {
         params.push(limit);
-        sql += ` LIMIT $${params.length}`;
+        sql += ` LIMIT $${paramIdx}`;
+        paramIdx++;
     }
     if (skip !== undefined) {
         params.push(skip);
-        sql += ` OFFSET $${params.length}`;
+        sql += ` OFFSET $${paramIdx}`;
+        paramIdx++;
     }
     const result = await client.query(sql, params.length > 0 ? params : undefined);
     return result.rows;
@@ -626,11 +743,10 @@ export async function docFind(client, collection, filter, { sort, limit, skip } 
 
 export async function docFindOne(client, collection, filter) {
     validateIdentifier(collection);
-    const params = [];
+    const { clause, params } = buildFilter(filter);
     let sql = `SELECT _id, data, created_at FROM ${collection}`;
-    if (filter && Object.keys(filter).length > 0) {
-        params.push(JSON.stringify(filter));
-        sql += ` WHERE data @> $${params.length}::jsonb`;
+    if (clause) {
+        sql += ` WHERE ${clause}`;
     }
     sql += ' LIMIT 1';
     const result = await client.query(sql, params.length > 0 ? params : undefined);
@@ -639,58 +755,67 @@ export async function docFindOne(client, collection, filter) {
 
 export async function docUpdate(client, collection, filter, update) {
     validateIdentifier(collection);
+    const { clause, params, nextParam } = buildFilter(filter);
+    const updateParam = `$${nextParam}::jsonb`;
+    params.push(JSON.stringify(update));
+    const where = clause || 'TRUE';
     const result = await client.query(
-        `UPDATE ${collection} SET data = data || $2::jsonb WHERE data @> $1::jsonb`,
-        [JSON.stringify(filter), JSON.stringify(update)]
+        `UPDATE ${collection} SET data = data || ${updateParam} WHERE ${where}`,
+        params
     );
     return result.rowCount;
 }
 
 export async function docUpdateOne(client, collection, filter, update) {
     validateIdentifier(collection);
+    const { clause, params, nextParam } = buildFilter(filter);
+    const updateParam = `$${nextParam}::jsonb`;
+    params.push(JSON.stringify(update));
+    const where = clause || 'TRUE';
     const result = await client.query(
         `WITH target AS (` +
-        `SELECT _id FROM ${collection} WHERE data @> $1::jsonb LIMIT 1` +
-        `) UPDATE ${collection} SET data = data || $2::jsonb ` +
+        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
+        `) UPDATE ${collection} SET data = data || ${updateParam} ` +
         `FROM target WHERE ${collection}._id = target._id`,
-        [JSON.stringify(filter), JSON.stringify(update)]
+        params
     );
     return result.rowCount;
 }
 
 export async function docDelete(client, collection, filter) {
     validateIdentifier(collection);
+    const { clause, params } = buildFilter(filter);
+    const where = clause || 'TRUE';
     const result = await client.query(
-        `DELETE FROM ${collection} WHERE data @> $1::jsonb`,
-        [JSON.stringify(filter)]
+        `DELETE FROM ${collection} WHERE ${where}`,
+        params
     );
     return result.rowCount;
 }
 
 export async function docDeleteOne(client, collection, filter) {
     validateIdentifier(collection);
+    const { clause, params } = buildFilter(filter);
+    const where = clause || 'TRUE';
     const result = await client.query(
         `WITH target AS (` +
-        `SELECT _id FROM ${collection} WHERE data @> $1::jsonb LIMIT 1` +
+        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
         `) DELETE FROM ${collection} USING target WHERE ${collection}._id = target._id`,
-        [JSON.stringify(filter)]
+        params
     );
     return result.rowCount;
 }
 
 export async function docCount(client, collection, filter) {
     validateIdentifier(collection);
-    const params = [];
+    const { clause, params } = buildFilter(filter);
     let sql = `SELECT COUNT(*) FROM ${collection}`;
-    if (filter && Object.keys(filter).length > 0) {
-        params.push(JSON.stringify(filter));
-        sql += ` WHERE data @> $${params.length}::jsonb`;
+    if (clause) {
+        sql += ` WHERE ${clause}`;
     }
     const result = await client.query(sql, params.length > 0 ? params : undefined);
     return parseInt(result.rows[0].count);
 }
-
-const fieldKeyPattern = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
 
 function validateFieldRef(ref) {
     const field = ref.slice(1);
@@ -781,6 +906,7 @@ export async function docAggregate(client, collection, pipeline) {
     validateIdentifier(collection);
 
     const params = [];
+    let paramIdx = 1;
     let whereClauses = [];
     let selectParts = null;
     let groupBy = null;
@@ -803,8 +929,12 @@ export async function docAggregate(client, collection, pipeline) {
         }
 
         if (op === '$match') {
-            params.push(JSON.stringify(stage.$match));
-            whereClauses.push(`data @> $${params.length}::jsonb`);
+            const bf = buildFilter(stage.$match, paramIdx);
+            if (bf.clause) {
+                whereClauses.push(bf.clause);
+                params.push(...bf.params);
+                paramIdx = bf.nextParam;
+            }
         } else if (op === '$group') {
             hasGroup = true;
             const result = buildGroup(stage.$group);
@@ -825,10 +955,12 @@ export async function docAggregate(client, collection, pipeline) {
             }
         } else if (op === '$limit') {
             params.push(stage.$limit);
-            limitClause = ` LIMIT $${params.length}`;
+            limitClause = ` LIMIT $${paramIdx}`;
+            paramIdx++;
         } else if (op === '$skip') {
             params.push(stage.$skip);
-            offsetClause = ` OFFSET $${params.length}`;
+            offsetClause = ` OFFSET $${paramIdx}`;
+            paramIdx++;
         }
     }
 

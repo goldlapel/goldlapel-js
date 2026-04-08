@@ -535,4 +535,152 @@ describe('docAggregate', () => {
         assert.ok(!sql.includes('ORDER BY'));
         assert.deepEqual(result, rows);
     });
+
+    it('$match with comparison operators', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $match: { amount: { $gte: 100 } } },
+            { $limit: 10 },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("(data->>'amount')::numeric >= $1"));
+        assert.ok(sql.includes('LIMIT $2'));
+        assert.deepEqual(client._calls[0].values, [100, 10]);
+    });
+});
+
+// ─── Comparison Operators ─────────────────────────────────────────────────
+
+describe('comparison operators', () => {
+    it('$gt generates numeric comparison', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'products', { price: { $gt: 100 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("(data->>'price')::numeric > $1"));
+        assert.deepEqual(client._calls[0].values, [100]);
+    });
+
+    it('$gte and $lte generate range', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'products', { price: { $gte: 10, $lte: 50 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("(data->>'price')::numeric >= $1"));
+        assert.ok(sql.includes("(data->>'price')::numeric <= $2"));
+        assert.deepEqual(client._calls[0].values, [10, 50]);
+    });
+
+    it('$lt generates less-than', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'events', { age: { $lt: 18 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("(data->>'age')::numeric < $1"));
+        assert.deepEqual(client._calls[0].values, [18]);
+    });
+
+    it('$ne generates not-equal', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { status: { $ne: 0 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("(data->>'status')::numeric != $1"));
+        assert.deepEqual(client._calls[0].values, [0]);
+    });
+
+    it('$in generates IN clause with numbered params', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { role: { $in: ['admin', 'editor'] } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data->>'role' IN ($1, $2)"));
+        assert.deepEqual(client._calls[0].values, ['admin', 'editor']);
+    });
+
+    it('$nin generates NOT IN clause', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { status: { $nin: ['banned', 'suspended'] } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data->>'status' NOT IN ($1, $2)"));
+        assert.deepEqual(client._calls[0].values, ['banned', 'suspended']);
+    });
+
+    it('$exists true checks key presence', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { email: { $exists: true } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data ? 'email'"));
+        assert.deepEqual(client._calls[0].values, undefined);
+    });
+
+    it('$exists false checks key absence', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { deleted_at: { $exists: false } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("NOT (data ? 'deleted_at')"));
+    });
+
+    it('$regex generates pattern match', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { name: { $regex: '^A' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("data->>'name' ~ $1"));
+        assert.deepEqual(client._calls[0].values, ['^A']);
+    });
+
+    it('$not negates inner operator', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'products', { price: { $not: { $gt: 1000 } } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("NOT ((data->>'price')::numeric > $1)"));
+        assert.deepEqual(client._calls[0].values, [1000]);
+    });
+
+    it('mixed plain values and operators', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'products', { category: 'electronics', price: { $gt: 50 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('data @> $'));
+        assert.ok(sql.includes("(data->>'price')::numeric > $"));
+        // plain key should be in containment param, operator should be separate
+        const containmentIdx = sql.match(/data @> \$(\d+)::jsonb/)[1];
+        const gtIdx = sql.match(/::numeric > \$(\d+)/)[1];
+        assert.notEqual(containmentIdx, gtIdx);
+        // containment param should be the category JSON
+        const cIdx = Number(containmentIdx) - 1;
+        assert.equal(client._calls[0].values[cIdx], JSON.stringify({ category: 'electronics' }));
+    });
+
+    it('operators work with docCount', async () => {
+        const client = mockClient({ rows: [{ count: '5' }], rowCount: 1 });
+        const result = await docCount(client, 'products', { price: { $gte: 100 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT COUNT(*)'));
+        assert.ok(sql.includes("(data->>'price')::numeric >= $1"));
+        assert.equal(result, 5);
+    });
+
+    it('operators work with docUpdate', async () => {
+        const client = mockClient({ rows: [], rowCount: 3 });
+        const result = await docUpdate(client, 'products', { price: { $lt: 10 } }, { clearance: true });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('UPDATE products SET data = data || $2::jsonb'));
+        assert.ok(sql.includes("(data->>'price')::numeric < $1"));
+        assert.deepEqual(client._calls[0].values, [10, JSON.stringify({ clearance: true })]);
+        assert.equal(result, 3);
+    });
+
+    it('operators work with docDelete', async () => {
+        const client = mockClient({ rows: [], rowCount: 2 });
+        const result = await docDelete(client, 'logs', { age: { $gt: 90 } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('DELETE FROM logs'));
+        assert.ok(sql.includes("(data->>'age')::numeric > $1"));
+        assert.deepEqual(client._calls[0].values, [90]);
+        assert.equal(result, 2);
+    });
+
+    it('$in rejects empty array', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { role: { $in: [] } }),
+            /\$in requires a non-empty array/
+        );
+    });
 });
