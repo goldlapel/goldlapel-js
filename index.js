@@ -6,6 +6,23 @@ import { join, dirname } from 'path';
 import { platform, arch } from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
+import {
+    publish, subscribe, enqueue, dequeue,
+    incr, getCounter,
+    zadd, zincrby, zrange, zrank, zscore, zrem,
+    geoadd, georadius, geodist,
+    hset, hget, hgetall, hdel,
+    countDistinct,
+    script,
+    streamAdd, streamCreateGroup, streamRead, streamAck, streamClaim,
+    search, searchFuzzy, searchPhonetic, similar, suggest,
+    facets, aggregate, createSearchConfig,
+    percolateAdd, percolate, percolateDelete,
+    analyze, explainScore,
+    docInsert, docInsertMany, docFind, docFindOne,
+    docUpdate, docUpdateOne, docDelete, docDeleteOne,
+    docCount, docCreateIndex, docAggregate,
+} from './utils.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -227,6 +244,7 @@ export class GoldLapel {
         this._extraArgs = extraArgs || [];
         this._process = null;
         this._proxyUrl = null;
+        this._client = null;
     }
 
     async start() {
@@ -274,6 +292,12 @@ export class GoldLapel {
 
         this._proxyUrl = _makeProxyUrl(this._upstream, this._port);
 
+        // Create client connection
+        const pg = await import('pg');
+        const Client = pg.default?.Client ?? pg.Client;
+        this._client = new Client({ connectionString: this._proxyUrl });
+        await this._client.connect();
+
         if (this._dashboardPort) {
             console.log(`goldlapel → :${this._port} (proxy) | http://127.0.0.1:${this._dashboardPort} (dashboard)`);
         } else {
@@ -284,6 +308,10 @@ export class GoldLapel {
     }
 
     stop() {
+        if (this._client) {
+            this._client.end().catch(() => {});
+            this._client = null;
+        }
         const proc = this._process;
         this._process = null;
         this._proxyUrl = null;
@@ -295,6 +323,13 @@ export class GoldLapel {
                 }
             }, 5000);
         }
+    }
+
+    get client() {
+        if (!this._client) {
+            throw new Error('Not connected. Call start() before accessing client.');
+        }
+        return this._client;
     }
 
     get url() {
@@ -311,6 +346,80 @@ export class GoldLapel {
         }
         return null;
     }
+
+    // ─── Instance methods (delegate to utils with this.client) ─────────
+
+    // Document store
+    async docInsert(...args) { return docInsert(this.client, ...args); }
+    async docInsertMany(...args) { return docInsertMany(this.client, ...args); }
+    async docFind(...args) { return docFind(this.client, ...args); }
+    async docFindOne(...args) { return docFindOne(this.client, ...args); }
+    async docUpdate(...args) { return docUpdate(this.client, ...args); }
+    async docUpdateOne(...args) { return docUpdateOne(this.client, ...args); }
+    async docDelete(...args) { return docDelete(this.client, ...args); }
+    async docDeleteOne(...args) { return docDeleteOne(this.client, ...args); }
+    async docCount(...args) { return docCount(this.client, ...args); }
+    async docCreateIndex(...args) { return docCreateIndex(this.client, ...args); }
+    async docAggregate(...args) { return docAggregate(this.client, ...args); }
+
+    // Search
+    async search(...args) { return search(this.client, ...args); }
+    async searchFuzzy(...args) { return searchFuzzy(this.client, ...args); }
+    async searchPhonetic(...args) { return searchPhonetic(this.client, ...args); }
+    async similar(...args) { return similar(this.client, ...args); }
+    async suggest(...args) { return suggest(this.client, ...args); }
+    async facets(...args) { return facets(this.client, ...args); }
+    async aggregate(...args) { return aggregate(this.client, ...args); }
+    async createSearchConfig(...args) { return createSearchConfig(this.client, ...args); }
+
+    // Percolation
+    async percolateAdd(...args) { return percolateAdd(this.client, ...args); }
+    async percolate(...args) { return percolate(this.client, ...args); }
+    async percolateDelete(...args) { return percolateDelete(this.client, ...args); }
+
+    // Analysis
+    async analyze(...args) { return analyze(this.client, ...args); }
+    async explainScore(...args) { return explainScore(this.client, ...args); }
+
+    // Pub/Sub & Queues
+    async publish(...args) { return publish(this.client, ...args); }
+    async subscribe(...args) { return subscribe(this.client, ...args); }
+    async enqueue(...args) { return enqueue(this.client, ...args); }
+    async dequeue(...args) { return dequeue(this.client, ...args); }
+
+    // Counters
+    async incr(...args) { return incr(this.client, ...args); }
+    async getCounter(...args) { return getCounter(this.client, ...args); }
+
+    // Hash maps
+    async hset(...args) { return hset(this.client, ...args); }
+    async hget(...args) { return hget(this.client, ...args); }
+    async hgetall(...args) { return hgetall(this.client, ...args); }
+    async hdel(...args) { return hdel(this.client, ...args); }
+
+    // Sorted sets
+    async zadd(...args) { return zadd(this.client, ...args); }
+    async zincrby(...args) { return zincrby(this.client, ...args); }
+    async zrange(...args) { return zrange(this.client, ...args); }
+    async zrank(...args) { return zrank(this.client, ...args); }
+    async zscore(...args) { return zscore(this.client, ...args); }
+    async zrem(...args) { return zrem(this.client, ...args); }
+
+    // Geo
+    async geoadd(...args) { return geoadd(this.client, ...args); }
+    async georadius(...args) { return georadius(this.client, ...args); }
+    async geodist(...args) { return geodist(this.client, ...args); }
+
+    // Misc
+    async countDistinct(...args) { return countDistinct(this.client, ...args); }
+    async script(...args) { return script(this.client, ...args); }
+
+    // Streams
+    async streamAdd(...args) { return streamAdd(this.client, ...args); }
+    async streamCreateGroup(...args) { return streamCreateGroup(this.client, ...args); }
+    async streamRead(...args) { return streamRead(this.client, ...args); }
+    async streamAck(...args) { return streamAck(this.client, ...args); }
+    async streamClaim(...args) { return streamClaim(this.client, ...args); }
 }
 
 // Module-level singleton
