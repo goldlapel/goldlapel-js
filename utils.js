@@ -586,6 +586,7 @@ const COMPARISON_OPS = {
     $gte: '>=',
     $lt:  '<',
     $lte: '<=',
+    $eq:  '=',
     $ne:  '!=',
 };
 
@@ -812,6 +813,17 @@ function buildFilter(filterDict, startParam = 1) {
             continue;
         }
 
+        if (key === '$text') {
+            if (value === null || typeof value !== 'object' || Array.isArray(value) || !('$search' in value)) {
+                throw new Error('$text requires {$search: "query"}');
+            }
+            const lang = value.$language || 'english';
+            opClauses.push(`to_tsvector($${paramIdx}, data::text) @@ plainto_tsquery($${paramIdx + 1}, $${paramIdx + 2})`);
+            params.push(lang, lang, value.$search);
+            paramIdx += 3;
+            continue;
+        }
+
         if (!fieldKeyPattern.test(key)) {
             throw new Error(`Invalid filter key: ${key}`);
         }
@@ -869,6 +881,43 @@ function buildFilter(filterDict, startParam = 1) {
                 } else {
                     throw new Error('$not requires an operator object');
                 }
+            } else if (op === '$elemMatch') {
+                if (opVal === null || typeof opVal !== 'object' || Array.isArray(opVal)) {
+                    throw new Error('$elemMatch value must be an object');
+                }
+                const fj = fieldPathJson(key);
+                const elemClauses = [];
+                for (const [subOp, subVal] of Object.entries(opVal)) {
+                    if (subOp in COMPARISON_OPS) {
+                        const sqlOp = COMPARISON_OPS[subOp];
+                        if (typeof subVal === 'number') {
+                            elemClauses.push(`(elem#>>'{}')::numeric ${sqlOp} $${paramIdx}`);
+                        } else {
+                            elemClauses.push(`elem#>>'{}' ${sqlOp} $${paramIdx}`);
+                        }
+                        params.push(subVal);
+                        paramIdx++;
+                    } else if (subOp === '$regex') {
+                        elemClauses.push(`elem#>>'{}' ~ $${paramIdx}`);
+                        params.push(subVal);
+                        paramIdx++;
+                    } else {
+                        throw new Error(`Unsupported $elemMatch operator: ${subOp}`);
+                    }
+                }
+                if (elemClauses.length) {
+                    opClauses.push(
+                        `EXISTS (SELECT 1 FROM jsonb_array_elements(${fj}) AS elem WHERE ${elemClauses.join(' AND ')})`
+                    );
+                }
+            } else if (op === '$text') {
+                if (opVal === null || typeof opVal !== 'object' || Array.isArray(opVal) || !('$search' in opVal)) {
+                    throw new Error('$text requires {$search: "query"}');
+                }
+                const lang = opVal.$language || 'english';
+                opClauses.push(`to_tsvector($${paramIdx}, ${fp}) @@ plainto_tsquery($${paramIdx + 1}, $${paramIdx + 2})`);
+                params.push(lang, lang, opVal.$search);
+                paramIdx += 3;
             } else {
                 throw new Error(`Unknown operator: ${op}`);
             }
@@ -953,6 +1002,50 @@ export async function docFind(client, collection, filter, { sort, limit, skip } 
     }
     const result = await client.query(sql, params.length > 0 ? params : undefined);
     return result.rows;
+}
+
+export async function* docFindCursor(client, collection, filter = null, { sort, limit, skip, batchSize = 100 } = {}) {
+    validateIdentifier(collection);
+    const { clause, params, nextParam } = buildFilter(filter);
+    let paramIdx = nextParam;
+    let sql = `SELECT _id, data, created_at FROM ${collection}`;
+    if (clause) {
+        sql += ` WHERE ${clause}`;
+    }
+    if (sort && Object.keys(sort).length > 0) {
+        const sortKeyPattern = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
+        const clauses = Object.entries(sort).map(([key, dir]) => {
+            if (!sortKeyPattern.test(key)) {
+                throw new Error(`Invalid sort key: ${key}`);
+            }
+            return `data->>'${key}' ${dir === -1 ? 'DESC' : 'ASC'}`;
+        });
+        sql += ` ORDER BY ${clauses.join(', ')}`;
+    }
+    if (limit !== undefined) {
+        params.push(limit);
+        sql += ` LIMIT $${paramIdx}`;
+        paramIdx++;
+    }
+    if (skip !== undefined) {
+        params.push(skip);
+        sql += ` OFFSET $${paramIdx}`;
+        paramIdx++;
+    }
+
+    const cursorName = `gl_cursor_${Date.now()}`;
+    await client.query('BEGIN');
+    await client.query(`DECLARE ${cursorName} CURSOR FOR ${sql}`, params.length > 0 ? params : undefined);
+    try {
+        while (true) {
+            const result = await client.query(`FETCH ${batchSize} FROM ${cursorName}`);
+            if (result.rows.length === 0) break;
+            for (const row of result.rows) yield row;
+        }
+    } finally {
+        await client.query(`CLOSE ${cursorName}`);
+        await client.query('COMMIT');
+    }
 }
 
 export async function docFindOne(client, collection, filter) {

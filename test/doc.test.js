@@ -4,6 +4,7 @@ import {
     docInsert,
     docInsertMany,
     docFind,
+    docFindCursor,
     docFindOne,
     docUpdate,
     docUpdateOne,
@@ -1553,6 +1554,209 @@ describe('docDistinct', () => {
         const client = mockClient();
         await assert.rejects(
             () => docDistinct(client, 'bad table', 'field'),
+            /Invalid identifier/
+        );
+    });
+});
+
+// ─── $elemMatch ───────────────────────────────────────────────────────────
+
+describe('$elemMatch', () => {
+    it('generates EXISTS with numeric range', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { scores: { $elemMatch: { $gt: 80, $lt: 90 } } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('EXISTS'));
+        assert.ok(sql.includes('jsonb_array_elements'));
+        assert.ok(sql.includes("(elem#>>'{}')::numeric > $1"));
+        assert.ok(sql.includes("(elem#>>'{}')::numeric < $2"));
+        assert.deepEqual(client._calls[0].values, [80, 90]);
+    });
+
+    it('handles $regex in $elemMatch', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { tags: { $elemMatch: { $regex: '^py' } } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('EXISTS'));
+        assert.ok(sql.includes("elem#>>'{}' ~ $1"));
+        assert.deepEqual(client._calls[0].values, ['^py']);
+    });
+
+    it('handles single condition', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { scores: { $elemMatch: { $eq: 100 } } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('EXISTS'));
+        assert.ok(sql.includes("elem#>>'{}'"));
+        assert.deepEqual(client._calls[0].values, [100]);
+    });
+
+    it('rejects non-object operand', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { scores: { $elemMatch: [1, 2] } }),
+            /\$elemMatch value must be an object/
+        );
+    });
+
+    it('rejects unsupported sub-operators', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { scores: { $elemMatch: { $foo: 1 } } }),
+            /Unsupported \$elemMatch operator/
+        );
+    });
+
+    it('works with docFind full round trip', async () => {
+        const client = mockClient({ rows: [{ _id: 'a', data: { scores: [85] } }], rowCount: 1 });
+        const result = await docFind(client, 'users', { scores: { $elemMatch: { $gt: 80 } } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT _id, data, created_at FROM users'));
+        assert.ok(sql.includes('EXISTS'));
+        assert.equal(result.length, 1);
+    });
+});
+
+// ─── $text ────────────────────────────────────────────────────────────────
+
+describe('$text filter', () => {
+    it('generates top-level text search', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { $text: { $search: 'hello world' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('to_tsvector'));
+        assert.ok(sql.includes('plainto_tsquery'));
+        assert.ok(sql.includes('data::text'));
+        assert.deepEqual(client._calls[0].values, ['english', 'english', 'hello world']);
+    });
+
+    it('generates field-level text search', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { content: { $text: { $search: 'hello' } } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('to_tsvector'));
+        assert.ok(sql.includes('plainto_tsquery'));
+        assert.ok(sql.includes("data->>'content'"));
+        assert.deepEqual(client._calls[0].values, ['english', 'english', 'hello']);
+    });
+
+    it('supports custom language', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { $text: { $search: 'bonjour', $language: 'french' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('to_tsvector'));
+        assert.deepEqual(client._calls[0].values, ['french', 'french', 'bonjour']);
+    });
+
+    it('rejects missing $search in top-level', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { $text: { $language: 'english' } }),
+            /\$text requires/
+        );
+    });
+
+    it('rejects non-object $text at top level', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { $text: 'hello' }),
+            /\$text requires/
+        );
+    });
+
+    it('rejects missing $search in field-level', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docFind(client, 'users', { content: { $text: { $language: 'english' } } }),
+            /\$text requires/
+        );
+    });
+
+    it('works with docFind', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { $text: { $search: 'hello' } });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('to_tsvector'));
+        assert.ok(sql.includes('@@'));
+    });
+});
+
+// ─── docFindCursor ────────────────────────────────────────────────────────
+
+describe('docFindCursor', () => {
+    function mockCursorClient(batches) {
+        const calls = [];
+        let fetchIdx = 0;
+        return {
+            query: async (text, values) => {
+                calls.push({ text, values });
+                if (text.startsWith('FETCH')) {
+                    const batch = fetchIdx < batches.length ? batches[fetchIdx] : [];
+                    fetchIdx++;
+                    return { rows: batch };
+                }
+                return { rows: [], rowCount: 0 };
+            },
+            _calls: calls,
+        };
+    }
+
+    it('returns async iterable', async () => {
+        const client = mockCursorClient([[]]);
+        const gen = docFindCursor(client, 'users');
+        assert.ok(gen[Symbol.asyncIterator], 'should be an async iterable');
+        // Consume the generator to avoid hanging
+        for await (const _ of gen) { /* no-op */ }
+    });
+
+    it('yields rows from batches', async () => {
+        const rows = [
+            { _id: 'a', data: { name: 'Alice' }, created_at: 'now' },
+            { _id: 'b', data: { name: 'Bob' }, created_at: 'now' },
+        ];
+        const client = mockCursorClient([rows, []]);
+        const results = [];
+        for await (const row of docFindCursor(client, 'users')) {
+            results.push(row);
+        }
+        assert.equal(results.length, 2);
+        assert.equal(results[0]._id, 'a');
+        assert.equal(results[1]._id, 'b');
+    });
+
+    it('passes filter to DECLARE CURSOR', async () => {
+        const client = mockCursorClient([[]]);
+        for await (const _ of docFindCursor(client, 'users', { status: 'active' })) { /* no-op */ }
+        const declareSql = client._calls.find(c => c.text.includes('DECLARE'));
+        assert.ok(declareSql, 'should have DECLARE CURSOR call');
+        assert.ok(declareSql.text.includes('WHERE'));
+        assert.ok(declareSql.text.includes('data @>'));
+    });
+
+    it('respects batchSize in FETCH', async () => {
+        const client = mockCursorClient([[]]);
+        for await (const _ of docFindCursor(client, 'users', null, { batchSize: 50 })) { /* no-op */ }
+        const fetchCall = client._calls.find(c => c.text.includes('FETCH'));
+        assert.ok(fetchCall, 'should have FETCH call');
+        assert.ok(fetchCall.text.includes('FETCH 50'));
+    });
+
+    it('executes BEGIN, DECLARE, FETCH, CLOSE, COMMIT', async () => {
+        const client = mockCursorClient([[]]);
+        for await (const _ of docFindCursor(client, 'users')) { /* no-op */ }
+        const texts = client._calls.map(c => c.text);
+        assert.ok(texts[0] === 'BEGIN');
+        assert.ok(texts[1].includes('DECLARE'));
+        assert.ok(texts[1].includes('CURSOR FOR'));
+        assert.ok(texts[2].includes('FETCH'));
+        assert.ok(texts[3].includes('CLOSE'));
+        assert.ok(texts[4] === 'COMMIT');
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockCursorClient([[]]);
+        await assert.rejects(
+            async () => { for await (const _ of docFindCursor(client, 'bad; name')) { /* no-op */ } },
             /Invalid identifier/
         );
     });
