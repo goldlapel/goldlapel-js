@@ -399,6 +399,9 @@ export {
     facets, aggregate, createSearchConfig,
     percolateAdd, percolate, percolateDelete,
     analyze, explainScore,
+    docInsert, docInsertMany, docFind, docFindOne,
+    docUpdate, docUpdateOne, docDelete, docDeleteOne,
+    docCount, docCreateIndex,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };

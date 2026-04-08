@@ -560,3 +560,152 @@ export async function script(client, luaCode, ...args) {
     );
     return result.rows[0] ? result.rows[0][funcName] : null;
 }
+
+// ─── Document Store ────────────────────────────────────────────────────────
+
+async function ensureCollection(client, collection) {
+    await client.query(
+        `CREATE TABLE IF NOT EXISTS ${collection} (` +
+        `_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), ` +
+        `data JSONB NOT NULL, ` +
+        `created_at TIMESTAMPTZ DEFAULT NOW())`
+    );
+}
+
+export async function docInsert(client, collection, document) {
+    validateIdentifier(collection);
+    await ensureCollection(client, collection);
+    const result = await client.query(
+        `INSERT INTO ${collection} (data) VALUES ($1::jsonb) RETURNING _id, data, created_at`,
+        [JSON.stringify(document)]
+    );
+    return result.rows[0];
+}
+
+export async function docInsertMany(client, collection, documents) {
+    validateIdentifier(collection);
+    await ensureCollection(client, collection);
+    const placeholders = documents.map((_, i) => `($${i + 1}::jsonb)`).join(', ');
+    const params = documents.map(d => JSON.stringify(d));
+    const result = await client.query(
+        `INSERT INTO ${collection} (data) VALUES ${placeholders} RETURNING _id, data, created_at`,
+        params
+    );
+    return result.rows;
+}
+
+export async function docFind(client, collection, filter, { sort, limit, skip } = {}) {
+    validateIdentifier(collection);
+    const params = [];
+    let sql = `SELECT _id, data, created_at FROM ${collection}`;
+    if (filter && Object.keys(filter).length > 0) {
+        params.push(JSON.stringify(filter));
+        sql += ` WHERE data @> $${params.length}::jsonb`;
+    }
+    if (sort && Object.keys(sort).length > 0) {
+        const sortKeyPattern = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
+        const clauses = Object.entries(sort).map(([key, dir]) => {
+            if (!sortKeyPattern.test(key)) {
+                throw new Error(`Invalid sort key: ${key}`);
+            }
+            return `data->>'${key}' ${dir === -1 ? 'DESC' : 'ASC'}`;
+        });
+        sql += ` ORDER BY ${clauses.join(', ')}`;
+    }
+    if (limit !== undefined) {
+        params.push(limit);
+        sql += ` LIMIT $${params.length}`;
+    }
+    if (skip !== undefined) {
+        params.push(skip);
+        sql += ` OFFSET $${params.length}`;
+    }
+    const result = await client.query(sql, params.length > 0 ? params : undefined);
+    return result.rows;
+}
+
+export async function docFindOne(client, collection, filter) {
+    validateIdentifier(collection);
+    const params = [];
+    let sql = `SELECT _id, data, created_at FROM ${collection}`;
+    if (filter && Object.keys(filter).length > 0) {
+        params.push(JSON.stringify(filter));
+        sql += ` WHERE data @> $${params.length}::jsonb`;
+    }
+    sql += ' LIMIT 1';
+    const result = await client.query(sql, params.length > 0 ? params : undefined);
+    return result.rows[0] || null;
+}
+
+export async function docUpdate(client, collection, filter, update) {
+    validateIdentifier(collection);
+    const result = await client.query(
+        `UPDATE ${collection} SET data = data || $2::jsonb WHERE data @> $1::jsonb`,
+        [JSON.stringify(filter), JSON.stringify(update)]
+    );
+    return result.rowCount;
+}
+
+export async function docUpdateOne(client, collection, filter, update) {
+    validateIdentifier(collection);
+    const result = await client.query(
+        `WITH target AS (` +
+        `SELECT _id FROM ${collection} WHERE data @> $1::jsonb LIMIT 1` +
+        `) UPDATE ${collection} SET data = data || $2::jsonb ` +
+        `FROM target WHERE ${collection}._id = target._id`,
+        [JSON.stringify(filter), JSON.stringify(update)]
+    );
+    return result.rowCount;
+}
+
+export async function docDelete(client, collection, filter) {
+    validateIdentifier(collection);
+    const result = await client.query(
+        `DELETE FROM ${collection} WHERE data @> $1::jsonb`,
+        [JSON.stringify(filter)]
+    );
+    return result.rowCount;
+}
+
+export async function docDeleteOne(client, collection, filter) {
+    validateIdentifier(collection);
+    const result = await client.query(
+        `WITH target AS (` +
+        `SELECT _id FROM ${collection} WHERE data @> $1::jsonb LIMIT 1` +
+        `) DELETE FROM ${collection} USING target WHERE ${collection}._id = target._id`,
+        [JSON.stringify(filter)]
+    );
+    return result.rowCount;
+}
+
+export async function docCount(client, collection, filter) {
+    validateIdentifier(collection);
+    const params = [];
+    let sql = `SELECT COUNT(*) FROM ${collection}`;
+    if (filter && Object.keys(filter).length > 0) {
+        params.push(JSON.stringify(filter));
+        sql += ` WHERE data @> $${params.length}::jsonb`;
+    }
+    const result = await client.query(sql, params.length > 0 ? params : undefined);
+    return parseInt(result.rows[0].count);
+}
+
+export async function docCreateIndex(client, collection, keys) {
+    validateIdentifier(collection);
+    if (!keys || Object.keys(keys).length === 0) {
+        await client.query(
+            `CREATE INDEX IF NOT EXISTS ${collection}_data_gin ON ${collection} USING GIN (data)`
+        );
+        return;
+    }
+    for (const [key, dir] of Object.entries(keys)) {
+        if (!/^[a-zA-Z_][a-zA-Z0-9_.]*$/.test(key)) {
+            throw new Error(`Invalid index key: ${key}`);
+        }
+        const order = dir === -1 ? 'DESC' : 'ASC';
+        const safeName = key.replace(/\./g, '_');
+        await client.query(
+            `CREATE INDEX IF NOT EXISTS ${collection}_${safeName}_idx ON ${collection} ((data->>'${key}') ${order})`
+        );
+    }
+}
