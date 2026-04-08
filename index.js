@@ -22,6 +22,9 @@ import {
     docInsert, docInsertMany, docFind, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
     docCount, docCreateIndex, docAggregate,
+    docWatch, docUnwatch,
+    docCreateTtlIndex, docRemoveTtlIndex,
+    docCreateCapped, docRemoveCap,
 } from './utils.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -361,6 +364,12 @@ export class GoldLapel {
     async docCount(...args) { return docCount(this.client, ...args); }
     async docCreateIndex(...args) { return docCreateIndex(this.client, ...args); }
     async docAggregate(...args) { return docAggregate(this.client, ...args); }
+    async docWatch(...args) { return docWatch(this.client, ...args); }
+    async docUnwatch(...args) { return docUnwatch(this.client, ...args); }
+    async docCreateTtlIndex(...args) { return docCreateTtlIndex(this.client, ...args); }
+    async docRemoveTtlIndex(...args) { return docRemoveTtlIndex(this.client, ...args); }
+    async docCreateCapped(...args) { return docCreateCapped(this.client, ...args); }
+    async docRemoveCap(...args) { return docRemoveCap(this.client, ...args); }
 
     // Search
     async search(...args) { return search(this.client, ...args); }
@@ -511,6 +520,9 @@ export {
     docInsert, docInsertMany, docFind, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
     docCount, docCreateIndex, docAggregate,
+    docWatch, docUnwatch,
+    docCreateTtlIndex, docRemoveTtlIndex,
+    docCreateCapped, docRemoveCap,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };

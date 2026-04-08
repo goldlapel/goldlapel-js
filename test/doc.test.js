@@ -12,6 +12,12 @@ import {
     docCount,
     docCreateIndex,
     docAggregate,
+    docWatch,
+    docUnwatch,
+    docCreateTtlIndex,
+    docRemoveTtlIndex,
+    docCreateCapped,
+    docRemoveCap,
 } from '../utils.js';
 
 function mockClient(queryResult) {
@@ -971,5 +977,186 @@ describe('dot-notation expansion', () => {
         assert.deepEqual(client._calls[0].values, [
             JSON.stringify({ meta: { source: 'test' } }),
         ]);
+    });
+});
+
+// ─── docWatch ─────────────────────────────────────────────────────────────
+
+function mockListenClient(queryResult) {
+    const calls = [];
+    const listeners = {};
+    return {
+        query: async (text, values) => {
+            calls.push({ text, values });
+            return queryResult ?? { rows: [], rowCount: 0 };
+        },
+        on(event, fn) {
+            if (!listeners[event]) listeners[event] = [];
+            listeners[event].push(fn);
+        },
+        removeListener(event, fn) {
+            if (listeners[event]) {
+                listeners[event] = listeners[event].filter(f => f !== fn);
+            }
+        },
+        _calls: calls,
+        _listeners: listeners,
+    };
+}
+
+describe('docWatch', () => {
+    it('creates trigger, function, and LISTEN, returns stop handle', async () => {
+        const client = mockListenClient();
+        const events = [];
+        const watcher = await docWatch(client, 'orders', (ev) => events.push(ev));
+
+        // Should have: CREATE FUNCTION, DROP TRIGGER IF EXISTS, CREATE TRIGGER, LISTEN
+        assert.equal(client._calls.length, 4);
+        assert.ok(client._calls[0].text.includes('CREATE OR REPLACE FUNCTION orders_notify_fn'));
+        assert.ok(client._calls[0].text.includes('pg_notify'));
+        assert.ok(client._calls[0].text.includes('TG_OP'));
+        assert.ok(client._calls[1].text.includes('DROP TRIGGER IF EXISTS orders_notify_trg ON orders'));
+        assert.ok(client._calls[2].text.includes('CREATE TRIGGER orders_notify_trg'));
+        assert.ok(client._calls[2].text.includes('AFTER INSERT OR UPDATE OR DELETE ON orders'));
+        assert.ok(client._calls[2].text.includes('EXECUTE FUNCTION orders_notify_fn'));
+        assert.ok(client._calls[3].text.includes('LISTEN orders_changes'));
+
+        // Listener registered
+        assert.equal(client._listeners.notification.length, 1);
+
+        // stop() removes listener
+        assert.equal(typeof watcher.stop, 'function');
+        watcher.stop();
+        assert.equal(client._listeners.notification.length, 0);
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockListenClient();
+        await assert.rejects(
+            () => docWatch(client, 'DROP;--', () => {}),
+            /Invalid identifier/
+        );
+    });
+});
+
+// ─── docUnwatch ───────────────────────────────────────────────────────────
+
+describe('docUnwatch', () => {
+    it('drops trigger, function, and UNLISTEN', async () => {
+        const client = mockClient();
+        await docUnwatch(client, 'orders');
+        assert.equal(client._calls.length, 3);
+        assert.ok(client._calls[0].text.includes('DROP TRIGGER IF EXISTS orders_notify_trg ON orders'));
+        assert.ok(client._calls[1].text.includes('DROP FUNCTION IF EXISTS orders_notify_fn'));
+        assert.ok(client._calls[2].text.includes('UNLISTEN orders_changes'));
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docUnwatch(client, '1bad'),
+            /Invalid identifier/
+        );
+    });
+});
+
+// ─── docCreateTtlIndex ───────────────────────────────────────────────────
+
+describe('docCreateTtlIndex', () => {
+    it('creates index, trigger function, and trigger with default field', async () => {
+        const client = mockClient();
+        await docCreateTtlIndex(client, 'sessions', 3600);
+        assert.equal(client._calls.length, 4);
+        assert.ok(client._calls[0].text.includes('CREATE INDEX IF NOT EXISTS sessions_ttl_idx ON sessions (created_at)'));
+        assert.ok(client._calls[1].text.includes('CREATE OR REPLACE FUNCTION sessions_ttl_fn'));
+        assert.ok(client._calls[1].text.includes("INTERVAL '3600 seconds'"));
+        assert.ok(client._calls[1].text.includes('DELETE FROM sessions WHERE created_at'));
+        assert.ok(client._calls[2].text.includes('DROP TRIGGER IF EXISTS sessions_ttl_trg ON sessions'));
+        assert.ok(client._calls[3].text.includes('CREATE TRIGGER sessions_ttl_trg'));
+        assert.ok(client._calls[3].text.includes('BEFORE INSERT ON sessions'));
+    });
+
+    it('uses custom field', async () => {
+        const client = mockClient();
+        await docCreateTtlIndex(client, 'tokens', 86400, { field: 'expires_at' });
+        assert.ok(client._calls[0].text.includes('ON tokens (expires_at)'));
+        assert.ok(client._calls[1].text.includes('WHERE expires_at'));
+    });
+
+    it('rejects non-positive expireAfterSeconds', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docCreateTtlIndex(client, 'items', 0),
+            /expireAfterSeconds must be a positive number/
+        );
+        await assert.rejects(
+            () => docCreateTtlIndex(client, 'items', -10),
+            /expireAfterSeconds must be a positive number/
+        );
+    });
+});
+
+// ─── docRemoveTtlIndex ──────────────────────────────────────────────────
+
+describe('docRemoveTtlIndex', () => {
+    it('drops trigger, function, and index', async () => {
+        const client = mockClient();
+        await docRemoveTtlIndex(client, 'sessions');
+        assert.equal(client._calls.length, 3);
+        assert.ok(client._calls[0].text.includes('DROP TRIGGER IF EXISTS sessions_ttl_trg ON sessions'));
+        assert.ok(client._calls[1].text.includes('DROP FUNCTION IF EXISTS sessions_ttl_fn'));
+        assert.ok(client._calls[2].text.includes('DROP INDEX IF EXISTS sessions_ttl_idx'));
+    });
+});
+
+// ─── docCreateCapped ────────────────────────────────────────────────────
+
+describe('docCreateCapped', () => {
+    it('ensures collection and creates cap trigger', async () => {
+        const client = mockClient();
+        await docCreateCapped(client, 'logs', 1000);
+        // ensureCollection (1) + CREATE FUNCTION (2) + DROP TRIGGER (3) + CREATE TRIGGER (4)
+        assert.equal(client._calls.length, 4);
+        assert.ok(client._calls[0].text.includes('CREATE TABLE IF NOT EXISTS logs'));
+        assert.ok(client._calls[1].text.includes('CREATE OR REPLACE FUNCTION logs_cap_fn'));
+        assert.ok(client._calls[1].text.includes('DELETE FROM logs'));
+        assert.ok(client._calls[1].text.includes('ORDER BY created_at ASC'));
+        assert.ok(client._calls[1].text.includes('LIMIT GREATEST'));
+        assert.ok(client._calls[1].text.includes('1000'));
+        assert.ok(client._calls[2].text.includes('DROP TRIGGER IF EXISTS logs_cap_trg ON logs'));
+        assert.ok(client._calls[3].text.includes('CREATE TRIGGER logs_cap_trg'));
+        assert.ok(client._calls[3].text.includes('AFTER INSERT ON logs'));
+    });
+
+    it('rejects non-positive maxDocuments', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docCreateCapped(client, 'logs', 0),
+            /maxDocuments must be a positive number/
+        );
+        await assert.rejects(
+            () => docCreateCapped(client, 'logs', -5),
+            /maxDocuments must be a positive number/
+        );
+    });
+});
+
+// ─── docRemoveCap ───────────────────────────────────────────────────────
+
+describe('docRemoveCap', () => {
+    it('drops trigger and function', async () => {
+        const client = mockClient();
+        await docRemoveCap(client, 'logs');
+        assert.equal(client._calls.length, 2);
+        assert.ok(client._calls[0].text.includes('DROP TRIGGER IF EXISTS logs_cap_trg ON logs'));
+        assert.ok(client._calls[1].text.includes('DROP FUNCTION IF EXISTS logs_cap_fn'));
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docRemoveCap(client, 'bad table'),
+            /Invalid identifier/
+        );
     });
 });

@@ -1173,3 +1173,164 @@ export async function docCreateIndex(client, collection, keys) {
         );
     }
 }
+
+// ─── Change Streams ───────────────────────────────────────────────────────
+
+export async function docWatch(client, collection, callback) {
+    validateIdentifier(collection);
+    const channel = `${collection}_changes`;
+    const funcName = `${collection}_notify_fn`;
+    const triggerName = `${collection}_notify_trg`;
+
+    await client.query(`
+        CREATE OR REPLACE FUNCTION ${funcName}()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                PERFORM pg_notify('${channel}', json_build_object('op', TG_OP, '_id', OLD._id::text)::text);
+                RETURN OLD;
+            ELSE
+                PERFORM pg_notify('${channel}', json_build_object('op', TG_OP, '_id', NEW._id::text, 'data', NEW.data)::text);
+                RETURN NEW;
+            END IF;
+        END;
+        $$
+    `);
+
+    await client.query(`
+        DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}
+    `);
+
+    await client.query(`
+        CREATE TRIGGER ${triggerName}
+        AFTER INSERT OR UPDATE OR DELETE ON ${collection}
+        FOR EACH ROW EXECUTE FUNCTION ${funcName}()
+    `);
+
+    await client.query(`LISTEN ${channel}`);
+
+    const listener = (msg) => {
+        if (msg.channel === channel) {
+            let parsed;
+            try { parsed = JSON.parse(msg.payload); } catch { parsed = msg.payload; }
+            callback(parsed);
+        }
+    };
+    client.on('notification', listener);
+
+    return {
+        stop() {
+            client.removeListener('notification', listener);
+            client.query(`UNLISTEN ${channel}`).catch(() => {});
+        },
+    };
+}
+
+export async function docUnwatch(client, collection) {
+    validateIdentifier(collection);
+    const channel = `${collection}_changes`;
+    const funcName = `${collection}_notify_fn`;
+    const triggerName = `${collection}_notify_trg`;
+
+    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}`);
+    await client.query(`DROP FUNCTION IF EXISTS ${funcName}()`);
+    await client.query(`UNLISTEN ${channel}`);
+}
+
+// ─── TTL Indexes ──────────────────────────────────────────────────────────
+
+export async function docCreateTtlIndex(client, collection, expireAfterSeconds, { field = 'created_at' } = {}) {
+    validateIdentifier(collection);
+    validateIdentifier(field);
+    if (typeof expireAfterSeconds !== 'number' || expireAfterSeconds <= 0) {
+        throw new Error('expireAfterSeconds must be a positive number');
+    }
+
+    const idxName = `${collection}_ttl_idx`;
+    const funcName = `${collection}_ttl_fn`;
+    const triggerName = `${collection}_ttl_trg`;
+
+    await client.query(
+        `CREATE INDEX IF NOT EXISTS ${idxName} ON ${collection} (${field})`
+    );
+
+    await client.query(`
+        CREATE OR REPLACE FUNCTION ${funcName}()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            DELETE FROM ${collection} WHERE ${field} < NOW() - INTERVAL '${Number(expireAfterSeconds)} seconds';
+            RETURN NEW;
+        END;
+        $$
+    `);
+
+    await client.query(`
+        DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}
+    `);
+
+    await client.query(`
+        CREATE TRIGGER ${triggerName}
+        BEFORE INSERT ON ${collection}
+        FOR EACH ROW EXECUTE FUNCTION ${funcName}()
+    `);
+}
+
+export async function docRemoveTtlIndex(client, collection) {
+    validateIdentifier(collection);
+
+    const idxName = `${collection}_ttl_idx`;
+    const funcName = `${collection}_ttl_fn`;
+    const triggerName = `${collection}_ttl_trg`;
+
+    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}`);
+    await client.query(`DROP FUNCTION IF EXISTS ${funcName}()`);
+    await client.query(`DROP INDEX IF EXISTS ${idxName}`);
+}
+
+// ─── Capped Collections ──────────────────────────────────────────────────
+
+export async function docCreateCapped(client, collection, maxDocuments) {
+    validateIdentifier(collection);
+    if (typeof maxDocuments !== 'number' || maxDocuments <= 0) {
+        throw new Error('maxDocuments must be a positive number');
+    }
+
+    await ensureCollection(client, collection);
+
+    const funcName = `${collection}_cap_fn`;
+    const triggerName = `${collection}_cap_trg`;
+
+    await client.query(`
+        CREATE OR REPLACE FUNCTION ${funcName}()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            DELETE FROM ${collection} WHERE _id IN (
+                SELECT _id FROM ${collection}
+                ORDER BY created_at ASC, _id ASC
+                LIMIT GREATEST((SELECT COUNT(*) FROM ${collection}) - ${Number(maxDocuments)}, 0)
+            );
+            RETURN NEW;
+        END;
+        $$
+    `);
+
+    await client.query(`
+        DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}
+    `);
+
+    await client.query(`
+        CREATE TRIGGER ${triggerName}
+        AFTER INSERT ON ${collection}
+        FOR EACH ROW EXECUTE FUNCTION ${funcName}()
+    `);
+}
+
+export async function docRemoveCap(client, collection) {
+    validateIdentifier(collection);
+
+    const funcName = `${collection}_cap_fn`;
+    const triggerName = `${collection}_cap_trg`;
+
+    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}`);
+    await client.query(`DROP FUNCTION IF EXISTS ${funcName}()`);
+}
