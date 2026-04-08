@@ -827,7 +827,7 @@ function validateFieldRef(ref) {
 
 function buildGroup(group) {
     const selectParts = [];
-    const supportedAccumulators = new Set(['$sum', '$avg', '$min', '$max', '$count']);
+    const supportedAccumulators = new Set(['$sum', '$avg', '$min', '$max', '$count', '$push', '$addToSet']);
 
     // Handle _id (GROUP BY key)
     let groupBy = null;
@@ -837,6 +837,26 @@ function buildGroup(group) {
             const field = validateFieldRef(idRef);
             selectParts.push(`data->>'${field}' AS _id`);
             groupBy = `data->>'${field}'`;
+        } else if (typeof idRef === 'object' && !Array.isArray(idRef)) {
+            const entries = Object.entries(idRef);
+            if (entries.length === 0) {
+                throw new Error('Composite $group _id must have at least one field');
+            }
+            const jsonParts = [];
+            const groupByParts = [];
+            for (const [alias, ref] of entries) {
+                if (!fieldKeyPattern.test(alias)) {
+                    throw new Error(`Invalid alias: ${alias}`);
+                }
+                if (typeof ref !== 'string' || !ref.startsWith('$')) {
+                    throw new Error(`Composite _id values must be field references: ${ref}`);
+                }
+                const field = validateFieldRef(ref);
+                jsonParts.push(`'${alias}', data->>'${field}'`);
+                groupByParts.push(`data->>'${field}'`);
+            }
+            selectParts.push(`json_build_object(${jsonParts.join(', ')}) AS _id`);
+            groupBy = groupByParts.join(', ');
         } else {
             throw new Error(`Unsupported $group _id: ${idRef}`);
         }
@@ -895,6 +915,20 @@ function buildGroup(group) {
                 selectParts.push(`MAX((data->>'${field}')::numeric) AS ${alias}`);
             } else {
                 throw new Error(`Unsupported $max value: ${val}`);
+            }
+        } else if (acc === '$push') {
+            if (typeof val === 'string' && val.startsWith('$')) {
+                const field = validateFieldRef(val);
+                selectParts.push(`array_agg(data->>'${field}') AS ${alias}`);
+            } else {
+                throw new Error(`Unsupported $push value: ${val}`);
+            }
+        } else if (acc === '$addToSet') {
+            if (typeof val === 'string' && val.startsWith('$')) {
+                const field = validateFieldRef(val);
+                selectParts.push(`array_agg(DISTINCT data->>'${field}') AS ${alias}`);
+            } else {
+                throw new Error(`Unsupported $addToSet value: ${val}`);
             }
         }
     }

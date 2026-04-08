@@ -518,9 +518,9 @@ describe('docAggregate', () => {
         const client = mockClient();
         await assert.rejects(
             () => docAggregate(client, 'users', [
-                { $group: { _id: null, vals: { $push: '$x' } } },
+                { $group: { _id: null, vals: { $first: '$x' } } },
             ]),
-            /Unsupported accumulator: \$push/
+            /Unsupported accumulator: \$first/
         );
     });
 
@@ -682,5 +682,92 @@ describe('comparison operators', () => {
             () => docFind(client, 'users', { role: { $in: [] } }),
             /\$in requires a non-empty array/
         );
+    });
+});
+
+// ─── Composite $group._id + $push/$addToSet ──────────────────────────────
+
+describe('composite $group._id', () => {
+    it('object _id builds json_build_object + multi-key GROUP BY', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $group: { _id: { region: '$region', status: '$status' }, total: { $sum: '$amount' } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("json_build_object('region', data->>'region', 'status', data->>'status') AS _id"));
+        assert.ok(sql.includes("SUM((data->>'amount')::numeric) AS total"));
+        assert.ok(sql.includes("GROUP BY data->>'region', data->>'status'"));
+    });
+
+    it('single-key object _id', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'events', [
+            { $group: { _id: { category: '$category' }, count: { $sum: 1 } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("json_build_object('category', data->>'category') AS _id"));
+        assert.ok(sql.includes("GROUP BY data->>'category'"));
+    });
+
+    it('composite _id rejects non-field-reference value', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docAggregate(client, 'orders', [
+                { $group: { _id: { region: 'literal' }, total: { $sum: '$amount' } } },
+            ]),
+            /Composite _id values must be field references/
+        );
+    });
+
+    it('composite _id rejects empty object', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docAggregate(client, 'orders', [
+                { $group: { _id: {}, total: { $sum: '$amount' } } },
+            ]),
+            /Composite \$group _id must have at least one field/
+        );
+    });
+});
+
+describe('$push and $addToSet accumulators', () => {
+    it('$push generates array_agg', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $group: { _id: '$category', items: { $push: '$name' } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("array_agg(data->>'name') AS items"));
+        assert.ok(sql.includes("GROUP BY data->>'category'"));
+    });
+
+    it('$addToSet generates array_agg DISTINCT', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'orders', [
+            { $group: { _id: '$category', unique_tags: { $addToSet: '$tag' } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("array_agg(DISTINCT data->>'tag') AS unique_tags"));
+    });
+
+    it('$push with null _id (no GROUP BY)', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'logs', [
+            { $group: { _id: null, all_levels: { $push: '$level' } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("array_agg(data->>'level') AS all_levels"));
+        assert.ok(!sql.includes('GROUP BY'));
+    });
+
+    it('$addToSet with composite _id', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'sales', [
+            { $group: { _id: { region: '$region', year: '$year' }, brands: { $addToSet: '$brand' } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("json_build_object('region', data->>'region', 'year', data->>'year') AS _id"));
+        assert.ok(sql.includes("array_agg(DISTINCT data->>'brand') AS brands"));
+        assert.ok(sql.includes("GROUP BY data->>'region', data->>'year'"));
     });
 });
