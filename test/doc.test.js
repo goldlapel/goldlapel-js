@@ -908,3 +908,68 @@ describe('$lookup', () => {
         );
     });
 });
+
+// ─── Dot-notation expansion in plain containment filters ─────────────────
+
+describe('dot-notation expansion', () => {
+    it('single dotted key expands to nested object', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { 'addr.city': 'NY' });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('data @> $1::jsonb'));
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ addr: { city: 'NY' } })]);
+    });
+
+    it('multi-level dotted key expands to deeply nested object', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { 'a.b.c': 42 });
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ a: { b: { c: 42 } } })]);
+    });
+
+    it('non-dotted key passes through unchanged', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { status: 'active' });
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ status: 'active' })]);
+    });
+
+    it('mixed dotted and plain keys', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { 'addr.city': 'NY', active: true });
+        assert.deepEqual(client._calls[0].values, [
+            JSON.stringify({ addr: { city: 'NY' }, active: true }),
+        ]);
+    });
+
+    it('multiple dotted keys sharing a prefix merge correctly', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docFind(client, 'users', { 'addr.city': 'NY', 'addr.zip': '10001' });
+        assert.deepEqual(client._calls[0].values, [
+            JSON.stringify({ addr: { city: 'NY', zip: '10001' } }),
+        ]);
+    });
+
+    it('dot expansion works in docCount', async () => {
+        const client = mockClient({ rows: [{ count: '3' }], rowCount: 1 });
+        await docCount(client, 'orders', { 'ship.country': 'US' });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('data @> $1::jsonb'));
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ ship: { country: 'US' } })]);
+    });
+
+    it('dot expansion works in docUpdate', async () => {
+        const client = mockClient({ rows: [], rowCount: 1 });
+        await docUpdate(client, 'users', { 'profile.verified': true }, { level: 'pro' });
+        assert.deepEqual(client._calls[0].values, [
+            JSON.stringify({ profile: { verified: true } }),
+            JSON.stringify({ level: 'pro' }),
+        ]);
+    });
+
+    it('dot expansion works in docDelete', async () => {
+        const client = mockClient({ rows: [], rowCount: 2 });
+        await docDelete(client, 'logs', { 'meta.source': 'test' });
+        assert.deepEqual(client._calls[0].values, [
+            JSON.stringify({ meta: { source: 'test' } }),
+        ]);
+    });
+});

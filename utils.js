@@ -565,6 +565,22 @@ export async function script(client, luaCode, ...args) {
 
 const fieldKeyPattern = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
 
+function expandDotKeys(obj) {
+    const result = {};
+    for (const [key, value] of Object.entries(obj)) {
+        const parts = key.split('.');
+        let current = result;
+        for (const part of parts.slice(0, -1)) {
+            if (!(part in current)) {
+                current[part] = {};
+            }
+            current = current[part];
+        }
+        current[parts[parts.length - 1]] = value;
+    }
+    return result;
+}
+
 const COMPARISON_OPS = {
     $gt:  '>',
     $gte: '>=',
@@ -665,7 +681,7 @@ function buildFilter(filterDict, startParam = 1) {
 
     if (Object.keys(plainKeys).length > 0) {
         allClauses.push(`data @> $${paramIdx}::jsonb`);
-        params.push(JSON.stringify(plainKeys));
+        params.push(JSON.stringify(expandDotKeys(plainKeys)));
         paramIdx++;
     }
 
