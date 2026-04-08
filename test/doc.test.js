@@ -11,6 +11,7 @@ import {
     docDeleteOne,
     docCount,
     docCreateIndex,
+    docAggregate,
 } from '../utils.js';
 
 function mockClient(queryResult) {
@@ -430,5 +431,108 @@ describe('docCreateIndex', () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         const result = await docCreateIndex(client, 'users');
         assert.equal(result, undefined);
+    });
+});
+
+// ─── docAggregate ─────────────────────────────────────────────────────────
+
+describe('docAggregate', () => {
+    it('full pipeline: $match + $group + $sort + $limit', async () => {
+        const rows = [{ _id: 'electronics', total: 500 }];
+        const client = mockClient({ rows, rowCount: 1 });
+        const result = await docAggregate(client, 'orders', [
+            { $match: { status: 'shipped' } },
+            { $group: { _id: '$category', total: { $sum: '$amount' } } },
+            { $sort: { total: -1 } },
+            { $limit: 10 },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("SELECT data->>'category' AS _id, SUM((data->>'amount')::numeric) AS total FROM orders"));
+        assert.ok(sql.includes('WHERE data @> $1::jsonb'));
+        assert.ok(sql.includes("GROUP BY data->>'category'"));
+        assert.ok(sql.includes('ORDER BY total DESC'));
+        assert.ok(sql.includes('LIMIT $2'));
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ status: 'shipped' }), 10]);
+        assert.deepEqual(result, rows);
+    });
+
+    it('$group with $avg uses numeric cast', async () => {
+        const client = mockClient({ rows: [{ _id: 'A', avg_price: 25.5 }], rowCount: 1 });
+        await docAggregate(client, 'products', [
+            { $group: { _id: '$brand', avg_price: { $avg: '$price' } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("AVG((data->>'price')::numeric) AS avg_price"));
+        assert.ok(sql.includes("GROUP BY data->>'brand'"));
+    });
+
+    it('$group with null _id produces no GROUP BY', async () => {
+        const client = mockClient({ rows: [{ count: 42 }], rowCount: 1 });
+        await docAggregate(client, 'events', [
+            { $group: { _id: null, count: { $sum: 1 } } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('COUNT(*) AS count'));
+        assert.ok(!sql.includes('GROUP BY'));
+    });
+
+    it('$match only behaves like find', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'users', [
+            { $match: { active: true } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT _id, data, created_at FROM users'));
+        assert.ok(sql.includes('WHERE data @> $1::jsonb'));
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ active: true })]);
+    });
+
+    it('$sort after $group uses aliases', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'sales', [
+            { $group: { _id: '$region', revenue: { $sum: '$amount' } } },
+            { $sort: { revenue: -1 } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('ORDER BY revenue DESC'));
+    });
+
+    it('$sort without $group uses data->>key', async () => {
+        const client = mockClient({ rows: [], rowCount: 0 });
+        await docAggregate(client, 'users', [
+            { $sort: { name: 1 } },
+        ]);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes("ORDER BY data->>'name' ASC"));
+    });
+
+    it('throws on unsupported pipeline stage', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docAggregate(client, 'users', [{ $lookup: { from: 'other' } }]),
+            /Unsupported pipeline stage: \$lookup/
+        );
+    });
+
+    it('throws on unsupported accumulator', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docAggregate(client, 'users', [
+                { $group: { _id: null, vals: { $push: '$x' } } },
+            ]),
+            /Unsupported accumulator: \$push/
+        );
+    });
+
+    it('empty pipeline returns all rows', async () => {
+        const rows = [{ _id: 'a', data: { x: 1 }, created_at: 'now' }];
+        const client = mockClient({ rows, rowCount: 1 });
+        const result = await docAggregate(client, 'items', []);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('SELECT _id, data, created_at FROM items'));
+        assert.ok(!sql.includes('WHERE'));
+        assert.ok(!sql.includes('GROUP BY'));
+        assert.ok(!sql.includes('ORDER BY'));
+        assert.deepEqual(result, rows);
     });
 });

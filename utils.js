@@ -690,6 +690,173 @@ export async function docCount(client, collection, filter) {
     return parseInt(result.rows[0].count);
 }
 
+const fieldKeyPattern = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
+
+function validateFieldRef(ref) {
+    const field = ref.slice(1);
+    if (!fieldKeyPattern.test(field)) {
+        throw new Error(`Invalid field reference: ${ref}`);
+    }
+    return field;
+}
+
+function buildGroup(group) {
+    const selectParts = [];
+    const supportedAccumulators = new Set(['$sum', '$avg', '$min', '$max', '$count']);
+
+    // Handle _id (GROUP BY key)
+    let groupBy = null;
+    if (group._id !== null && group._id !== undefined) {
+        const idRef = group._id;
+        if (typeof idRef === 'string' && idRef.startsWith('$')) {
+            const field = validateFieldRef(idRef);
+            selectParts.push(`data->>'${field}' AS _id`);
+            groupBy = `data->>'${field}'`;
+        } else {
+            throw new Error(`Unsupported $group _id: ${idRef}`);
+        }
+    }
+
+    for (const [alias, expr] of Object.entries(group)) {
+        if (alias === '_id') continue;
+        if (!fieldKeyPattern.test(alias)) {
+            throw new Error(`Invalid alias: ${alias}`);
+        }
+
+        if (typeof expr !== 'object' || expr === null) {
+            throw new Error(`Unsupported accumulator for ${alias}`);
+        }
+
+        const accKeys = Object.keys(expr);
+        if (accKeys.length !== 1) {
+            throw new Error(`Unsupported accumulator for ${alias}`);
+        }
+
+        const acc = accKeys[0];
+        const val = expr[acc];
+
+        if (!supportedAccumulators.has(acc)) {
+            throw new Error(`Unsupported accumulator: ${acc}`);
+        }
+
+        if (acc === '$count') {
+            selectParts.push(`COUNT(*) AS ${alias}`);
+        } else if (acc === '$sum') {
+            if (val === 1) {
+                selectParts.push(`COUNT(*) AS ${alias}`);
+            } else if (typeof val === 'string' && val.startsWith('$')) {
+                const field = validateFieldRef(val);
+                selectParts.push(`SUM((data->>'${field}')::numeric) AS ${alias}`);
+            } else {
+                throw new Error(`Unsupported $sum value: ${val}`);
+            }
+        } else if (acc === '$avg') {
+            if (typeof val === 'string' && val.startsWith('$')) {
+                const field = validateFieldRef(val);
+                selectParts.push(`AVG((data->>'${field}')::numeric) AS ${alias}`);
+            } else {
+                throw new Error(`Unsupported $avg value: ${val}`);
+            }
+        } else if (acc === '$min') {
+            if (typeof val === 'string' && val.startsWith('$')) {
+                const field = validateFieldRef(val);
+                selectParts.push(`MIN((data->>'${field}')::numeric) AS ${alias}`);
+            } else {
+                throw new Error(`Unsupported $min value: ${val}`);
+            }
+        } else if (acc === '$max') {
+            if (typeof val === 'string' && val.startsWith('$')) {
+                const field = validateFieldRef(val);
+                selectParts.push(`MAX((data->>'${field}')::numeric) AS ${alias}`);
+            } else {
+                throw new Error(`Unsupported $max value: ${val}`);
+            }
+        }
+    }
+
+    return { selectParts, groupBy };
+}
+
+export async function docAggregate(client, collection, pipeline) {
+    validateIdentifier(collection);
+
+    const params = [];
+    let whereClauses = [];
+    let selectParts = null;
+    let groupBy = null;
+    let orderClauses = [];
+    let limitClause = '';
+    let offsetClause = '';
+    let hasGroup = false;
+
+    const supportedStages = new Set(['$match', '$group', '$sort', '$limit', '$skip']);
+
+    for (const stage of pipeline) {
+        const stageKeys = Object.keys(stage);
+        if (stageKeys.length !== 1) {
+            throw new Error(`Invalid pipeline stage: ${JSON.stringify(stage)}`);
+        }
+        const op = stageKeys[0];
+
+        if (!supportedStages.has(op)) {
+            throw new Error(`Unsupported pipeline stage: ${op}`);
+        }
+
+        if (op === '$match') {
+            params.push(JSON.stringify(stage.$match));
+            whereClauses.push(`data @> $${params.length}::jsonb`);
+        } else if (op === '$group') {
+            hasGroup = true;
+            const result = buildGroup(stage.$group);
+            selectParts = result.selectParts;
+            groupBy = result.groupBy;
+        } else if (op === '$sort') {
+            const sortEntries = Object.entries(stage.$sort);
+            for (const [key, dir] of sortEntries) {
+                if (!fieldKeyPattern.test(key)) {
+                    throw new Error(`Invalid sort key: ${key}`);
+                }
+                const direction = dir === -1 ? 'DESC' : 'ASC';
+                if (hasGroup) {
+                    orderClauses.push(`${key} ${direction}`);
+                } else {
+                    orderClauses.push(`data->>'${key}' ${direction}`);
+                }
+            }
+        } else if (op === '$limit') {
+            params.push(stage.$limit);
+            limitClause = ` LIMIT $${params.length}`;
+        } else if (op === '$skip') {
+            params.push(stage.$skip);
+            offsetClause = ` OFFSET $${params.length}`;
+        }
+    }
+
+    const select = selectParts && selectParts.length > 0
+        ? selectParts.join(', ')
+        : '_id, data, created_at';
+
+    let sql = `SELECT ${select} FROM ${collection}`;
+
+    if (whereClauses.length > 0) {
+        sql += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    if (groupBy) {
+        sql += ` GROUP BY ${groupBy}`;
+    }
+
+    if (orderClauses.length > 0) {
+        sql += ` ORDER BY ${orderClauses.join(', ')}`;
+    }
+
+    sql += limitClause;
+    sql += offsetClause;
+
+    const result = await client.query(sql, params.length > 0 ? params : undefined);
+    return result.rows;
+}
+
 export async function docCreateIndex(client, collection, keys) {
     validateIdentifier(collection);
     if (!keys || Object.keys(keys).length === 0) {

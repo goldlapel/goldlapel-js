@@ -401,7 +401,7 @@ export {
     analyze, explainScore,
     docInsert, docInsertMany, docFind, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
-    docCount, docCreateIndex,
+    docCount, docCreateIndex, docAggregate,
 } from './utils.js';
 
 export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };
