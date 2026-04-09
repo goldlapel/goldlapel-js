@@ -941,13 +941,19 @@ function buildFilter(filterDict, startParam = 1) {
     };
 }
 
-async function ensureCollection(client, collection) {
+async function ensureCollection(client, collection, { unlogged = false } = {}) {
+    const prefix = unlogged ? 'CREATE UNLOGGED TABLE' : 'CREATE TABLE';
     await client.query(
-        `CREATE TABLE IF NOT EXISTS ${collection} (` +
+        `${prefix} IF NOT EXISTS ${collection} (` +
         `_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), ` +
         `data JSONB NOT NULL, ` +
         `created_at TIMESTAMPTZ DEFAULT NOW())`
     );
+}
+
+export async function docCreateCollection(client, collection, { unlogged = false } = {}) {
+    validateIdentifier(collection);
+    await ensureCollection(client, collection, { unlogged });
 }
 
 export async function docInsert(client, collection, document) {

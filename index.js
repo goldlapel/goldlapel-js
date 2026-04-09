@@ -19,6 +19,7 @@ import {
     facets, aggregate, createSearchConfig,
     percolateAdd, percolate, percolateDelete,
     analyze, explainScore,
+    docCreateCollection,
     docInsert, docInsertMany, docFind, docFindCursor, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
     docFindOneAndUpdate, docFindOneAndDelete,
@@ -355,6 +356,7 @@ export class GoldLapel {
     // ─── Instance methods (delegate to utils with this.client) ─────────
 
     // Document store
+    async docCreateCollection(...args) { return docCreateCollection(this.client, ...args); }
     async docInsert(...args) { return docInsert(this.client, ...args); }
     async docInsertMany(...args) { return docInsertMany(this.client, ...args); }
     async docFind(...args) { return docFind(this.client, ...args); }
@@ -523,6 +525,7 @@ export {
     facets, aggregate, createSearchConfig,
     percolateAdd, percolate, percolateDelete,
     analyze, explainScore,
+    docCreateCollection,
     docInsert, docInsertMany, docFind, docFindCursor, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
     docFindOneAndUpdate, docFindOneAndDelete,

@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    docCreateCollection,
     docInsert,
     docInsertMany,
     docFind,
@@ -1757,6 +1758,44 @@ describe('docFindCursor', () => {
         const client = mockCursorClient([[]]);
         await assert.rejects(
             async () => { for await (const _ of docFindCursor(client, 'bad; name')) { /* no-op */ } },
+            /Invalid identifier/
+        );
+    });
+});
+
+// ─── docCreateCollection ──────────────────────────────────────────────────
+
+describe('docCreateCollection', () => {
+    it('creates a regular table by default (not UNLOGGED)', async () => {
+        const client = mockClient();
+        await docCreateCollection(client, 'events');
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS events'));
+        assert.ok(!sql.includes('UNLOGGED'));
+    });
+
+    it('creates an UNLOGGED table when unlogged: true', async () => {
+        const client = mockClient();
+        await docCreateCollection(client, 'events', { unlogged: true });
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('CREATE UNLOGGED TABLE IF NOT EXISTS events'));
+    });
+
+    it('unlogged table has correct schema (_id UUID, data JSONB, created_at)', async () => {
+        const client = mockClient();
+        await docCreateCollection(client, 'metrics', { unlogged: true });
+        const sql = client._calls[0].text;
+        assert.ok(sql.includes('_id UUID PRIMARY KEY DEFAULT gen_random_uuid()'));
+        assert.ok(sql.includes('data JSONB NOT NULL'));
+        assert.ok(sql.includes('created_at TIMESTAMPTZ DEFAULT NOW()'));
+    });
+
+    it('validates collection identifier', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => docCreateCollection(client, 'DROP TABLE x; --'),
             /Invalid identifier/
         );
     });
