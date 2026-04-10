@@ -34,7 +34,7 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@goldlapel/goldlapel": "workspace:*"
+    "@goldlapel/goldlapel": "*"
   },
   "dependencies": {
     "pg": "^8.20.0"

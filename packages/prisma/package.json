@@ -33,7 +33,7 @@
     "directory": "packages/prisma"
   },
   "devDependencies": {
-    "@goldlapel/goldlapel": "workspace:*"
+    "@goldlapel/goldlapel": "*"
   },
   "dependencies": {
     "prisma": "^5.22.0"
