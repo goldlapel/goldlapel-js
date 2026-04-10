@@ -7,13 +7,13 @@ Gold Lapel sits between your app and Postgres, watches query patterns, and autom
 ## Install
 
 ```bash
-npm install goldlapel
+npm install @goldlapel/goldlapel
 ```
 
 ## Quick Start
 
 ```js
-import goldlapel from 'goldlapel';
+import goldlapel from '@goldlapel/goldlapel';
 
 // Start the proxy — returns a database connection with L1 cache built in
 const conn = goldlapel.start('postgresql://user:pass@localhost:5432/mydb');
@@ -57,7 +57,7 @@ Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `null` if not runni
 Class interface for managing multiple instances:
 
 ```js
-import { GoldLapel } from 'goldlapel';
+import { GoldLapel } from '@goldlapel/goldlapel';
 
 const proxy = new GoldLapel('postgresql://user:pass@localhost:5432/mydb', { port: 7932 });
 const conn = await proxy.start();
@@ -70,7 +70,7 @@ proxy.stop();
 Pass a config object to configure the proxy:
 
 ```js
-import goldlapel from 'goldlapel'
+import goldlapel from '@goldlapel/goldlapel'
 
 const conn = await goldlapel.start('postgresql://user:pass@localhost/mydb', {
   config: {
@@ -87,7 +87,7 @@ Keys use `camelCase` and map to CLI flags (`poolSize` → `--pool-size`). Boolea
 Unknown keys throw immediately. To see all valid keys:
 
 ```js
-import { configKeys } from 'goldlapel'
+import { configKeys } from '@goldlapel/goldlapel'
 console.log(configKeys())
 ```
 

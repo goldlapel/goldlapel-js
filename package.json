@@ -1,5 +1,5 @@
 {
-  "name": "goldlapel",
+  "name": "@goldlapel/goldlapel",
   "version": "0.1.0-rc16",
   "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "module",
