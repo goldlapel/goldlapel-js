@@ -204,6 +204,7 @@ export async function zrem(client, table, member) {
 }
 
 export async function geoadd(client, table, nameColumn, geomColumn, name, lon, lat) {
+    await client.query('CREATE EXTENSION IF NOT EXISTS postgis');
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${table} (
             id BIGSERIAL PRIMARY KEY,
@@ -537,6 +538,7 @@ export async function explainScore(client, table, column, query, idColumn, idVal
 }
 
 export async function script(client, luaCode, ...args) {
+    await client.query('CREATE EXTENSION IF NOT EXISTS pllua');
     const funcName = '_gl_lua_' + Math.random().toString(36).slice(2, 10);
     const n = args.length;
     const params = Array.from({length: n}, (_, i) => `p${i + 1} text`).join(', ');
