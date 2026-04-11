@@ -95,23 +95,22 @@ describe('search', () => {
 // ─── searchFuzzy ────────────────────────────────────────────────────────────
 
 describe('searchFuzzy', () => {
-    it('enables pg_trgm extension then queries', async () => {
+    it('queries with pg_trgm similarity', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await searchFuzzy(client, 'products', 'name', 'widget');
-        assert.equal(client._calls.length, 2);
-        assert.ok(client._calls[0].text.includes('CREATE EXTENSION IF NOT EXISTS pg_trgm'));
-        const sql = client._calls[1].text;
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('similarity(name, $1)'));
         assert.ok(sql.includes('FROM products'));
         assert.ok(sql.includes('> $2'));
         assert.ok(sql.includes('LIMIT $3'));
-        assert.deepEqual(client._calls[1].values, ['widget', 0.3, 50]);
+        assert.deepEqual(client._calls[0].values, ['widget', 0.3, 50]);
     });
 
     it('uses custom threshold and limit', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await searchFuzzy(client, 'products', 'name', 'widgt', { threshold: 0.5, limit: 5 });
-        assert.deepEqual(client._calls[1].values, ['widgt', 0.5, 5]);
+        assert.deepEqual(client._calls[0].values, ['widgt', 0.5, 5]);
     });
 
     it('returns rows', async () => {
@@ -141,30 +140,28 @@ describe('searchFuzzy', () => {
 // ─── searchPhonetic ─────────────────────────────────────────────────────────
 
 describe('searchPhonetic', () => {
-    it('enables fuzzystrmatch and pg_trgm then queries', async () => {
+    it('queries with phonetic matching', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await searchPhonetic(client, 'users', 'name', 'john');
-        assert.equal(client._calls.length, 3);
-        assert.ok(client._calls[0].text.includes('CREATE EXTENSION IF NOT EXISTS fuzzystrmatch'));
-        assert.ok(client._calls[1].text.includes('CREATE EXTENSION IF NOT EXISTS pg_trgm'));
-        const sql = client._calls[2].text;
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('soundex(name) = soundex($1)'));
         assert.ok(sql.includes('similarity(name, $1) AS _score'));
         assert.ok(sql.includes('FROM users'));
         assert.ok(sql.includes('LIMIT $2'));
-        assert.deepEqual(client._calls[2].values, ['john', 50]);
+        assert.deepEqual(client._calls[0].values, ['john', 50]);
     });
 
     it('uses custom limit', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await searchPhonetic(client, 'users', 'name', 'jon', { limit: 5 });
-        assert.deepEqual(client._calls[2].values, ['jon', 5]);
+        assert.deepEqual(client._calls[0].values, ['jon', 5]);
     });
 
     it('returns rows ordered by score then column', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await searchPhonetic(client, 'users', 'name', 'john');
-        const sql = client._calls[2].text;
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('ORDER BY _score DESC, name'));
     });
 
@@ -180,30 +177,29 @@ describe('searchPhonetic', () => {
 // ─── similar (vector similarity) ────────────────────────────────────────────
 
 describe('similar', () => {
-    it('enables pgvector extension then queries', async () => {
+    it('queries with vector similarity', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await similar(client, 'docs', 'embedding', [0.1, 0.2, 0.3]);
-        assert.equal(client._calls.length, 2);
-        assert.ok(client._calls[0].text.includes('CREATE EXTENSION IF NOT EXISTS vector'));
-        const sql = client._calls[1].text;
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('(embedding <=> $1::vector)'));
         assert.ok(sql.includes('AS _score'));
         assert.ok(sql.includes('FROM docs'));
         assert.ok(sql.includes('ORDER BY _score'));
         assert.ok(sql.includes('LIMIT $2'));
-        assert.deepEqual(client._calls[1].values, ['[0.1,0.2,0.3]', 10]);
+        assert.deepEqual(client._calls[0].values, ['[0.1,0.2,0.3]', 10]);
     });
 
     it('formats vector literal correctly', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await similar(client, 'docs', 'embedding', [1, 2, 3, 4, 5]);
-        assert.equal(client._calls[1].values[0], '[1,2,3,4,5]');
+        assert.equal(client._calls[0].values[0], '[1,2,3,4,5]');
     });
 
     it('uses custom limit', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await similar(client, 'docs', 'embedding', [0.1], { limit: 3 });
-        assert.equal(client._calls[1].values[1], 3);
+        assert.equal(client._calls[0].values[1], 3);
     });
 
     it('returns rows', async () => {
@@ -225,28 +221,27 @@ describe('similar', () => {
 // ─── suggest (autocomplete) ─────────────────────────────────────────────────
 
 describe('suggest', () => {
-    it('enables pg_trgm and generates ILIKE query', async () => {
+    it('generates ILIKE query for autocomplete', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await suggest(client, 'cities', 'name', 'san f');
-        assert.equal(client._calls.length, 2);
-        assert.ok(client._calls[0].text.includes('CREATE EXTENSION IF NOT EXISTS pg_trgm'));
-        const sql = client._calls[1].text;
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('similarity(name, $1) AS _score'));
         assert.ok(sql.includes('WHERE name ILIKE $2'));
         assert.ok(sql.includes('LIMIT $3'));
-        assert.deepEqual(client._calls[1].values, ['san f', 'san f%', 10]);
+        assert.deepEqual(client._calls[0].values, ['san f', 'san f%', 10]);
     });
 
     it('uses custom limit', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await suggest(client, 'cities', 'name', 'new', { limit: 5 });
-        assert.equal(client._calls[1].values[2], 5);
+        assert.equal(client._calls[0].values[2], 5);
     });
 
     it('returns rows ordered by score then column', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await suggest(client, 'cities', 'name', 'san');
-        const sql = client._calls[1].text;
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('ORDER BY _score DESC, name'));
     });
 

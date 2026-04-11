@@ -32,7 +32,6 @@ export async function search(client, table, column, query, { limit = 50, lang = 
 export async function searchFuzzy(client, table, column, query, { limit = 50, threshold = 0.3 } = {}) {
     validateIdentifier(table);
     validateIdentifier(column);
-    await client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
     const result = await client.query(
         `SELECT *, similarity(${column}, $1) AS _score FROM ${table} WHERE similarity(${column}, $1) > $2 ORDER BY _score DESC LIMIT $3`,
         [query, threshold, limit]
@@ -43,8 +42,6 @@ export async function searchFuzzy(client, table, column, query, { limit = 50, th
 export async function searchPhonetic(client, table, column, query, { limit = 50 } = {}) {
     validateIdentifier(table);
     validateIdentifier(column);
-    await client.query('CREATE EXTENSION IF NOT EXISTS fuzzystrmatch');
-    await client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
     const result = await client.query(
         `SELECT *, similarity(${column}, $1) AS _score FROM ${table} WHERE soundex(${column}) = soundex($1) ORDER BY _score DESC, ${column} LIMIT $2`,
         [query, limit]
@@ -55,7 +52,6 @@ export async function searchPhonetic(client, table, column, query, { limit = 50 
 export async function similar(client, table, column, vector, { limit = 10 } = {}) {
     validateIdentifier(table);
     validateIdentifier(column);
-    await client.query('CREATE EXTENSION IF NOT EXISTS vector');
     const vectorLiteral = '[' + vector.join(',') + ']';
     const result = await client.query(
         `SELECT *, (${column} <=> $1::vector) AS _score FROM ${table} ORDER BY _score LIMIT $2`,
@@ -67,7 +63,6 @@ export async function similar(client, table, column, vector, { limit = 10 } = {}
 export async function suggest(client, table, column, prefix, { limit = 10 } = {}) {
     validateIdentifier(table);
     validateIdentifier(column);
-    await client.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
     const result = await client.query(
         `SELECT *, similarity(${column}, $1) AS _score FROM ${table} WHERE ${column} ILIKE $2 ORDER BY _score DESC, ${column} LIMIT $3`,
         [prefix, prefix + '%', limit]
@@ -209,7 +204,6 @@ export async function zrem(client, table, member) {
 }
 
 export async function geoadd(client, table, nameColumn, geomColumn, name, lon, lat) {
-    await client.query('CREATE EXTENSION IF NOT EXISTS postgis');
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${table} (
             id BIGSERIAL PRIMARY KEY,
@@ -543,7 +537,6 @@ export async function explainScore(client, table, column, query, idColumn, idVal
 }
 
 export async function script(client, luaCode, ...args) {
-    await client.query('CREATE EXTENSION IF NOT EXISTS pllua');
     const funcName = '_gl_lua_' + Math.random().toString(36).slice(2, 10);
     const n = args.length;
     const params = Array.from({length: n}, (_, i) => `p${i + 1} text`).join(', ');
