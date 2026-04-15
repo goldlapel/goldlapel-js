@@ -13,73 +13,66 @@ npm install @goldlapel/goldlapel
 ## Quick Start
 
 ```js
-import goldlapel from '@goldlapel/goldlapel';
+import { GoldLapel } from '@goldlapel/goldlapel';
 
-// Start the proxy — returns a database connection with L1 cache built in
-const conn = goldlapel.start('postgresql://user:pass@localhost:5432/mydb');
+// Create a proxy instance and start it
+const gl = new GoldLapel('postgresql://user:pass@localhost:5432/mydb');
+await gl.start();
 
-// Use the connection directly — no driver setup needed
-const result = conn.query('SELECT * FROM users WHERE id = $1', [42]);
+// Use the proxy connection directly — no driver setup needed
+const result = gl.query('SELECT * FROM users WHERE id = $1', [42]);
 ```
 
 After startup, Gold Lapel prints a one-line summary and serves a dashboard at `http://127.0.0.1:7933` by default:
 
 ```js
-const dashUrl = goldlapel.dashboardUrl();
+const dashUrl = gl.dashboardUrl();
 // => "http://127.0.0.1:7933" (or null if not running / dashboard disabled)
 ```
 
 ## API
 
-### `goldlapel.start(upstream, opts)`
+### `new GoldLapel(upstream, opts)`
 
-Starts the Gold Lapel proxy and returns a database connection with L1 cache.
+Creates a Gold Lapel proxy instance.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `opts.port` — proxy port (default: 7932)
 - `opts.config` — config object (see [Configuration](#configuration))
 - `opts.extraArgs` — additional CLI flags passed to the binary (e.g. `['--threshold-impact', '5000']`)
 
-### `goldlapel.stop()`
+### `gl.start()`
+
+Starts the proxy. Returns a promise that resolves when the proxy is ready.
+
+### `gl.stop()`
 
 Stops the proxy. Also called automatically on process exit.
 
-### `goldlapel.proxyUrl()`
+### `gl.proxyUrl()`
 
 Returns the current proxy URL, or `null` if not running.
 
-### `goldlapel.dashboardUrl()`
+### `gl.dashboardUrl()`
 
 Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `null` if not running or the dashboard is disabled (`dashboardPort: 0`).
 
-### `new goldlapel.GoldLapel(upstream, opts)`
+## Configuration
 
-Class interface for managing multiple instances:
+Pass a config object to the constructor to configure the proxy:
 
 ```js
 import { GoldLapel } from '@goldlapel/goldlapel';
 
-const proxy = new GoldLapel('postgresql://user:pass@localhost:5432/mydb', { port: 7932 });
-const conn = await proxy.start();
-// ...
-proxy.stop();
-```
-
-## Configuration
-
-Pass a config object to configure the proxy:
-
-```js
-import goldlapel from '@goldlapel/goldlapel'
-
-const conn = await goldlapel.start('postgresql://user:pass@localhost/mydb', {
+const gl = new GoldLapel('postgresql://user:pass@localhost/mydb', {
   config: {
     mode: 'waiter',
     poolSize: 50,
     disableMatviews: true,
     replica: ['postgresql://user:pass@replica1/mydb'],
   },
-})
+});
+await gl.start();
 ```
 
 Keys use `camelCase` and map to CLI flags (`poolSize` → `--pool-size`). Boolean keys are flags — `true` enables them. Array keys produce repeated flags.
@@ -87,8 +80,8 @@ Keys use `camelCase` and map to CLI flags (`poolSize` → `--pool-size`). Boolea
 Unknown keys throw immediately. To see all valid keys:
 
 ```js
-import { configKeys } from '@goldlapel/goldlapel'
-console.log(configKeys())
+import { configKeys } from '@goldlapel/goldlapel';
+console.log(configKeys());
 ```
 
 For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
@@ -98,10 +91,10 @@ For the full configuration reference, see the [main documentation](https://githu
 You can also pass raw CLI flags via `extraArgs`:
 
 ```js
-const conn = await goldlapel.start(
-    'postgresql://user:pass@localhost:5432/mydb',
-    { extraArgs: ['--threshold-duration-ms', '200', '--refresh-interval-secs', '30'] }
-);
+const gl = new GoldLapel('postgresql://user:pass@localhost:5432/mydb', {
+  extraArgs: ['--threshold-duration-ms', '200', '--refresh-interval-secs', '30'],
+});
+await gl.start();
 ```
 
 Or set environment variables (`GOLDLAPEL_PROXY_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
