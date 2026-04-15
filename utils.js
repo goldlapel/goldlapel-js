@@ -473,7 +473,7 @@ export async function percolateAdd(client, name, queryId, query, { lang = 'engli
         )
     `);
     await client.query(
-        `CREATE INDEX IF NOT EXISTS ${name}_tsq_idx ON ${name} USING GIN (tsquery)`
+        `CREATE INDEX IF NOT EXISTS ${name}_tsq_idx ON ${name} USING GIST (tsquery)`
     );
     await client.query(
         `INSERT INTO ${name} (query_id, query_text, tsquery, lang, metadata)

@@ -445,7 +445,7 @@ describe('percolateAdd', () => {
         assert.ok(createSql.includes('tsquery TSQUERY NOT NULL'));
         const indexSql = client._calls[1].text;
         assert.ok(indexSql.includes('CREATE INDEX IF NOT EXISTS alerts_tsq_idx'));
-        assert.ok(indexSql.includes('USING GIN (tsquery)'));
+        assert.ok(indexSql.includes('USING GIST (tsquery)'));
         const insertSql = client._calls[2].text;
         assert.ok(insertSql.includes('INSERT INTO alerts'));
         assert.ok(insertSql.includes('plainto_tsquery($3, $2)'));
