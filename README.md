@@ -103,7 +103,7 @@ Starts a Gold Lapel proxy and returns a `GoldLapel` instance. Eagerly opens an i
 - `upstream` — your Postgres connection string
 - `opts.port` — proxy port (default: 7932)
 - `opts.dashboardPort` — dashboard port (default: 7933; `0` disables)
-- `opts.logLevel` — `trace` | `debug` | `info` | `warn` | `error`
+- `opts.logLevel` — `trace` | `debug` | `info` | `warn` | `error` (only `trace`/`debug`/`info` produce visible output; `warn`/`error` are the default level and emit nothing extra)
 - `opts.config` — camelCase config object (see [Configuration](#configuration))
 - `opts.extraArgs` — raw CLI flags passed to the binary
 - `opts.noConnect` — skip opening the internal driver connection

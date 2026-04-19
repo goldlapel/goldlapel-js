@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { GoldLapel, start, _driverNotFoundError } from '../index.js';
+import { GoldLapel, start, _driverNotFoundError, _logLevelToVerboseFlag } from '../index.js';
 
 function mockClient(queryResult) {
     const calls = [];
@@ -235,7 +235,7 @@ describe('noConnect option', () => {
 // ─── logLevel option ───────────────────────────────────────────────────────
 
 describe('logLevel option', () => {
-    it('accepts valid log levels', () => {
+    it('accepts valid log levels on the instance', () => {
         for (const lvl of ['trace', 'debug', 'info', 'warn', 'error']) {
             const gl = new GoldLapel('postgresql://localhost:5432/mydb', { logLevel: lvl });
             assert.strictEqual(gl._logLevel, lvl);
@@ -245,5 +245,98 @@ describe('logLevel option', () => {
     it('is undefined when not specified', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         assert.strictEqual(gl._logLevel, undefined);
+    });
+});
+
+describe('_logLevelToVerboseFlag()', () => {
+    it('maps trace → -vvv', () => {
+        assert.strictEqual(_logLevelToVerboseFlag('trace'), '-vvv');
+    });
+
+    it('maps debug → -vv', () => {
+        assert.strictEqual(_logLevelToVerboseFlag('debug'), '-vv');
+    });
+
+    it('maps info → -v', () => {
+        assert.strictEqual(_logLevelToVerboseFlag('info'), '-v');
+    });
+
+    it('maps warn/warning/error → null (default level, no flag emitted)', () => {
+        assert.strictEqual(_logLevelToVerboseFlag('warn'), null);
+        assert.strictEqual(_logLevelToVerboseFlag('warning'), null);
+        assert.strictEqual(_logLevelToVerboseFlag('error'), null);
+    });
+
+    it('returns null for undefined / null', () => {
+        assert.strictEqual(_logLevelToVerboseFlag(undefined), null);
+        assert.strictEqual(_logLevelToVerboseFlag(null), null);
+    });
+
+    it('is case-insensitive', () => {
+        assert.strictEqual(_logLevelToVerboseFlag('DEBUG'), '-vv');
+        assert.strictEqual(_logLevelToVerboseFlag('Info'), '-v');
+    });
+
+    it('throws a clear error on invalid level strings', () => {
+        assert.throws(
+            () => _logLevelToVerboseFlag('verbose'),
+            /logLevel must be one of: trace, debug, info, warn, error/,
+        );
+        assert.throws(
+            () => _logLevelToVerboseFlag('loud'),
+            /logLevel must be one of: trace, debug, info, warn, error/,
+        );
+    });
+
+    it('throws on non-string values', () => {
+        assert.throws(
+            () => _logLevelToVerboseFlag(5),
+            /logLevel must be one of: trace, debug, info, warn, error/,
+        );
+    });
+});
+
+describe('GoldLapel._buildSpawnArgs()', () => {
+    it('emits -vv when logLevel is "debug"', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { logLevel: 'debug' });
+        const args = gl._buildSpawnArgs();
+        assert.ok(args.includes('-vv'), `expected -vv in args: ${args.join(' ')}`);
+        assert.ok(!args.includes('--log-level'),
+            `must NOT pass --log-level (unsupported by proxy): ${args.join(' ')}`);
+    });
+
+    it('emits -v when logLevel is "info"', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { logLevel: 'info' });
+        const args = gl._buildSpawnArgs();
+        assert.ok(args.includes('-v'));
+        assert.ok(!args.includes('-vv'));
+    });
+
+    it('emits -vvv when logLevel is "trace"', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { logLevel: 'trace' });
+        assert.ok(gl._buildSpawnArgs().includes('-vvv'));
+    });
+
+    it('emits no verbose flag for warn/error (default level)', () => {
+        for (const lvl of ['warn', 'error']) {
+            const gl = new GoldLapel('postgresql://localhost:5432/mydb', { logLevel: lvl });
+            const args = gl._buildSpawnArgs();
+            assert.ok(!args.some(a => a.startsWith('-v')),
+                `unexpected verbose flag for ${lvl}: ${args.join(' ')}`);
+        }
+    });
+
+    it('emits no verbose flag when logLevel unset', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        const args = gl._buildSpawnArgs();
+        assert.ok(!args.some(a => a.startsWith('-v')));
+    });
+
+    it('raises on invalid logLevel', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { logLevel: 'loud' });
+        assert.throws(
+            () => gl._buildSpawnArgs(),
+            /logLevel must be one of: trace, debug, info, warn, error/,
+        );
     });
 });

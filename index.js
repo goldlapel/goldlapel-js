@@ -69,7 +69,34 @@ const LIST_KEYS = new Set([
     'replica', 'excludeTables',
 ]);
 
-const VALID_LOG_LEVELS = new Set(['trace', 'debug', 'info', 'warn', 'error']);
+// logLevel is exposed as an ergonomic string ("trace"|"debug"|"info"|"warn"|
+// "error"), but the proxy binary's actual verbosity flag is count-based
+// (`-v`/`-vv`/`-vvv`). Translate at the wrapper boundary so users don't have
+// to know the underlying flag shape. "warn"/"error" map to the default level
+// (no flag emitted).
+const VALID_LOG_LEVELS = new Set(['trace', 'debug', 'info', 'warn', 'warning', 'error']);
+
+export function _logLevelToVerboseFlag(level) {
+    if (level === undefined || level === null) return null;
+    if (typeof level !== 'string') {
+        throw new Error(
+            `logLevel must be one of: trace, debug, info, warn, error (got ${typeof level})`
+        );
+    }
+    const normalized = level.toLowerCase();
+    if (!VALID_LOG_LEVELS.has(normalized)) {
+        throw new Error(
+            `logLevel must be one of: trace, debug, info, warn, error (got '${level}')`
+        );
+    }
+    switch (normalized) {
+        case 'trace': return '-vvv';
+        case 'debug': return '-vv';
+        case 'info': return '-v';
+        // warn/warning/error map to the default level — no flag emitted.
+        default: return null;
+    }
+}
 
 export function configKeys() {
     return new Set(VALID_CONFIG_KEYS);
@@ -367,28 +394,30 @@ export class GoldLapel {
         this._connScope = new AsyncLocalStorage();
     }
 
-    async _spawn() {
-        if (this._process && this._process.exitCode === null) {
-            return;
-        }
-
-        if (this._logLevel !== undefined && !VALID_LOG_LEVELS.has(this._logLevel)) {
-            throw new Error(
-                `Invalid logLevel '${this._logLevel}'. Must be one of: ` +
-                [...VALID_LOG_LEVELS].join(', ')
-            );
-        }
-
-        const binary = _findBinary();
+    // Builds the argv passed to the proxy binary. Pure — no side effects —
+    // so tests can assert the translated flags without spawning a process.
+    // Throws if logLevel is invalid (via _logLevelToVerboseFlag).
+    _buildSpawnArgs() {
+        const verboseFlag = _logLevelToVerboseFlag(this._logLevel);
         const args = [
             '--upstream', this._upstream,
             '--proxy-port', String(this._port),
             ..._configToArgs(this._config),
             ...this._extraArgs,
         ];
-        if (this._logLevel) {
-            args.push('--log-level', this._logLevel);
+        if (verboseFlag) {
+            args.push(verboseFlag);
         }
+        return args;
+    }
+
+    async _spawn() {
+        if (this._process && this._process.exitCode === null) {
+            return;
+        }
+
+        const args = this._buildSpawnArgs();
+        const binary = _findBinary();
 
         const env = { ...process.env };
         if (!env.GOLDLAPEL_CLIENT) env.GOLDLAPEL_CLIENT = 'node';
@@ -721,4 +750,4 @@ export {
     docCreateCapped, docRemoveCap,
 } from './utils.js';
 
-export default { GoldLapel, start, configKeys, _configToArgs };
+export default { GoldLapel, start, configKeys, _configToArgs, _logLevelToVerboseFlag };
