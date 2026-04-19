@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { GoldLapel, start, _driverNotFoundError, _logLevelToVerboseFlag } from '../index.js';
+import { GoldLapel, start, _driverNotFoundError, _logLevelToVerboseFlag, _makePostgresJsAdapter } from '../index.js';
 
 function mockClient(queryResult) {
     const calls = [];
@@ -338,5 +338,87 @@ describe('GoldLapel._buildSpawnArgs()', () => {
             () => gl._buildSpawnArgs(),
             /logLevel must be one of: trace, debug, info, warn, error/,
         );
+    });
+});
+
+// ─── postgres.js driver adapter pub/sub behavior ───────────────────────────
+//
+// postgres.js has no `client.on('notification', ...)` event model, so
+// subscribe() and docWatch() can't deliver events through it. Rather than
+// silently swallow them, the adapter throws on on/off/once/removeListener
+// and points users at pg.
+
+describe('_makePostgresJsAdapter', () => {
+    function fakeSql() {
+        const calls = [];
+        const sql = async () => [];
+        sql.unsafe = async (text, args) => {
+            calls.push({ text, args });
+            const rows = [];
+            rows.count = 0;
+            rows.command = 'SELECT';
+            rows.columns = [];
+            return rows;
+        };
+        sql.end = async () => {};
+        sql._calls = calls;
+        return sql;
+    }
+
+    it('query() delegates to sql.unsafe and normalizes the result shape', async () => {
+        const sql = fakeSql();
+        const conn = _makePostgresJsAdapter(sql);
+        const res = await conn.query('SELECT 1', []);
+        assert.deepStrictEqual(res, {
+            rows: [],
+            fields: [],
+            rowCount: 0,
+            command: 'SELECT',
+        });
+        assert.strictEqual(sql._calls.length, 1);
+        assert.strictEqual(sql._calls[0].text, 'SELECT 1');
+    });
+
+    it('on() throws a helpful pub/sub-not-supported error', () => {
+        const conn = _makePostgresJsAdapter(fakeSql());
+        assert.throws(
+            () => conn.on('notification', () => {}),
+            /pub\/sub .* not supported .* 'postgres' \(postgres\.js\)/s,
+        );
+    });
+
+    it('off() throws with the same message', () => {
+        const conn = _makePostgresJsAdapter(fakeSql());
+        assert.throws(
+            () => conn.off('notification', () => {}),
+            /pub\/sub .* not supported/,
+        );
+    });
+
+    it('once() throws with the same message', () => {
+        const conn = _makePostgresJsAdapter(fakeSql());
+        assert.throws(
+            () => conn.once('notification', () => {}),
+            /pub\/sub .* not supported/,
+        );
+    });
+
+    it('removeListener() throws with the same message', () => {
+        const conn = _makePostgresJsAdapter(fakeSql());
+        assert.throws(
+            () => conn.removeListener('notification', () => {}),
+            /pub\/sub .* not supported/,
+        );
+    });
+
+    it('error message points users at pg and the { conn } / using() escape hatches', () => {
+        const conn = _makePostgresJsAdapter(fakeSql());
+        try {
+            conn.on('notification', () => {});
+            assert.fail('expected throw');
+        } catch (err) {
+            assert.match(err.message, /pg/);
+            assert.match(err.message, /\{ conn \}|gl\.using/);
+        }
     });
 });

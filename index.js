@@ -307,6 +307,46 @@ export function _driverNotFoundError() {
     );
 }
 
+// Builds the adapter object that wraps a postgres.js `sql` instance into the
+// shape utils.js expects (a `.query(text, values)` method). Exported so tests
+// can exercise the pub/sub-not-supported branch without installing postgres.js.
+//
+// postgres.js has no LISTEN/NOTIFY event model compatible with pg's
+// `client.on('notification', ...)` interface. Rather than silently swallow
+// subscribe()/docWatch() callbacks (user sets up pub/sub, then wonders why
+// no events ever fire), `on`/`off`/`once`/`removeListener` throw loud and
+// point at pg.
+export function _makePostgresJsAdapter(sql) {
+    const pubsubNotSupported = () => {
+        throw new Error(
+            "Gold Lapel pub/sub (subscribe, docWatch) is not supported on " +
+            "the 'postgres' (postgres.js) driver — postgres.js does not " +
+            "expose the node-postgres 'notification' event model. Install " +
+            "'pg' (node-postgres) as your internal driver (auto-detected " +
+            "if present) or pass an explicit pg client via { conn } / " +
+            "gl.using(conn, ...)."
+        );
+    };
+    return {
+        _sql: sql,
+        async query(text, values) {
+            const args = values == null ? [] : values;
+            // sql.unsafe(text, args) runs parameterized; returns a rows-like array
+            const rows = await sql.unsafe(text, args);
+            return {
+                rows: Array.from(rows),
+                fields: rows.columns ?? [],
+                rowCount: rows.count ?? rows.length ?? 0,
+                command: rows.command ?? '',
+            };
+        },
+        on: pubsubNotSupported,
+        off: pubsubNotSupported,
+        once: pubsubNotSupported,
+        removeListener: pubsubNotSupported,
+    };
+}
+
 export async function _connectWithDriver(driverName, url) {
     // Returns an object with { conn, close } where conn has a .query(text, values)
     // method that resolves to { rows, fields, rowCount, command } shape.
@@ -322,21 +362,7 @@ export async function _connectWithDriver(driverName, url) {
         const mod = await import('postgres');
         const postgres = mod.default ?? mod;
         const sql = postgres(url);
-        const conn = {
-            _sql: sql,
-            async query(text, values) {
-                const args = values == null ? [] : values;
-                // sql.unsafe(text, args) runs parameterized; returns a rows-like array
-                const rows = await sql.unsafe(text, args);
-                return {
-                    rows: Array.from(rows),
-                    fields: rows.columns ?? [],
-                    rowCount: rows.count ?? rows.length ?? 0,
-                    command: rows.command ?? '',
-                };
-            },
-            on() {}, off() {}, once() {},
-        };
+        const conn = _makePostgresJsAdapter(sql);
         return { conn, close: () => sql.end() };
     }
     if (driverName === '@vercel/postgres') {
