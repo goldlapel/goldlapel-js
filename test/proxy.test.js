@@ -7,9 +7,6 @@ import os from 'os';
 
 import {
     GoldLapel,
-    stop,
-    proxyUrl,
-    dashboardUrl,
     configKeys,
     _findBinary,
     _makeProxyUrl,
@@ -214,17 +211,17 @@ describe('GoldLapel class', () => {
         assert.strictEqual(gl.url, null);
     });
 
-    it('stop() is no-op when never started', () => {
+    it('stop() is no-op when never started', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        gl.stop();
+        await gl.stop();
         assert.strictEqual(gl.running, false);
         assert.strictEqual(gl.url, null);
     });
 
-    it('stop() is idempotent', () => {
+    it('stop() is idempotent', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        gl.stop();
-        gl.stop();
+        await gl.stop();
+        await gl.stop();
         assert.strictEqual(gl.running, false);
         assert.strictEqual(gl.url, null);
     });
@@ -240,6 +237,28 @@ describe('dashboardUrl', () => {
     it('custom port from config', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
             config: { dashboardPort: 8080 },
+        });
+        assert.strictEqual(gl._dashboardPort, 8080);
+    });
+
+    it('derives from custom proxy port when dashboardPort not supplied', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            port: 17932,
+        });
+        assert.strictEqual(gl._dashboardPort, 17933);
+    });
+
+    it('explicit dashboardPort wins over proxy-port derivation', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            port: 17932,
+            dashboardPort: 9999,
+        });
+        assert.strictEqual(gl._dashboardPort, 9999);
+    });
+
+    it('custom port from top-level opt', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            dashboardPort: 8080,
         });
         assert.strictEqual(gl._dashboardPort, 8080);
     });
@@ -269,11 +288,6 @@ describe('dashboardUrl', () => {
         // Simulate a running process
         gl._process = { exitCode: null, killed: false, kill() {} };
         assert.strictEqual(gl.dashboardUrl, 'http://127.0.0.1:7933');
-    });
-
-    it('module-level dashboardUrl returns null when not started', () => {
-        stop();
-        assert.strictEqual(dashboardUrl(), null);
     });
 });
 
@@ -385,13 +399,5 @@ describe('configKeys', () => {
         const a = configKeys();
         const b = configKeys();
         assert.notStrictEqual(a, b);
-    });
-});
-
-
-describe('module functions', () => {
-    it('proxyUrl returns null when not started', () => {
-        stop();
-        assert.strictEqual(proxyUrl(), null);
     });
 });

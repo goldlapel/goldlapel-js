@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert'
 
-import { drizzle, init, start, stop, proxyUrl, GoldLapel, wrap, NativeCache } from '../index.js'
+import { drizzle, init, start, GoldLapel, wrap, NativeCache } from '../index.js'
 
 function mockStart(returnUrl) {
     const calls = []
@@ -76,7 +76,7 @@ describe('drizzle', () => {
 
         assert.strictEqual(calls.length, 1)
         assert.strictEqual(calls[0].upstream, 'postgresql://user:pass@host:5432/mydb')
-        assert.deepStrictEqual(calls[0].opts, { config: undefined, port: undefined, extraArgs: undefined })
+        assert.deepStrictEqual(calls[0].opts, { config: undefined, port: undefined, extraArgs: undefined, noConnect: true })
         assert.strictEqual(pools.length, 1)
         assert.strictEqual(pools[0]._opts.connectionString, 'postgresql://user:pass@localhost:7932/mydb')
         assert.strictEqual(wrapCalls.length, 1)
@@ -345,20 +345,19 @@ describe('drizzle L1 cache', () => {
         assert.strictEqual(pools[0]._opts.connectionString, 'postgresql://user:pass@localhost:7932/mydb')
     })
 
-    it('handles start returning a non-string (wrapped client) by using proxyUrl()', async () => {
+    it('handles start returning a GoldLapel instance by using instance.url', async () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        // Simulate start() returning a wrapped client object instead of a URL
-        const wrappedClient = { _wrapped: true, query: () => {} }
-        const { _start } = mockStart(wrappedClient)
+        // Simulate start() returning an instance (new v0.2 behavior)
+        const instance = { url: 'postgresql://user:pass@localhost:7932/mydb', query: () => {} }
+        const { _start } = mockStart(instance)
         const { _drizzle } = mockDrizzle()
         const { _wrap } = mockWrap()
         const { _pg, pools } = mockPg()
 
-        // When start returns non-string, it falls back to proxyUrl() which may be null
-        // The pool gets connectionString: null which is valid for pg (it uses defaults)
         await drizzle({ _start, _drizzle, _wrap, _pg })
 
         assert.strictEqual(pools.length, 1)
+        assert.strictEqual(pools[0]._opts.connectionString, 'postgresql://user:pass@localhost:7932/mydb')
     })
 
     it('strips nativeCache and invalidationPort from drizzle options', async () => {
@@ -477,17 +476,15 @@ describe('init', () => {
         assert.strictEqual(process.env.DATABASE_URL, 'postgresql://explicit@localhost:7932/db')
     })
 
-    it('handles start returning non-string by falling back to proxyUrl()', async () => {
+    it('handles start returning a GoldLapel instance via instance.url', async () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const wrappedClient = { _wrapped: true }
-        const { _start } = mockStart(wrappedClient)
+        const instance = { url: 'postgresql://user:pass@localhost:7932/mydb' }
+        const { _start } = mockStart(instance)
 
         const result = await init({ _start })
 
-        // When start returns non-string, init falls back to proxyUrl() which is null
-        // in test context (no real proxy running). process.env coerces null to "null".
-        assert.strictEqual(result, null)
-        assert.strictEqual(process.env.DATABASE_URL, 'null')
+        assert.strictEqual(result, 'postgresql://user:pass@localhost:7932/mydb')
+        assert.strictEqual(process.env.DATABASE_URL, 'postgresql://user:pass@localhost:7932/mydb')
     })
 
     it('does not overwrite existing GOLDLAPEL_CLIENT', async () => {
@@ -505,14 +502,6 @@ describe('init', () => {
 describe('re-exports', () => {
     it('re-exports start from goldlapel', () => {
         assert.strictEqual(typeof start, 'function')
-    })
-
-    it('re-exports stop from goldlapel', () => {
-        assert.strictEqual(typeof stop, 'function')
-    })
-
-    it('re-exports proxyUrl from goldlapel', () => {
-        assert.strictEqual(typeof proxyUrl, 'function')
     })
 
     it('re-exports GoldLapel from goldlapel', () => {

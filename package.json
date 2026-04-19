@@ -1,6 +1,6 @@
 {
-  "name": "@goldlapel/goldlapel",
-  "version": "0.0.0",
+  "name": "goldlapel",
+  "version": "0.2.0",
   "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "module",
   "main": "index.js",
@@ -45,8 +45,15 @@
     "@goldlapel/linux-x64-musl": "0.1.0-rc16",
     "@goldlapel/win-x64": "0.1.0-rc16"
   },
-  "dependencies": {
-    "pg": "^8.20.0"
+  "peerDependencies": {
+    "pg": "^8.20.0",
+    "postgres": "^3.4.0",
+    "@vercel/postgres": "^0.10.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": { "optional": true },
+    "postgres": { "optional": true },
+    "@vercel/postgres": { "optional": true }
   },
   "workspaces": [
     "packages/*"

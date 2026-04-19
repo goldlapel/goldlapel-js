@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert'
 
-import { withGoldLapel, init, cacheExtension, start, stop, proxyUrl, GoldLapel, NativeCache } from '../index.js'
+import { withGoldLapel, init, cacheExtension, start, GoldLapel, NativeCache } from '../index.js'
 
 const origGoldlapelClient = process.env.GOLDLAPEL_CLIENT
 
@@ -65,7 +65,7 @@ describe('withGoldLapel', () => {
 
         assert.strictEqual(calls.length, 1)
         assert.strictEqual(calls[0].upstream, 'postgresql://user:pass@host:5432/mydb')
-        assert.deepStrictEqual(calls[0].opts, { config: undefined, port: undefined, extraArgs: undefined })
+        assert.deepStrictEqual(calls[0].opts, { config: undefined, port: undefined, extraArgs: undefined, noConnect: true })
         assert(client instanceof MockPrismaClient)
         assert.strictEqual(client._opts.datasources.db.url, 'postgresql://user:pass@localhost:7932/mydb')
         assert.strictEqual(process.env.DATABASE_URL, 'postgresql://user:pass@localhost:7932/mydb')
@@ -879,14 +879,6 @@ describe('cacheExtension', () => {
 describe('re-exports', () => {
     it('re-exports start from goldlapel', () => {
         assert.strictEqual(typeof start, 'function')
-    })
-
-    it('re-exports stop from goldlapel', () => {
-        assert.strictEqual(typeof stop, 'function')
-    })
-
-    it('re-exports proxyUrl from goldlapel', () => {
-        assert.strictEqual(typeof proxyUrl, 'function')
     })
 
     it('re-exports GoldLapel from goldlapel', () => {
