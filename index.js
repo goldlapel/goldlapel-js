@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from 'child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { NativeCache } from './cache.js';
 import { createConnection } from 'net';
 import { existsSync } from 'fs';
@@ -67,6 +68,8 @@ const BOOLEAN_KEYS = new Set([
 const LIST_KEYS = new Set([
     'replica', 'excludeTables',
 ]);
+
+const VALID_LOG_LEVELS = new Set(['trace', 'debug', 'info', 'warn', 'error']);
 
 export function configKeys() {
     return new Set(VALID_CONFIG_KEYS);
@@ -239,23 +242,130 @@ export function _waitForPort(host, port, timeout) {
     });
 }
 
-export class GoldLapel {
-    constructor(upstream, { port, config, extraArgs } = {}) {
-        this._upstream = upstream;
-        this._port = port ?? DEFAULT_PORT;
-        this._dashboardPort = config && config.dashboardPort !== undefined
-            ? Number(config.dashboardPort)
-            : DEFAULT_DASHBOARD_PORT;
-        this._config = config || {};
-        this._extraArgs = extraArgs || [];
-        this._process = null;
-        this._proxyUrl = null;
-        this._client = null;
+// ─── Driver auto-detection ─────────────────────────────────────────────────
+//
+// At import time we attempt to find a Postgres driver in the user's project.
+// Order: pg → postgres (postgres.js) → @vercel/postgres. The first one found
+// wins. Detection is eager so we can fail fast if none is installed, but the
+// actual module is loaded lazily (on the first start() call) to keep import
+// cheap and avoid loading native addons for users who only want wrapper
+// methods with their own conn.
+
+const DRIVER_CANDIDATES = ['pg', 'postgres', '@vercel/postgres'];
+
+export function _detectDriver() {
+    // Allow override via env var for tests
+    if (process.env.GOLDLAPEL_DRIVER === 'none') return null;
+    if (process.env.GOLDLAPEL_DRIVER) {
+        return process.env.GOLDLAPEL_DRIVER;
     }
 
-    async start() {
+    for (const name of DRIVER_CANDIDATES) {
+        try {
+            require.resolve(name);
+            return name;
+        } catch {}
+    }
+    return null;
+}
+
+let _driverName = _detectDriver();
+
+export function _driverNotFoundError() {
+    return new Error(
+        'No supported Postgres driver found. Install one of: ' +
+        DRIVER_CANDIDATES.join(', ') +
+        ". For example: `npm install pg`. If you only need the proxy URL " +
+        'without an internal connection, pass `{ noConnect: true }` to start().'
+    );
+}
+
+export async function _connectWithDriver(driverName, url) {
+    // Returns an object with { conn, close } where conn has a .query(text, values)
+    // method that resolves to { rows, fields, rowCount, command } shape.
+    if (driverName === 'pg') {
+        const pg = await import('pg');
+        const Client = pg.default?.Client ?? pg.Client;
+        const client = new Client({ connectionString: url });
+        await client.connect();
+        return { conn: client, close: () => client.end() };
+    }
+    if (driverName === 'postgres') {
+        // postgres.js — template-tag style. Wrap to the shape utils expect.
+        const mod = await import('postgres');
+        const postgres = mod.default ?? mod;
+        const sql = postgres(url);
+        const conn = {
+            _sql: sql,
+            async query(text, values) {
+                const args = values == null ? [] : values;
+                // sql.unsafe(text, args) runs parameterized; returns a rows-like array
+                const rows = await sql.unsafe(text, args);
+                return {
+                    rows: Array.from(rows),
+                    fields: rows.columns ?? [],
+                    rowCount: rows.count ?? rows.length ?? 0,
+                    command: rows.command ?? '',
+                };
+            },
+            on() {}, off() {}, once() {},
+        };
+        return { conn, close: () => sql.end() };
+    }
+    if (driverName === '@vercel/postgres') {
+        const { createClient } = await import('@vercel/postgres');
+        const client = createClient({ connectionString: url });
+        await client.connect();
+        const conn = {
+            _client: client,
+            async query(text, values) {
+                return client.query(text, values);
+            },
+            on(ev, h) { return client.on?.(ev, h); },
+            off(ev, h) { return client.off?.(ev, h); },
+            once(ev, h) { return client.once?.(ev, h); },
+        };
+        return { conn, close: () => client.end() };
+    }
+    throw new Error(`Unsupported driver: ${driverName}`);
+}
+
+// ─── GoldLapel instance ────────────────────────────────────────────────────
+
+const _connScope = new AsyncLocalStorage();
+
+export class GoldLapel {
+    constructor(upstream, {
+        port, dashboardPort, logLevel, config, extraArgs, noConnect,
+    } = {}) {
+        this._upstream = upstream;
+        this._port = port ?? DEFAULT_PORT;
+        this._dashboardPort = dashboardPort !== undefined
+            ? Number(dashboardPort)
+            : (config && config.dashboardPort !== undefined
+                ? Number(config.dashboardPort)
+                : DEFAULT_DASHBOARD_PORT);
+        this._logLevel = logLevel;
+        this._config = config || {};
+        this._extraArgs = extraArgs || [];
+        this._noConnect = !!noConnect;
+        this._process = null;
+        this._proxyUrl = null;
+        this._defaultConn = null;
+        this._defaultClose = null;
+        this._stopped = false;
+    }
+
+    async _spawn() {
         if (this._process && this._process.exitCode === null) {
-            return this._proxyUrl;
+            return;
+        }
+
+        if (this._logLevel !== undefined && !VALID_LOG_LEVELS.has(this._logLevel)) {
+            throw new Error(
+                `Invalid logLevel '${this._logLevel}'. Must be one of: ` +
+                [...VALID_LOG_LEVELS].join(', ')
+            );
         }
 
         const binary = _findBinary();
@@ -265,6 +375,9 @@ export class GoldLapel {
             ..._configToArgs(this._config),
             ...this._extraArgs,
         ];
+        if (this._logLevel) {
+            args.push('--log-level', this._logLevel);
+        }
 
         const env = { ...process.env };
         if (!env.GOLDLAPEL_CLIENT) env.GOLDLAPEL_CLIENT = 'node';
@@ -297,27 +410,40 @@ export class GoldLapel {
         this._process.stderr.removeListener('data', onData);
 
         this._proxyUrl = _makeProxyUrl(this._upstream, this._port);
+    }
 
-        // Create client connection
-        const pg = await import('pg');
-        const Client = pg.default?.Client ?? pg.Client;
-        this._client = new Client({ connectionString: this._proxyUrl });
-        await this._client.connect();
+    async _openDefaultConn() {
+        if (this._noConnect) return;
+        if (this._defaultConn) return;
 
+        const driver = _driverName;
+        if (!driver) {
+            throw _driverNotFoundError();
+        }
+        const { conn, close } = await _connectWithDriver(driver, this._proxyUrl);
+        this._defaultConn = conn;
+        this._defaultClose = close;
+    }
+
+    async _printBanner() {
         if (this._dashboardPort) {
             console.log(`goldlapel → :${this._port} (proxy) | http://127.0.0.1:${this._dashboardPort} (dashboard)`);
         } else {
             console.log(`goldlapel → :${this._port} (proxy)`);
         }
-
-        return this._proxyUrl;
     }
 
-    stop() {
-        if (this._client) {
-            this._client.end().catch(() => {});
-            this._client = null;
+    async stop() {
+        if (this._stopped) return;
+        this._stopped = true;
+
+        const close = this._defaultClose;
+        this._defaultConn = null;
+        this._defaultClose = null;
+        if (close) {
+            try { await close(); } catch {}
         }
+
         const proc = this._process;
         this._process = null;
         this._proxyUrl = null;
@@ -331,11 +457,34 @@ export class GoldLapel {
         }
     }
 
-    get client() {
-        if (!this._client) {
-            throw new Error('Not connected. Call start() before accessing client.');
+    async [Symbol.asyncDispose]() {
+        return this.stop();
+    }
+
+    // ─── Connection resolution ─────────────────────────────────────────────
+
+    _resolveConn(override) {
+        // Priority: explicit `{ conn }` > scoped `using()` conn > default internal conn.
+        if (override !== undefined && override !== null) return override;
+        const scoped = _connScope.getStore();
+        if (scoped) return scoped;
+        if (!this._defaultConn) {
+            throw new Error(
+                'Not connected. Either call start() on this GoldLapel instance, ' +
+                'provide a conn via { conn } on this call, or use gl.using(conn, cb).'
+            );
         }
-        return this._client;
+        return this._defaultConn;
+    }
+
+    // Scoped connection override. The callback receives this instance; any
+    // wrapper method invoked from within the callback (including across awaits)
+    // will use the supplied `conn` unless it passes its own `{ conn }` override.
+    async using(conn, callback) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('gl.using(conn, callback): callback must be a function');
+        }
+        return _connScope.run(conn, () => callback(this));
     }
 
     get url() {
@@ -353,162 +502,189 @@ export class GoldLapel {
         return null;
     }
 
-    // ─── Instance methods (delegate to utils with this.client) ─────────
+    // ─── Wrapper methods ───────────────────────────────────────────────────
+    //
+    // Every method accepts an optional trailing `{ conn }` option that
+    // overrides the default connection for that call. If absent, the
+    // connection is resolved from the `using()` scope or the internal default.
 
     // Document store
-    async docCreateCollection(...args) { return docCreateCollection(this.client, ...args); }
-    async docInsert(...args) { return docInsert(this.client, ...args); }
-    async docInsertMany(...args) { return docInsertMany(this.client, ...args); }
-    async docFind(...args) { return docFind(this.client, ...args); }
-    async *docFindCursor(...args) { yield* docFindCursor(this.client, ...args); }
-    async docFindOne(...args) { return docFindOne(this.client, ...args); }
-    async docUpdate(...args) { return docUpdate(this.client, ...args); }
-    async docUpdateOne(...args) { return docUpdateOne(this.client, ...args); }
-    async docDelete(...args) { return docDelete(this.client, ...args); }
-    async docDeleteOne(...args) { return docDeleteOne(this.client, ...args); }
-    async docFindOneAndUpdate(...args) { return docFindOneAndUpdate(this.client, ...args); }
-    async docFindOneAndDelete(...args) { return docFindOneAndDelete(this.client, ...args); }
-    async docDistinct(...args) { return docDistinct(this.client, ...args); }
-    async docCount(...args) { return docCount(this.client, ...args); }
-    async docCreateIndex(...args) { return docCreateIndex(this.client, ...args); }
-    async docAggregate(...args) { return docAggregate(this.client, ...args); }
-    async docWatch(...args) { return docWatch(this.client, ...args); }
-    async docUnwatch(...args) { return docUnwatch(this.client, ...args); }
-    async docCreateTtlIndex(...args) { return docCreateTtlIndex(this.client, ...args); }
-    async docRemoveTtlIndex(...args) { return docRemoveTtlIndex(this.client, ...args); }
-    async docCreateCapped(...args) { return docCreateCapped(this.client, ...args); }
-    async docRemoveCap(...args) { return docRemoveCap(this.client, ...args); }
+    async docCreateCollection(...args) { return _call(this, docCreateCollection, args); }
+    async docInsert(...args) { return _call(this, docInsert, args); }
+    async docInsertMany(...args) { return _call(this, docInsertMany, args); }
+    async docFind(...args) { return _call(this, docFind, args); }
+    async *docFindCursor(...args) {
+        const { conn, rest } = _splitArgs(this, args);
+        yield* docFindCursor(conn, ...rest);
+    }
+    async docFindOne(...args) { return _call(this, docFindOne, args); }
+    async docUpdate(...args) { return _call(this, docUpdate, args); }
+    async docUpdateOne(...args) { return _call(this, docUpdateOne, args); }
+    async docDelete(...args) { return _call(this, docDelete, args); }
+    async docDeleteOne(...args) { return _call(this, docDeleteOne, args); }
+    async docFindOneAndUpdate(...args) { return _call(this, docFindOneAndUpdate, args); }
+    async docFindOneAndDelete(...args) { return _call(this, docFindOneAndDelete, args); }
+    async docDistinct(...args) { return _call(this, docDistinct, args); }
+    async docCount(...args) { return _call(this, docCount, args); }
+    async docCreateIndex(...args) { return _call(this, docCreateIndex, args); }
+    async docAggregate(...args) { return _call(this, docAggregate, args); }
+    async docWatch(...args) { return _call(this, docWatch, args); }
+    async docUnwatch(...args) { return _call(this, docUnwatch, args); }
+    async docCreateTtlIndex(...args) { return _call(this, docCreateTtlIndex, args); }
+    async docRemoveTtlIndex(...args) { return _call(this, docRemoveTtlIndex, args); }
+    async docCreateCapped(...args) { return _call(this, docCreateCapped, args); }
+    async docRemoveCap(...args) { return _call(this, docRemoveCap, args); }
 
     // Search
-    async search(...args) { return search(this.client, ...args); }
-    async searchFuzzy(...args) { return searchFuzzy(this.client, ...args); }
-    async searchPhonetic(...args) { return searchPhonetic(this.client, ...args); }
-    async similar(...args) { return similar(this.client, ...args); }
-    async suggest(...args) { return suggest(this.client, ...args); }
-    async facets(...args) { return facets(this.client, ...args); }
-    async aggregate(...args) { return aggregate(this.client, ...args); }
-    async createSearchConfig(...args) { return createSearchConfig(this.client, ...args); }
+    async search(...args) { return _call(this, search, args); }
+    async searchFuzzy(...args) { return _call(this, searchFuzzy, args); }
+    async searchPhonetic(...args) { return _call(this, searchPhonetic, args); }
+    async similar(...args) { return _call(this, similar, args); }
+    async suggest(...args) { return _call(this, suggest, args); }
+    async facets(...args) { return _call(this, facets, args); }
+    async aggregate(...args) { return _call(this, aggregate, args); }
+    async createSearchConfig(...args) { return _call(this, createSearchConfig, args); }
 
     // Percolation
-    async percolateAdd(...args) { return percolateAdd(this.client, ...args); }
-    async percolate(...args) { return percolate(this.client, ...args); }
-    async percolateDelete(...args) { return percolateDelete(this.client, ...args); }
+    async percolateAdd(...args) { return _call(this, percolateAdd, args); }
+    async percolate(...args) { return _call(this, percolate, args); }
+    async percolateDelete(...args) { return _call(this, percolateDelete, args); }
 
     // Analysis
-    async analyze(...args) { return analyze(this.client, ...args); }
-    async explainScore(...args) { return explainScore(this.client, ...args); }
+    async analyze(...args) { return _call(this, analyze, args); }
+    async explainScore(...args) { return _call(this, explainScore, args); }
 
     // Pub/Sub & Queues
-    async publish(...args) { return publish(this.client, ...args); }
-    async subscribe(...args) { return subscribe(this.client, ...args); }
-    async enqueue(...args) { return enqueue(this.client, ...args); }
-    async dequeue(...args) { return dequeue(this.client, ...args); }
+    async publish(...args) { return _call(this, publish, args); }
+    async subscribe(...args) { return _call(this, subscribe, args); }
+    async enqueue(...args) { return _call(this, enqueue, args); }
+    async dequeue(...args) { return _call(this, dequeue, args); }
 
     // Counters
-    async incr(...args) { return incr(this.client, ...args); }
-    async getCounter(...args) { return getCounter(this.client, ...args); }
+    async incr(...args) { return _call(this, incr, args); }
+    async getCounter(...args) { return _call(this, getCounter, args); }
 
     // Hash maps
-    async hset(...args) { return hset(this.client, ...args); }
-    async hget(...args) { return hget(this.client, ...args); }
-    async hgetall(...args) { return hgetall(this.client, ...args); }
-    async hdel(...args) { return hdel(this.client, ...args); }
+    async hset(...args) { return _call(this, hset, args); }
+    async hget(...args) { return _call(this, hget, args); }
+    async hgetall(...args) { return _call(this, hgetall, args); }
+    async hdel(...args) { return _call(this, hdel, args); }
 
     // Sorted sets
-    async zadd(...args) { return zadd(this.client, ...args); }
-    async zincrby(...args) { return zincrby(this.client, ...args); }
-    async zrange(...args) { return zrange(this.client, ...args); }
-    async zrank(...args) { return zrank(this.client, ...args); }
-    async zscore(...args) { return zscore(this.client, ...args); }
-    async zrem(...args) { return zrem(this.client, ...args); }
+    async zadd(...args) { return _call(this, zadd, args); }
+    async zincrby(...args) { return _call(this, zincrby, args); }
+    async zrange(...args) { return _call(this, zrange, args); }
+    async zrank(...args) { return _call(this, zrank, args); }
+    async zscore(...args) { return _call(this, zscore, args); }
+    async zrem(...args) { return _call(this, zrem, args); }
 
     // Geo
-    async geoadd(...args) { return geoadd(this.client, ...args); }
-    async georadius(...args) { return georadius(this.client, ...args); }
-    async geodist(...args) { return geodist(this.client, ...args); }
+    async geoadd(...args) { return _call(this, geoadd, args); }
+    async georadius(...args) { return _call(this, georadius, args); }
+    async geodist(...args) { return _call(this, geodist, args); }
 
     // Misc
-    async countDistinct(...args) { return countDistinct(this.client, ...args); }
-    async script(...args) { return script(this.client, ...args); }
+    async countDistinct(...args) { return _call(this, countDistinct, args); }
+    async script(...args) { return _call(this, script, args); }
 
     // Streams
-    async streamAdd(...args) { return streamAdd(this.client, ...args); }
-    async streamCreateGroup(...args) { return streamCreateGroup(this.client, ...args); }
-    async streamRead(...args) { return streamRead(this.client, ...args); }
-    async streamAck(...args) { return streamAck(this.client, ...args); }
-    async streamClaim(...args) { return streamClaim(this.client, ...args); }
+    async streamAdd(...args) { return _call(this, streamAdd, args); }
+    async streamCreateGroup(...args) { return _call(this, streamCreateGroup, args); }
+    async streamRead(...args) { return _call(this, streamRead, args); }
+    async streamAck(...args) { return _call(this, streamAck, args); }
+    async streamClaim(...args) { return _call(this, streamClaim, args); }
 }
 
-// Module-level singleton
-let _instance = null;
-let _cleanupRegistered = false;
-
-export async function start(upstream, opts) {
-    if (_instance && _instance.running) {
-        if (_instance._upstream !== upstream) {
-            throw new Error(
-                'Gold Lapel is already running for a different upstream. ' +
-                'Call goldlapel.stop() before starting with a new upstream.'
-            );
+// Splits out an optional trailing `{ conn }` from the args list.
+// The heuristic: if the last arg is a plain object with exactly the `conn`
+// property, treat it as the GL option bag. We use an explicit key check
+// (not instanceof) so it works across realms.
+function _splitArgs(gl, args) {
+    let override;
+    let rest = args;
+    if (args.length > 0) {
+        const last = args[args.length - 1];
+        if (
+            last !== null &&
+            typeof last === 'object' &&
+            !Array.isArray(last) &&
+            Object.prototype.hasOwnProperty.call(last, 'conn') &&
+            Object.keys(last).length === 1
+        ) {
+            override = last.conn;
+            rest = args.slice(0, -1);
         }
-        return _instance._wrappedClient || _instance.url;
     }
-    _instance = new GoldLapel(upstream, opts);
+    const conn = gl._resolveConn(override);
+    return { conn, rest };
+}
+
+function _call(gl, fn, args) {
+    const { conn, rest } = _splitArgs(gl, args);
+    return fn(conn, ...rest);
+}
+
+// ─── Factory ───────────────────────────────────────────────────────────────
+
+let _cleanupRegistered = false;
+const _liveInstances = new Set();
+
+function _cleanup() {
+    for (const inst of _liveInstances) {
+        try { inst.stop(); } catch {}
+    }
+    _liveInstances.clear();
+}
+
+/**
+ * Start a Gold Lapel proxy and return an instance for use with wrapper methods.
+ *
+ * ```js
+ * import * as goldlapel from 'goldlapel';
+ * const gl = await goldlapel.start('postgresql://user:pass@db/mydb');
+ * const rows = await gl.search('articles', 'body', 'postgres tuning');
+ * await gl.stop();
+ * ```
+ *
+ * @param {string} upstream  Postgres connection string (upstream database).
+ * @param {object} [opts]
+ * @param {number} [opts.port=7932]  Proxy listen port.
+ * @param {number} [opts.dashboardPort=7933]  Dashboard port. 0 disables.
+ * @param {'trace'|'debug'|'info'|'warn'|'error'} [opts.logLevel]  Binary log level.
+ * @param {object} [opts.config]  camelCase → CLI flags (see configKeys()).
+ * @param {string[]} [opts.extraArgs]  Raw CLI flags passed to the binary.
+ * @param {boolean} [opts.noConnect]  Skip opening the internal driver connection.
+ * @returns {Promise<GoldLapel>}
+ */
+export async function start(upstream, opts = {}) {
+    const gl = new GoldLapel(upstream, opts);
+    _liveInstances.add(gl);
     if (!_cleanupRegistered) {
         process.on('exit', _cleanup);
         _cleanupRegistered = true;
     }
-    const url = await _instance.start();
 
-    // Auto-detect pg and return wrapped client with L1 cache
-    let pg;
     try {
-        pg = await import('pg');
-    } catch {
-        throw new Error(
-            'No supported database driver found. ' +
-            'Install one (e.g. npm install pg) ' +
-            'or use proxyUrl() if you only need the connection string.'
-        );
+        await gl._spawn();
+        await gl._openDefaultConn();
+        await gl._printBanner();
+    } catch (err) {
+        _liveInstances.delete(gl);
+        try { await gl.stop(); } catch {}
+        throw err;
     }
-    const Client = pg.default?.Client ?? pg.Client;
-    const { wrap } = await import('./wrap.js');
-    const client = new Client({ connectionString: url });
-    await client.connect();
-    const invPort = opts?.config?.invalidationPort ?? (_instance._port + 2);
-    const wrapped = wrap(client, invPort);
-    _instance._wrappedClient = wrapped;
-    return wrapped;
+
+    // Ensure the instance is removed from the live set after stop()
+    const origStop = gl.stop.bind(gl);
+    gl.stop = async () => {
+        _liveInstances.delete(gl);
+        return origStop();
+    };
+
+    return gl;
 }
 
-export function stop() {
-    if (_instance) {
-        if (_instance._wrappedClient && typeof _instance._wrappedClient.end === 'function') {
-            _instance._wrappedClient.end();
-        }
-        _instance.stop();
-        _instance = null;
-    }
-    NativeCache._reset();
-}
-
-export function proxyUrl() {
-    return _instance ? _instance.url : null;
-}
-
-export function dashboardUrl() {
-    return _instance ? _instance.dashboardUrl : null;
-}
-
-function _cleanup() {
-    if (_instance) {
-        if (_instance._wrappedClient && typeof _instance._wrappedClient.end === 'function') {
-            _instance._wrappedClient.end();
-        }
-        _instance.stop();
-        _instance = null;
-    }
-}
+// ─── Module-level exports ──────────────────────────────────────────────────
 
 export { wrap } from './wrap.js';
 export { NativeCache } from './cache.js';
@@ -536,4 +712,4 @@ export {
     docCreateCapped, docRemoveCap,
 } from './utils.js';
 
-export default { GoldLapel, start, stop, proxyUrl, dashboardUrl, configKeys, _configToArgs };
+export default { GoldLapel, start, configKeys, _configToArgs };
