@@ -208,9 +208,15 @@ describe('wrapper methods throw before conn is available', () => {
 describe('all wrapper methods exist', () => {
     const expectedMethods = [
         // Document store
-        'docInsert', 'docInsertMany', 'docFind', 'docFindOne',
+        'docCreateCollection',
+        'docInsert', 'docInsertMany', 'docFind', 'docFindCursor', 'docFindOne',
         'docUpdate', 'docUpdateOne', 'docDelete', 'docDeleteOne',
+        'docFindOneAndUpdate', 'docFindOneAndDelete',
+        'docDistinct',
         'docCount', 'docCreateIndex', 'docAggregate',
+        'docWatch', 'docUnwatch',
+        'docCreateTtlIndex', 'docRemoveTtlIndex',
+        'docCreateCapped', 'docRemoveCap',
         // Search
         'search', 'searchFuzzy', 'searchPhonetic', 'similar', 'suggest',
         'facets', 'aggregate', 'createSearchConfig',
@@ -242,8 +248,33 @@ describe('all wrapper methods exist', () => {
         });
     }
 
-    it('count matches expected total (50)', () => {
-        assert.strictEqual(expectedMethods.length, 50);
+    it('count matches expected total (61)', () => {
+        assert.strictEqual(expectedMethods.length, 61);
+    });
+
+    it('list matches actual public wrapper surface', () => {
+        // Enumerate public methods on the prototype (skip _private, stop, using,
+        // and getters like url/running/dashboardUrl). This guards against drift
+        // in either direction — new public method added without test coverage,
+        // or method removed without updating the list.
+        const proto = Object.getPrototypeOf(gl);
+        const actual = new Set();
+        for (const name of Object.getOwnPropertyNames(proto)) {
+            if (name === 'constructor') continue;
+            if (name === 'stop' || name === 'using') continue;
+            if (name.startsWith('_')) continue;
+            const desc = Object.getOwnPropertyDescriptor(proto, name);
+            if (desc.get || desc.set) continue;
+            if (typeof desc.value === 'function') actual.add(name);
+        }
+        const expected = new Set(expectedMethods);
+        const missing = [...actual].filter((n) => !expected.has(n));
+        const extra = [...expected].filter((n) => !actual.has(n));
+        assert.deepStrictEqual(
+            { missing, extra },
+            { missing: [], extra: [] },
+            `expectedMethods drift: missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}`
+        );
     });
 
     it('has using()', () => {
