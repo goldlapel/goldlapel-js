@@ -10,7 +10,7 @@
   ],
   "peerDependencies": {
     "drizzle-orm": ">=0.31.0",
-    "goldlapel": ">=0.2.0"
+    "goldlapel": "^0.2.0"
   },
   "scripts": {
     "test": "node --test test/test.js"
