@@ -66,7 +66,7 @@ await gl.docInsert('events', { type: 'x' }, { conn: client });
 
 ## Auto-cleanup with `await using`
 
-On Node 22+, use the TC39 explicit resource management proposal to auto-stop the proxy at scope end:
+On Node 24+, use the TC39 explicit resource management proposal to auto-stop the proxy at scope end (explicit resource management is stable there):
 
 ```js
 {
@@ -75,7 +75,16 @@ On Node 22+, use the TC39 explicit resource management proposal to auto-stop the
 } // proxy auto-stops here
 ```
 
-On older Node, call `await gl.stop()` explicitly.
+On Node 22, the same syntax works behind the `--harmony-explicit-resource-management` flag. On earlier Node, fall back to the manual form:
+
+```js
+const gl = await goldlapel.start('postgresql://...');
+try {
+  const hits = await gl.search('articles', 'body', 'hello');
+} finally {
+  await gl.stop();
+}
+```
 
 ## Driver auto-detection
 
