@@ -279,18 +279,22 @@ export function _waitForPort(host, port, timeout) {
 // cheap and avoid loading native addons for users who only want wrapper
 // methods with their own conn.
 
-const DRIVER_CANDIDATES = ['pg', 'postgres', '@vercel/postgres'];
+export const _DRIVER_CANDIDATES = ['pg', 'postgres', '@vercel/postgres'];
 
-export function _detectDriver() {
+// `resolve` defaults to the module-scoped `require.resolve`; tests pass a fake
+// resolver to simulate various driver-installed subsets without touching the
+// real filesystem. The fake must throw like the real `require.resolve` does
+// for missing packages.
+export function _detectDriver(resolve = require.resolve) {
     // Allow override via env var for tests
     if (process.env.GOLDLAPEL_DRIVER === 'none') return null;
     if (process.env.GOLDLAPEL_DRIVER) {
         return process.env.GOLDLAPEL_DRIVER;
     }
 
-    for (const name of DRIVER_CANDIDATES) {
+    for (const name of _DRIVER_CANDIDATES) {
         try {
-            require.resolve(name);
+            resolve(name);
             return name;
         } catch {}
     }
@@ -300,11 +304,19 @@ export function _detectDriver() {
 let _driverName = _detectDriver();
 
 export function _driverNotFoundError() {
+    // Gold Lapel ships with no bundled driver — users pick one via npm's
+    // peerDependencies + peerDependenciesMeta optional pattern. If start()
+    // is called with zero drivers installed, name all three options with
+    // exact install commands so the fix is copy-pasteable.
     return new Error(
-        'No supported Postgres driver found. Install one of: ' +
-        DRIVER_CANDIDATES.join(', ') +
-        ". For example: `npm install pg`. If you only need the proxy URL " +
-        'without an internal connection, pass `{ noConnect: true }` to start().'
+        'No supported Postgres driver found. Gold Lapel needs one of ' +
+        "'pg', 'postgres' (postgres.js), or '@vercel/postgres' installed " +
+        'alongside it. Install one:\n' +
+        '  npm install pg                 # node-postgres (recommended)\n' +
+        '  npm install postgres           # postgres.js\n' +
+        '  npm install @vercel/postgres   # Vercel Postgres / Neon\n' +
+        'If you only need the proxy URL without an internal connection, ' +
+        'pass `{ noConnect: true }` to start().'
     );
 }
 

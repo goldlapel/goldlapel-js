@@ -10,6 +10,16 @@ Gold Lapel sits between your app and Postgres, watches query patterns, and autom
 npm install goldlapel
 ```
 
+Gold Lapel doesn't bundle a Postgres driver — pick the one you already use (or would prefer) and install it alongside. Any one of the three is sufficient:
+
+```bash
+npm install pg                 # node-postgres (recommended; only driver with full pub/sub support)
+npm install postgres           # postgres.js
+npm install @vercel/postgres   # Vercel Postgres / Neon
+```
+
+If you don't need an internal driver connection — for example, you're only using Gold Lapel to provide a proxy URL to Prisma or Drizzle — you can skip this step entirely and pass `noConnect: true` to `start()`.
+
 ## Quick Start
 
 ```js

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { GoldLapel, start, _driverNotFoundError, _logLevelToVerboseFlag, _makePostgresJsAdapter } from '../index.js';
+import { GoldLapel, start, _driverNotFoundError, _detectDriver, _connectWithDriver, _logLevelToVerboseFlag, _makePostgresJsAdapter, _DRIVER_CANDIDATES } from '../index.js';
 import * as goldlapel from '../index.js';
 import goldlapelDefault from '../index.js';
 
@@ -212,6 +212,82 @@ describe('driver detection', () => {
         assert.match(err.message, /vercel/);
         assert.match(err.message, /noConnect/);
     });
+
+    // Builds a fake `require.resolve` that only resolves names in `installed`
+    // and throws for anything else — mirroring real require.resolve behavior
+    // for a project that has only those packages in its node_modules.
+    function fakeResolver(installed) {
+        const set = new Set(installed);
+        return (name) => {
+            if (set.has(name)) return `/fake/node_modules/${name}/index.js`;
+            const err = new Error(`Cannot find module '${name}'`);
+            err.code = 'MODULE_NOT_FOUND';
+            throw err;
+        };
+    }
+
+    // Env-var override on _detectDriver would short-circuit the resolver path
+    // under test; stash and clear it for the priority suite.
+    function withCleanDriverEnv(fn) {
+        return async () => {
+            const orig = process.env.GOLDLAPEL_DRIVER;
+            delete process.env.GOLDLAPEL_DRIVER;
+            try {
+                await fn();
+            } finally {
+                if (orig !== undefined) process.env.GOLDLAPEL_DRIVER = orig;
+            }
+        };
+    }
+
+    it('priority: pg wins when all three drivers are installed', withCleanDriverEnv(() => {
+        const resolve = fakeResolver(['pg', 'postgres', '@vercel/postgres']);
+        assert.strictEqual(_detectDriver(resolve), 'pg');
+    }));
+
+    it('priority: postgres (postgres.js) wins when pg is missing', withCleanDriverEnv(() => {
+        const resolve = fakeResolver(['postgres', '@vercel/postgres']);
+        assert.strictEqual(_detectDriver(resolve), 'postgres');
+    }));
+
+    it('priority: @vercel/postgres is the last-resort when only it is installed', withCleanDriverEnv(() => {
+        const resolve = fakeResolver(['@vercel/postgres']);
+        assert.strictEqual(_detectDriver(resolve), '@vercel/postgres');
+    }));
+
+    // Documented behavior: _detectDriver picks ONE driver up front based on
+    // `require.resolve` success; _connectWithDriver only ever sees that single
+    // choice. If that driver's connect() throws, the error propagates upward
+    // — there is no automatic fall-through to the next candidate. This test
+    // pins that contract (no-fallthrough) so any future "try each driver
+    // until one connects" refactor has to explicitly update the test (and
+    // docs) rather than silently changing user-visible behavior. We prove it
+    // by invoking _connectWithDriver with a name that isn't one of the three
+    // supported drivers — the function throws `Unsupported driver` rather
+    // than attempting the next candidate.
+    it('connect dispatch throws upward — no automatic fall-through to other drivers', async () => {
+        await assert.rejects(
+            () => _connectWithDriver('not-a-real-driver', 'postgresql://u:p@localhost/db'),
+            /Unsupported driver: not-a-real-driver/,
+        );
+    });
+
+    it('no drivers installed → _detectDriver returns null and _driverNotFoundError names all three alternatives', withCleanDriverEnv(() => {
+        const resolve = fakeResolver([]);
+        assert.strictEqual(_detectDriver(resolve), null);
+
+        const err = _driverNotFoundError();
+        // Must explicitly name each of the three supported drivers so the
+        // user can copy-paste the install command that matches their stack.
+        assert.match(err.message, /\bpg\b/);
+        assert.match(err.message, /\bpostgres\b/);
+        assert.match(err.message, /@vercel\/postgres/);
+        // And at least one install hint per the README.
+        assert.match(err.message, /npm install/);
+
+        // Sanity-check _DRIVER_CANDIDATES hasn't drifted from the error text.
+        assert.deepStrictEqual(_DRIVER_CANDIDATES, ['pg', 'postgres', '@vercel/postgres']);
+    }));
 });
 
 // ─── noConnect option ──────────────────────────────────────────────────────
