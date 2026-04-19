@@ -1,4 +1,4 @@
-import { start, stop, proxyUrl, GoldLapel, NativeCache } from '@goldlapel/goldlapel'
+import { start, GoldLapel, NativeCache } from 'goldlapel'
 
 const DEFAULT_PORT = 7932
 const READ_OPS = new Set([
@@ -100,15 +100,29 @@ export function cacheExtension(options = {}) {
     }
 }
 
+// Resolve the proxy URL from whatever `start()` returned. start() in v0.2
+// returns a GoldLapel instance; older/mocked versions may return a string.
+function _resolveProxyUrl(result) {
+    if (typeof result === 'string') return result
+    if (result && typeof result === 'object' && typeof result.url === 'string') {
+        return result.url
+    }
+    return null
+}
+
 export async function withGoldLapel(options = {}) {
     const url = options.url || process.env.DATABASE_URL
     if (!url) throw new Error('Gold Lapel: DATABASE_URL not set. Pass { url } or set DATABASE_URL.')
     if (!process.env.GOLDLAPEL_CLIENT) process.env.GOLDLAPEL_CLIENT = 'prisma'
     const startFn = options._start || start
-    const result = await startFn(url, { config: options.config, port: options.port, extraArgs: options.extraArgs })
-
-    // start() may return a wrapped client or a URL string
-    const proxyUrlStr = typeof result === 'string' ? result : proxyUrl()
+    const result = await startFn(url, {
+        config: options.config,
+        port: options.port,
+        extraArgs: options.extraArgs,
+        // Prisma has its own driver; we don't need the wrapper's internal conn.
+        noConnect: true,
+    })
+    const proxyUrlStr = _resolveProxyUrl(result)
     process.env.DATABASE_URL = proxyUrlStr
 
     const proxyPort = options.port ?? DEFAULT_PORT
@@ -144,17 +158,24 @@ export async function init(options = {}) {
     if (!url) throw new Error('Gold Lapel: DATABASE_URL not set. Pass { url } or set DATABASE_URL.')
     if (!process.env.GOLDLAPEL_CLIENT) process.env.GOLDLAPEL_CLIENT = 'prisma'
     const startFn = options._start || start
-    const result = await startFn(url, { config: options.config, port: options.port, extraArgs: options.extraArgs })
-    const proxyUrlStr = typeof result === 'string' ? result : proxyUrl()
+    const result = await startFn(url, {
+        config: options.config,
+        port: options.port,
+        extraArgs: options.extraArgs,
+        noConnect: true,
+    })
+    const proxyUrlStr = _resolveProxyUrl(result)
     process.env.DATABASE_URL = proxyUrlStr
     return proxyUrlStr
 }
 
 export {
-    start, stop, proxyUrl, GoldLapel, NativeCache,
+    start, GoldLapel, NativeCache,
+} from 'goldlapel'
+export {
     docInsert, docInsertMany, docFind, docFindOne,
     docUpdate, docUpdateOne, docDelete, docDeleteOne,
     docCount, docCreateIndex, docAggregate,
     docWatch, docUnwatch, docCreateTtlIndex, docRemoveTtlIndex,
     docCreateCapped, docRemoveCap,
-} from '@goldlapel/goldlapel'
+} from 'goldlapel'

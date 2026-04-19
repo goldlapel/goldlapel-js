@@ -10,7 +10,7 @@
   ],
   "peerDependencies": {
     "@prisma/client": "^5.22.0",
-    "@goldlapel/goldlapel": ">=0.1.0"
+    "goldlapel": ">=0.2.0"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -33,7 +33,7 @@
     "directory": "packages/prisma"
   },
   "devDependencies": {
-    "@goldlapel/goldlapel": "*"
+    "goldlapel": "file:../.."
   },
   "dependencies": {
     "prisma": "^5.22.0"
