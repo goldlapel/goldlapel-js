@@ -14,6 +14,31 @@ import {
     percolateDelete,
     analyze,
     explainScore,
+    publish,
+    subscribe,
+    enqueue,
+    dequeue,
+    incr,
+    getCounter,
+    zadd,
+    zincrby,
+    zrange,
+    zrank,
+    zscore,
+    zrem,
+    hset,
+    hget,
+    hgetall,
+    hdel,
+    countDistinct,
+    geoadd,
+    georadius,
+    geodist,
+    streamAdd,
+    streamCreateGroup,
+    streamRead,
+    streamAck,
+    streamClaim,
 } from '../utils.js';
 
 function mockClient(queryResult) {
@@ -672,5 +697,117 @@ describe('explainScore', () => {
         const sql = client._calls[0].text;
         assert.ok(sql.includes('to_tsvector($1, title)'));
         assert.ok(sql.includes('title AS document_text'));
+    });
+});
+
+// ─── Redis-compat helpers: identifier validation (SQL-injection regression) ──
+
+describe('Redis-compat helpers reject SQL injection in identifier args', () => {
+    const bad = 'foo; DROP TABLE users--';
+
+    it('publish rejects malicious channel', async () => {
+        await assert.rejects(() => publish(mockClient(), bad, 'x'), /Invalid identifier/);
+    });
+    it('subscribe rejects malicious channel', async () => {
+        await assert.rejects(() => subscribe(mockClient(), bad, () => {}), /Invalid identifier/);
+    });
+    it('enqueue rejects malicious queueTable', async () => {
+        await assert.rejects(() => enqueue(mockClient(), bad, {}), /Invalid identifier/);
+    });
+    it('dequeue rejects malicious queueTable', async () => {
+        await assert.rejects(() => dequeue(mockClient(), bad), /Invalid identifier/);
+    });
+    it('incr rejects malicious table', async () => {
+        await assert.rejects(() => incr(mockClient(), bad, 'k'), /Invalid identifier/);
+    });
+    it('getCounter rejects malicious table', async () => {
+        await assert.rejects(() => getCounter(mockClient(), bad, 'k'), /Invalid identifier/);
+    });
+    it('zadd rejects malicious table', async () => {
+        await assert.rejects(() => zadd(mockClient(), bad, 'm', 1), /Invalid identifier/);
+    });
+    it('zincrby rejects malicious table', async () => {
+        await assert.rejects(() => zincrby(mockClient(), bad, 'm', 1), /Invalid identifier/);
+    });
+    it('zrange rejects malicious table', async () => {
+        await assert.rejects(() => zrange(mockClient(), bad), /Invalid identifier/);
+    });
+    it('zrank rejects malicious table', async () => {
+        await assert.rejects(() => zrank(mockClient(), bad, 'm'), /Invalid identifier/);
+    });
+    it('zscore rejects malicious table', async () => {
+        await assert.rejects(() => zscore(mockClient(), bad, 'm'), /Invalid identifier/);
+    });
+    it('zrem rejects malicious table', async () => {
+        await assert.rejects(() => zrem(mockClient(), bad, 'm'), /Invalid identifier/);
+    });
+    it('hset rejects malicious table', async () => {
+        await assert.rejects(() => hset(mockClient(), bad, 'k', 'f', 'v'), /Invalid identifier/);
+    });
+    it('hget rejects malicious table', async () => {
+        await assert.rejects(() => hget(mockClient(), bad, 'k', 'f'), /Invalid identifier/);
+    });
+    it('hgetall rejects malicious table', async () => {
+        await assert.rejects(() => hgetall(mockClient(), bad, 'k'), /Invalid identifier/);
+    });
+    it('hdel rejects malicious table', async () => {
+        await assert.rejects(() => hdel(mockClient(), bad, 'k', 'f'), /Invalid identifier/);
+    });
+    it('countDistinct rejects malicious table', async () => {
+        await assert.rejects(() => countDistinct(mockClient(), bad, 'col'), /Invalid identifier/);
+    });
+    it('countDistinct rejects malicious column', async () => {
+        await assert.rejects(() => countDistinct(mockClient(), 'tbl', bad), /Invalid identifier/);
+    });
+    it('geoadd rejects malicious table', async () => {
+        await assert.rejects(
+            () => geoadd(mockClient(), bad, 'name', 'geom', 'x', 0, 0),
+            /Invalid identifier/
+        );
+    });
+    it('geoadd rejects malicious nameColumn', async () => {
+        await assert.rejects(
+            () => geoadd(mockClient(), 'tbl', bad, 'geom', 'x', 0, 0),
+            /Invalid identifier/
+        );
+    });
+    it('geoadd rejects malicious geomColumn', async () => {
+        await assert.rejects(
+            () => geoadd(mockClient(), 'tbl', 'name', bad, 'x', 0, 0),
+            /Invalid identifier/
+        );
+    });
+    it('georadius rejects malicious table', async () => {
+        await assert.rejects(
+            () => georadius(mockClient(), bad, 'geom', 0, 0, 100),
+            /Invalid identifier/
+        );
+    });
+    it('georadius rejects malicious geomColumn', async () => {
+        await assert.rejects(
+            () => georadius(mockClient(), 'tbl', bad, 0, 0, 100),
+            /Invalid identifier/
+        );
+    });
+    it('geodist rejects malicious table', async () => {
+        await assert.rejects(
+            () => geodist(mockClient(), bad, 'geom', 'name', 'a', 'b'),
+            /Invalid identifier/
+        );
+    });
+    it('streamAdd rejects malicious stream', async () => {
+        await assert.rejects(() => streamAdd(mockClient(), bad, {}), /Invalid identifier/);
+    });
+    it('streamCreateGroup rejects malicious stream', async () => {
+        await assert.rejects(() => streamCreateGroup(mockClient(), bad, 'g'), /Invalid identifier/);
+    });
+    it('streamRead rejects malicious stream', async () => {
+        await assert.rejects(() => streamRead(mockClient(), bad, 'g', 'c'), /Invalid identifier/);
+    });
+    it('streamAck rejects malicious stream', async () => {
+        await assert.rejects(() => streamAck(mockClient(), bad, 'g', 1), /Invalid identifier/);
+    });
+    it('streamClaim rejects malicious stream', async () => {
+        await assert.rejects(() => streamClaim(mockClient(), bad, 'g', 'c'), /Invalid identifier/);
     });
 });

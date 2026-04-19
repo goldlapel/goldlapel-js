@@ -71,10 +71,12 @@ export async function suggest(client, table, column, prefix, { limit = 10 } = {}
 }
 
 export async function publish(client, channel, message) {
+    validateIdentifier(channel);
     await client.query('SELECT pg_notify($1, $2)', [channel, String(message)]);
 }
 
 export async function subscribe(client, channel, callback) {
+    validateIdentifier(channel);
     await client.query(`LISTEN ${channel}`);
     client.on('notification', (msg) => {
         if (msg.channel === channel) {
@@ -84,6 +86,7 @@ export async function subscribe(client, channel, callback) {
 }
 
 export async function enqueue(client, queueTable, payload) {
+    validateIdentifier(queueTable);
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${queueTable} (
             id BIGSERIAL PRIMARY KEY,
@@ -98,6 +101,7 @@ export async function enqueue(client, queueTable, payload) {
 }
 
 export async function dequeue(client, queueTable) {
+    validateIdentifier(queueTable);
     const result = await client.query(`
         DELETE FROM ${queueTable}
         WHERE id = (
@@ -114,6 +118,7 @@ export async function dequeue(client, queueTable) {
 }
 
 export async function incr(client, table, key, amount = 1) {
+    validateIdentifier(table);
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${table} (
             key TEXT PRIMARY KEY,
@@ -129,6 +134,7 @@ export async function incr(client, table, key, amount = 1) {
 }
 
 export async function getCounter(client, table, key) {
+    validateIdentifier(table);
     const result = await client.query(
         `SELECT value FROM ${table} WHERE key = $1`, [key]
     );
@@ -137,6 +143,7 @@ export async function getCounter(client, table, key) {
 }
 
 export async function zadd(client, table, member, score) {
+    validateIdentifier(table);
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${table} (
             member TEXT PRIMARY KEY,
@@ -150,6 +157,7 @@ export async function zadd(client, table, member, score) {
 }
 
 export async function zincrby(client, table, member, amount = 1) {
+    validateIdentifier(table);
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${table} (
             member TEXT PRIMARY KEY,
@@ -165,6 +173,7 @@ export async function zincrby(client, table, member, amount = 1) {
 }
 
 export async function zrange(client, table, start = 0, stop = 10, desc = true) {
+    validateIdentifier(table);
     const order = desc ? 'DESC' : 'ASC';
     const limit = stop - start;
     const result = await client.query(`
@@ -176,6 +185,7 @@ export async function zrange(client, table, start = 0, stop = 10, desc = true) {
 }
 
 export async function zrank(client, table, member, desc = true) {
+    validateIdentifier(table);
     const order = desc ? 'DESC' : 'ASC';
     const result = await client.query(`
         SELECT rank FROM (
@@ -189,6 +199,7 @@ export async function zrank(client, table, member, desc = true) {
 }
 
 export async function zscore(client, table, member) {
+    validateIdentifier(table);
     const result = await client.query(
         `SELECT score FROM ${table} WHERE member = $1`, [String(member)]
     );
@@ -197,6 +208,7 @@ export async function zscore(client, table, member) {
 }
 
 export async function zrem(client, table, member) {
+    validateIdentifier(table);
     const result = await client.query(
         `DELETE FROM ${table} WHERE member = $1`, [String(member)]
     );
@@ -204,6 +216,9 @@ export async function zrem(client, table, member) {
 }
 
 export async function geoadd(client, table, nameColumn, geomColumn, name, lon, lat) {
+    validateIdentifier(table);
+    validateIdentifier(nameColumn);
+    validateIdentifier(geomColumn);
     await client.query('CREATE EXTENSION IF NOT EXISTS postgis');
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${table} (
@@ -219,6 +234,8 @@ export async function geoadd(client, table, nameColumn, geomColumn, name, lon, l
 }
 
 export async function georadius(client, table, geomColumn, lon, lat, radiusMeters, limit = 50) {
+    validateIdentifier(table);
+    validateIdentifier(geomColumn);
     const result = await client.query(`
         SELECT *, ST_Distance(
             ${geomColumn}::geography,
@@ -237,6 +254,9 @@ export async function georadius(client, table, geomColumn, lon, lat, radiusMeter
 }
 
 export async function geodist(client, table, geomColumn, nameColumn, nameA, nameB) {
+    validateIdentifier(table);
+    validateIdentifier(geomColumn);
+    validateIdentifier(nameColumn);
     const result = await client.query(`
         SELECT ST_Distance(a.${geomColumn}::geography, b.${geomColumn}::geography)
         FROM ${table} a, ${table} b
@@ -247,6 +267,7 @@ export async function geodist(client, table, geomColumn, nameColumn, nameA, name
 }
 
 export async function hset(client, table, key, field, value) {
+    validateIdentifier(table);
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${table} (
             key TEXT PRIMARY KEY,
@@ -260,6 +281,7 @@ export async function hset(client, table, key, field, value) {
 }
 
 export async function hget(client, table, key, field) {
+    validateIdentifier(table);
     const result = await client.query(
         `SELECT data->>$1 AS val FROM ${table} WHERE key = $2`, [field, key]
     );
@@ -274,6 +296,7 @@ export async function hget(client, table, key, field) {
 }
 
 export async function hgetall(client, table, key) {
+    validateIdentifier(table);
     const result = await client.query(
         `SELECT data FROM ${table} WHERE key = $1`, [key]
     );
@@ -284,6 +307,8 @@ export async function hgetall(client, table, key) {
 }
 
 export async function countDistinct(client, table, column) {
+    validateIdentifier(table);
+    validateIdentifier(column);
     const result = await client.query(
         `SELECT COUNT(DISTINCT ${column}) AS cnt FROM ${table}`
     );
@@ -291,6 +316,7 @@ export async function countDistinct(client, table, column) {
 }
 
 export async function hdel(client, table, key, field) {
+    validateIdentifier(table);
     const result = await client.query(
         `SELECT data ? $1 AS existed FROM ${table} WHERE key = $2`, [field, key]
     );
@@ -302,6 +328,7 @@ export async function hdel(client, table, key, field) {
 }
 
 export async function streamAdd(client, stream, payload) {
+    validateIdentifier(stream);
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${stream} (
             id BIGSERIAL PRIMARY KEY,
@@ -317,6 +344,7 @@ export async function streamAdd(client, stream, payload) {
 }
 
 export async function streamCreateGroup(client, stream, group) {
+    validateIdentifier(stream);
     await client.query(`
         CREATE TABLE IF NOT EXISTS ${stream}_groups (
             group_name TEXT PRIMARY KEY,
@@ -340,6 +368,7 @@ export async function streamCreateGroup(client, stream, group) {
 }
 
 export async function streamRead(client, stream, group, consumer, count = 1) {
+    validateIdentifier(stream);
     const cursorResult = await client.query(
         `SELECT last_delivered_id FROM ${stream}_groups WHERE group_name = $1 FOR UPDATE`,
         [group]
@@ -373,6 +402,7 @@ export async function streamRead(client, stream, group, consumer, count = 1) {
 }
 
 export async function streamAck(client, stream, group, messageId) {
+    validateIdentifier(stream);
     const result = await client.query(
         `DELETE FROM ${stream}_pending WHERE group_name = $1 AND message_id = $2`,
         [group, messageId]
@@ -381,6 +411,7 @@ export async function streamAck(client, stream, group, messageId) {
 }
 
 export async function streamClaim(client, stream, group, consumer, minIdleMs = 60000) {
+    validateIdentifier(stream);
     const claimResult = await client.query(`
         UPDATE ${stream}_pending
         SET consumer = $1, claimed_at = NOW(), delivery_count = delivery_count + 1
