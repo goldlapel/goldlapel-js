@@ -305,6 +305,20 @@ describe('per-method { conn } override', () => {
         assert.deepEqual(def._calls[0].values, ['english', 'english', 'hello', 10]);
     });
 
+    it('{ conn } mixed with other options strips conn and keeps other options', async () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        const def = mockClient({ rows: [], rowCount: 0 });
+        const override = mockClient({ rows: [], rowCount: 0 });
+        gl._defaultConn = def;
+
+        await gl.search('articles', 'body', 'hello', { limit: 10, conn: override });
+
+        assert.strictEqual(def._calls.length, 0);
+        assert.strictEqual(override._calls.length, 1);
+        // limit still respected: values: [lang, lang, query, limit]
+        assert.deepEqual(override._calls[0].values, ['english', 'english', 'hello', 10]);
+    });
+
     it('docInsertMany uses override conn', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         const def = mockClient({ rows: [], rowCount: 0 });

@@ -333,6 +333,15 @@ export async function _connectWithDriver(driverName, url) {
 // ─── GoldLapel instance ────────────────────────────────────────────────────
 
 const _connScope = new AsyncLocalStorage();
+const _liveInstances = new Set();
+let _cleanupRegistered = false;
+
+function _cleanup() {
+    for (const inst of _liveInstances) {
+        try { inst.stop(); } catch {}
+    }
+    _liveInstances.clear();
+}
 
 export class GoldLapel {
     constructor(upstream, {
@@ -436,6 +445,8 @@ export class GoldLapel {
     async stop() {
         if (this._stopped) return;
         this._stopped = true;
+
+        _liveInstances.delete(this);
 
         const close = this._defaultClose;
         this._defaultConn = null;
@@ -595,10 +606,18 @@ export class GoldLapel {
     async streamClaim(...args) { return _call(this, streamClaim, args); }
 }
 
-// Splits out an optional trailing `{ conn }` from the args list.
-// The heuristic: if the last arg is a plain object with exactly the `conn`
-// property, treat it as the GL option bag. We use an explicit key check
-// (not instanceof) so it works across realms.
+// Splits out an optional `conn` from the trailing options arg.
+//
+// If the last argument is a plain object that contains a `conn` property, we
+// pull it out and pass the remaining keys through to the underlying method.
+// If `conn` is the only key, the entire options object is dropped so the
+// method's own default options kick in.
+//
+// This lets callers write any of:
+//   gl.docInsert('t', doc)                          // no override
+//   gl.docInsert('t', doc, { conn: client })        // pure override
+//   gl.search('t', 'c', 'q', { limit: 10 })         // normal options
+//   gl.search('t', 'c', 'q', { limit: 10, conn: c}) // options + override
 function _splitArgs(gl, args) {
     let override;
     let rest = args;
@@ -608,11 +627,17 @@ function _splitArgs(gl, args) {
             last !== null &&
             typeof last === 'object' &&
             !Array.isArray(last) &&
-            Object.prototype.hasOwnProperty.call(last, 'conn') &&
-            Object.keys(last).length === 1
+            Object.prototype.hasOwnProperty.call(last, 'conn')
         ) {
             override = last.conn;
-            rest = args.slice(0, -1);
+            const otherKeys = Object.keys(last).filter((k) => k !== 'conn');
+            if (otherKeys.length === 0) {
+                rest = args.slice(0, -1);
+            } else {
+                const trimmed = {};
+                for (const k of otherKeys) trimmed[k] = last[k];
+                rest = [...args.slice(0, -1), trimmed];
+            }
         }
     }
     const conn = gl._resolveConn(override);
@@ -625,16 +650,6 @@ function _call(gl, fn, args) {
 }
 
 // ─── Factory ───────────────────────────────────────────────────────────────
-
-let _cleanupRegistered = false;
-const _liveInstances = new Set();
-
-function _cleanup() {
-    for (const inst of _liveInstances) {
-        try { inst.stop(); } catch {}
-    }
-    _liveInstances.clear();
-}
 
 /**
  * Start a Gold Lapel proxy and return an instance for use with wrapper methods.
@@ -669,17 +684,9 @@ export async function start(upstream, opts = {}) {
         await gl._openDefaultConn();
         await gl._printBanner();
     } catch (err) {
-        _liveInstances.delete(gl);
         try { await gl.stop(); } catch {}
         throw err;
     }
-
-    // Ensure the instance is removed from the live set after stop()
-    const origStop = gl.stop.bind(gl);
-    gl.stop = async () => {
-        _liveInstances.delete(gl);
-        return origStop();
-    };
 
     return gl;
 }
