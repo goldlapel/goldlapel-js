@@ -1,6 +1,7 @@
 import { spawn, execFileSync } from 'child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { NativeCache } from './cache.js';
+import { wrap } from './wrap.js';
 import { createConnection } from 'net';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
@@ -781,4 +782,32 @@ export {
     docCreateCapped, docRemoveCap,
 } from './utils.js';
 
-export default { GoldLapel, start, configKeys, _configToArgs, _logLevelToVerboseFlag };
+// Default export mirrors the named surface so both styles work identically:
+//   import goldlapel from 'goldlapel';
+//   import * as goldlapel from 'goldlapel';
+// Every name available as a named export is also reachable via the default.
+export default {
+    GoldLapel, start, configKeys, _configToArgs, _logLevelToVerboseFlag,
+    wrap, NativeCache,
+    publish, subscribe, enqueue, dequeue,
+    incr, getCounter,
+    zadd, zincrby, zrange, zrank, zscore, zrem,
+    geoadd, georadius, geodist,
+    hset, hget, hgetall, hdel,
+    countDistinct,
+    script,
+    streamAdd, streamCreateGroup, streamRead, streamAck, streamClaim,
+    search, searchFuzzy, searchPhonetic, similar, suggest,
+    facets, aggregate, createSearchConfig,
+    percolateAdd, percolate, percolateDelete,
+    analyze, explainScore,
+    docCreateCollection,
+    docInsert, docInsertMany, docFind, docFindCursor, docFindOne,
+    docUpdate, docUpdateOne, docDelete, docDeleteOne,
+    docFindOneAndUpdate, docFindOneAndDelete,
+    docDistinct,
+    docCount, docCreateIndex, docAggregate,
+    docWatch, docUnwatch,
+    docCreateTtlIndex, docRemoveTtlIndex,
+    docCreateCapped, docRemoveCap,
+};

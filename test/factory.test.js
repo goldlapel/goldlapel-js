@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { GoldLapel, start, _driverNotFoundError, _logLevelToVerboseFlag, _makePostgresJsAdapter } from '../index.js';
+import * as goldlapel from '../index.js';
+import goldlapelDefault from '../index.js';
 
 function mockClient(queryResult) {
     const calls = [];
@@ -420,5 +422,40 @@ describe('_makePostgresJsAdapter', () => {
             assert.match(err.message, /pg/);
             assert.match(err.message, /\{ conn \}|gl\.using/);
         }
+    });
+});
+
+// ─── Default export mirrors the named export surface ───────────────────────
+
+describe('default export symmetry', () => {
+    it('default export exposes GoldLapel, start, and utilities', () => {
+        // Spot-check representative names from each category
+        assert.strictEqual(goldlapelDefault.GoldLapel, goldlapel.GoldLapel);
+        assert.strictEqual(goldlapelDefault.start, goldlapel.start);
+        assert.strictEqual(goldlapelDefault.configKeys, goldlapel.configKeys);
+        assert.strictEqual(goldlapelDefault.wrap, goldlapel.wrap);
+        assert.strictEqual(goldlapelDefault.NativeCache, goldlapel.NativeCache);
+        assert.strictEqual(goldlapelDefault.publish, goldlapel.publish);
+        assert.strictEqual(goldlapelDefault.subscribe, goldlapel.subscribe);
+        assert.strictEqual(goldlapelDefault.search, goldlapel.search);
+        assert.strictEqual(goldlapelDefault.docInsert, goldlapel.docInsert);
+        assert.strictEqual(goldlapelDefault.zadd, goldlapel.zadd);
+        assert.strictEqual(goldlapelDefault.streamAdd, goldlapel.streamAdd);
+    });
+
+    it('every named export is reachable via the default export', () => {
+        const missing = [];
+        for (const name of Object.keys(goldlapel)) {
+            if (name === 'default') continue;
+            // Private helpers prefixed with _ aren't part of the public surface
+            // — they're exported for tests/advanced users and don't need to be
+            // in the default export.
+            if (name.startsWith('_')) continue;
+            if (!(name in goldlapelDefault)) {
+                missing.push(name);
+            }
+        }
+        assert.deepStrictEqual(missing, [],
+            `named exports missing from default: ${JSON.stringify(missing)}`);
     });
 });
