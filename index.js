@@ -375,11 +375,16 @@ export class GoldLapel {
     } = {}) {
         this._upstream = upstream;
         this._port = port ?? DEFAULT_PORT;
+        // Dashboard defaults to proxy port + 1 (matches what the Rust binary
+        // binds when no --dashboard-port is passed). An explicit dashboardPort
+        // (top-level opt or via config) always wins. This ensures `port:
+        // 17932` reports the dashboard at :17933 rather than the hardcoded
+        // 7933.
         this._dashboardPort = dashboardPort !== undefined
             ? Number(dashboardPort)
             : (config && config.dashboardPort !== undefined
                 ? Number(config.dashboardPort)
-                : DEFAULT_DASHBOARD_PORT);
+                : this._port + 1);
         this._logLevel = logLevel;
         this._config = config || {};
         this._extraArgs = extraArgs || [];
@@ -695,7 +700,7 @@ function _call(gl, fn, args) {
  * @param {string} upstream  Postgres connection string (upstream database).
  * @param {object} [opts]
  * @param {number} [opts.port=7932]  Proxy listen port.
- * @param {number} [opts.dashboardPort=7933]  Dashboard port. 0 disables.
+ * @param {number} [opts.dashboardPort]  Dashboard port. Defaults to `port + 1` (7933 when `port` is the 7932 default). `0` disables.
  * @param {'trace'|'debug'|'info'|'warn'|'error'} [opts.logLevel]  Binary log level.
  * @param {object} [opts.config]  camelCase → CLI flags (see configKeys()).
  * @param {string[]} [opts.extraArgs]  Raw CLI flags passed to the binary.

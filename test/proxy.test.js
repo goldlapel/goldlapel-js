@@ -241,6 +241,21 @@ describe('dashboardUrl', () => {
         assert.strictEqual(gl._dashboardPort, 8080);
     });
 
+    it('derives from custom proxy port when dashboardPort not supplied', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            port: 17932,
+        });
+        assert.strictEqual(gl._dashboardPort, 17933);
+    });
+
+    it('explicit dashboardPort wins over proxy-port derivation', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            port: 17932,
+            dashboardPort: 9999,
+        });
+        assert.strictEqual(gl._dashboardPort, 9999);
+    });
+
     it('custom port from top-level opt', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
             dashboardPort: 8080,
