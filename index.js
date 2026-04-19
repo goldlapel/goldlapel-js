@@ -410,7 +410,7 @@ function _cleanup() {
 
 export class GoldLapel {
     constructor(upstream, {
-        port, dashboardPort, logLevel, config, extraArgs, noConnect,
+        port, dashboardPort, logLevel, config, extraArgs, noConnect, silent,
     } = {}) {
         this._upstream = upstream;
         this._port = port ?? DEFAULT_PORT;
@@ -428,6 +428,12 @@ export class GoldLapel {
         this._config = config || {};
         this._extraArgs = extraArgs || [];
         this._noConnect = !!noConnect;
+        // `silent` is a wrapper-only option (suppresses the startup banner).
+        // Deliberately a top-level option, NOT a key inside `config`, so it
+        // can never leak to the Rust binary as a `--silent` CLI flag — the
+        // argv builder only ever walks `this._config` through _configToArgs,
+        // which enforces VALID_CONFIG_KEYS.
+        this._silent = !!silent;
         this._process = null;
         this._proxyUrl = null;
         this._defaultConn = null;
@@ -510,11 +516,15 @@ export class GoldLapel {
     }
 
     async _printBanner() {
-        if (this._dashboardPort) {
-            console.log(`goldlapel → :${this._port} (proxy) | http://127.0.0.1:${this._dashboardPort} (dashboard)`);
-        } else {
-            console.log(`goldlapel → :${this._port} (proxy)`);
-        }
+        // Banner goes to stderr, never stdout. Library code writing to stdout
+        // corrupts programs that pipe gl output (e.g. a CLI tool piping the
+        // wrapper's own output). `silent: true` on start() suppresses the
+        // banner entirely.
+        if (this._silent) return;
+        const banner = this._dashboardPort
+            ? `goldlapel → :${this._port} (proxy) | http://127.0.0.1:${this._dashboardPort} (dashboard)`
+            : `goldlapel → :${this._port} (proxy)`;
+        console.error(banner);
     }
 
     async stop() {
@@ -744,6 +754,7 @@ function _call(gl, fn, args) {
  * @param {object} [opts.config]  camelCase → CLI flags (see configKeys()).
  * @param {string[]} [opts.extraArgs]  Raw CLI flags passed to the binary.
  * @param {boolean} [opts.noConnect]  Skip opening the internal driver connection.
+ * @param {boolean} [opts.silent]  Suppress the one-line startup banner (wrapper-only; never forwarded to the binary).
  * @returns {Promise<GoldLapel>}
  */
 export async function start(upstream, opts = {}) {

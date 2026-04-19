@@ -310,6 +310,117 @@ describe('noConnect option', () => {
     });
 });
 
+// ─── silent option / startup banner ────────────────────────────────────────
+//
+// Banner goes to stderr (never stdout) so it doesn't corrupt piped stdout
+// output from user programs. `silent: true` suppresses it entirely. `silent`
+// is a wrapper-only option — it must never be forwarded to the Rust binary
+// as a `--silent` CLI flag.
+
+describe('silent option', () => {
+    // Capture writes to process.stdout and process.stderr for the duration
+    // of `fn`, then restore. Returns { stdout, stderr } strings. We patch
+    // the streams rather than console.* because console.error ultimately
+    // calls process.stderr.write — intercepting at the stream layer catches
+    // both console.* and any direct stream.write usage.
+    async function captureStreams(fn) {
+        const origOut = process.stdout.write.bind(process.stdout);
+        const origErr = process.stderr.write.bind(process.stderr);
+        let stdout = '';
+        let stderr = '';
+        process.stdout.write = (chunk) => {
+            stdout += typeof chunk === 'string' ? chunk : chunk.toString();
+            return true;
+        };
+        process.stderr.write = (chunk) => {
+            stderr += typeof chunk === 'string' ? chunk : chunk.toString();
+            return true;
+        };
+        try {
+            await fn();
+        } finally {
+            process.stdout.write = origOut;
+            process.stderr.write = origErr;
+        }
+        return { stdout, stderr };
+    }
+
+    it('stored on the instance as a boolean', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { silent: true });
+        assert.strictEqual(gl._silent, true);
+    });
+
+    it('default is false', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.strictEqual(gl._silent, false);
+    });
+
+    it('coerces truthy/falsy values to booleans', () => {
+        const gl1 = new GoldLapel('postgresql://localhost:5432/mydb', { silent: 1 });
+        assert.strictEqual(gl1._silent, true);
+        const gl2 = new GoldLapel('postgresql://localhost:5432/mydb', { silent: 0 });
+        assert.strictEqual(gl2._silent, false);
+        const gl3 = new GoldLapel('postgresql://localhost:5432/mydb', { silent: undefined });
+        assert.strictEqual(gl3._silent, false);
+    });
+
+    it('_printBanner writes to stderr, not stdout', async () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        const { stdout, stderr } = await captureStreams(() => gl._printBanner());
+        assert.strictEqual(stdout, '', `banner must not leak to stdout: ${JSON.stringify(stdout)}`);
+        assert.match(stderr, /goldlapel → :7932 \(proxy\)/);
+    });
+
+    it('_printBanner includes dashboard URL when dashboardPort is set', async () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { port: 7932, dashboardPort: 7933 });
+        const { stdout, stderr } = await captureStreams(() => gl._printBanner());
+        assert.strictEqual(stdout, '');
+        assert.match(stderr, /:7932 \(proxy\)/);
+        assert.match(stderr, /http:\/\/127\.0\.0\.1:7933 \(dashboard\)/);
+    });
+
+    it('silent: true suppresses the banner on both streams', async () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { silent: true });
+        const { stdout, stderr } = await captureStreams(() => gl._printBanner());
+        assert.strictEqual(stdout, '', `silent must suppress stdout: ${stdout}`);
+        assert.strictEqual(stderr, '', `silent must suppress stderr: ${stderr}`);
+    });
+
+    it('silent: false still prints (same as default)', async () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { silent: false });
+        const { stdout, stderr } = await captureStreams(() => gl._printBanner());
+        assert.strictEqual(stdout, '');
+        assert.match(stderr, /goldlapel → /);
+    });
+
+    it('silent is not forwarded to the binary argv', () => {
+        // The CLI-args builder only walks `this._config` through _configToArgs,
+        // and `silent` is stored as its own field (`this._silent`), never in
+        // `this._config`. So no `--silent` flag can reach the Rust binary.
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { silent: true });
+        const args = gl._buildSpawnArgs();
+        assert.ok(!args.includes('--silent'),
+            `argv must not contain --silent: ${args.join(' ')}`);
+        assert.ok(!args.some(a => a === 'silent' || /--?silent/i.test(a)),
+            `argv must not contain any silent flag: ${args.join(' ')}`);
+    });
+
+    it('silent in config object is rejected by _configToArgs (wrapper-only key)', () => {
+        // Belt-and-suspenders: even if a user tried to pass silent via config
+        // (e.g. copy-pasted from Python docs), the config validator rejects
+        // it because it's not in VALID_CONFIG_KEYS — the Rust binary has no
+        // --silent flag, so forwarding it would be a silent no-op at best
+        // and a spawn error at worst.
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            config: { silent: true },
+        });
+        assert.throws(
+            () => gl._buildSpawnArgs(),
+            /Unknown config keys: silent/,
+        );
+    });
+});
+
 // ─── logLevel option ───────────────────────────────────────────────────────
 
 describe('logLevel option', () => {
