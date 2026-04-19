@@ -112,6 +112,39 @@ describe('gl.using(conn, callback)', () => {
         assert.strictEqual(outer._calls.length, 2);  // 'a' and 'c'
         assert.strictEqual(inner._calls.length, 1);  // 'b'
     });
+
+    it('using() scope is per-instance — does not leak across sibling GoldLapel instances', async () => {
+        // Regression: the AsyncLocalStorage backing gl.using() must be an
+        // instance field, not module-scoped. Otherwise a method invoked on gl2
+        // from inside gl1.using(connA, ...) would incorrectly pick up connA.
+        const gl1 = new GoldLapel('postgresql://localhost:5432/dbA');
+        const gl2 = new GoldLapel('postgresql://localhost:5432/dbB');
+
+        const connA = mockClient({ rows: [], rowCount: 0 });
+        const defB = mockClient({ rows: [], rowCount: 0 });
+        gl2._defaultConn = defB;
+
+        await gl1.using(connA, async (g1) => {
+            // Cross-instance call: gl2 should use its own default conn,
+            // not gl1's scoped connA.
+            await gl2.publish('events', 'from-gl2');
+            // gl1's own scoped call should still use connA.
+            await g1.publish('events', 'from-gl1');
+        });
+
+        assert.strictEqual(defB._calls.length, 1, 'gl2 used its own default conn');
+        assert.strictEqual(connA._calls.length, 1, 'gl1 used its scoped connA');
+        assert.strictEqual(
+            defB._calls[0].values[1],
+            'from-gl2',
+            'gl2 published the gl2 message on its default conn',
+        );
+        assert.strictEqual(
+            connA._calls[0].values[1],
+            'from-gl1',
+            'gl1 published the gl1 message on its scoped conn',
+        );
+    });
 });
 
 // ─── Symbol.asyncDispose ───────────────────────────────────────────────────

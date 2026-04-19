@@ -332,7 +332,6 @@ export async function _connectWithDriver(driverName, url) {
 
 // ─── GoldLapel instance ────────────────────────────────────────────────────
 
-const _connScope = new AsyncLocalStorage();
 const _liveInstances = new Set();
 let _cleanupRegistered = false;
 
@@ -363,6 +362,9 @@ export class GoldLapel {
         this._defaultConn = null;
         this._defaultClose = null;
         this._stopped = false;
+        // Per-instance scope for gl.using(). Module-scoped storage would leak
+        // the scoped conn across sibling GoldLapel instances in the same process.
+        this._connScope = new AsyncLocalStorage();
     }
 
     async _spawn() {
@@ -477,7 +479,7 @@ export class GoldLapel {
     _resolveConn(override) {
         // Priority: explicit `{ conn }` > scoped `using()` conn > default internal conn.
         if (override !== undefined && override !== null) return override;
-        const scoped = _connScope.getStore();
+        const scoped = this._connScope.getStore();
         if (scoped) return scoped;
         if (!this._defaultConn) {
             throw new Error(
@@ -495,7 +497,7 @@ export class GoldLapel {
         if (typeof callback !== 'function') {
             throw new TypeError('gl.using(conn, callback): callback must be a function');
         }
-        return _connScope.run(conn, () => callback(this));
+        return this._connScope.run(conn, () => callback(this));
     }
 
     get url() {
