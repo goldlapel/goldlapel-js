@@ -2,7 +2,7 @@
   "name": "@goldlapel/linux-arm64",
   "version": "0.1.0-rc16",
   "description": "Gold Lapel binary for Linux ARM64",
-  "files": ["goldlapel"],
+  "files": ["goldlapel", "THIRD-PARTY-NOTICES.md"],
   "os": ["linux"],
   "cpu": ["arm64"],
   "libc": ["glibc"],

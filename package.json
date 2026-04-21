@@ -11,7 +11,8 @@
     "wrap.js",
     "utils.js",
     "bin/",
-    "README.md"
+    "README.md",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "bin": {
     "goldlapel": "cli.js"
