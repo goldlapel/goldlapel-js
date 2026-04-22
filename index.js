@@ -36,7 +36,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 const DEFAULT_PORT = 7932;
-const DEFAULT_DASHBOARD_PORT = 7933;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
 

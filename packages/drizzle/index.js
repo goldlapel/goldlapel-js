@@ -5,7 +5,7 @@
 // or `drizzle-orm/postgres-js`. If you need postgres.js support, use the
 // goldlapel `init()` function to rewrite DATABASE_URL and create your own
 // drizzle instance with the proxy URL.
-import { start, GoldLapel, wrap, NativeCache } from 'goldlapel'
+import { start, wrap } from 'goldlapel'
 
 const DEFAULT_PORT = 7932
 

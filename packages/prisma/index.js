@@ -1,4 +1,4 @@
-import { start, GoldLapel, NativeCache } from 'goldlapel'
+import { start, NativeCache } from 'goldlapel'
 
 const DEFAULT_PORT = 7932
 const READ_OPS = new Set([
