@@ -355,23 +355,37 @@ export async function streamCreateGroup(client, stream, group, { patterns } = {}
 export async function streamRead(client, stream, group, consumer, count = 1, { patterns } = {}) {
     validateIdentifier(stream);
     const qp = _requirePatterns(patterns, 'streamRead');
-    const cursorResult = await client.query(qp.group_get_cursor, [group]);
-    if (cursorResult.rows.length === 0) return [];
-    const lastId = Number(cursorResult.rows[0].last_delivered_id);
-    const msgResult = await client.query(qp.read_since, [lastId, count]);
-    const messages = msgResult.rows.map(row => ({
-        id: Number(row.id),
-        payload: typeof row.payload === 'object' ? row.payload : JSON.parse(row.payload),
-        created_at: String(row.created_at),
-    }));
-    if (messages.length > 0) {
-        const newLast = messages[messages.length - 1].id;
-        await client.query(qp.group_advance_cursor, [newLast, group]);
-        for (const msg of messages) {
-            await client.query(qp.pending_insert, [msg.id, group, consumer]);
+    // Wrap in a transaction so the `FOR UPDATE` lock from `group_get_cursor`
+    // is held until we've inserted pending rows and advanced the cursor.
+    // Under autocommit, the lock is released as soon as the SELECT returns,
+    // letting concurrent consumers claim the same messages.
+    await client.query('BEGIN');
+    try {
+        const cursorResult = await client.query(qp.group_get_cursor, [group]);
+        if (cursorResult.rows.length === 0) {
+            await client.query('COMMIT');
+            return [];
         }
+        const lastId = Number(cursorResult.rows[0].last_delivered_id);
+        const msgResult = await client.query(qp.read_since, [lastId, count]);
+        const messages = msgResult.rows.map(row => ({
+            id: Number(row.id),
+            payload: typeof row.payload === 'object' ? row.payload : JSON.parse(row.payload),
+            created_at: String(row.created_at),
+        }));
+        if (messages.length > 0) {
+            const newLast = messages[messages.length - 1].id;
+            await client.query(qp.group_advance_cursor, [newLast, group]);
+            for (const msg of messages) {
+                await client.query(qp.pending_insert, [msg.id, group, consumer]);
+            }
+        }
+        await client.query('COMMIT');
+        return messages;
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch { /* swallow rollback errors; surface original */ }
+        throw err;
     }
-    return messages;
 }
 
 export async function streamAck(client, stream, group, messageId, { patterns } = {}) {

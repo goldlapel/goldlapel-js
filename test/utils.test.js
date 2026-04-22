@@ -811,3 +811,174 @@ describe('Redis-compat helpers reject SQL injection in identifier args', () => {
         await assert.rejects(() => streamClaim(mockClient(), bad, 'g', 'c'), /Invalid identifier/);
     });
 });
+
+// ─── streamRead transaction wrapping ─────────────────────────────────────────
+
+const STREAM_PATTERNS = {
+    query_patterns: {
+        group_get_cursor: 'SELECT last_delivered_id FROM g WHERE group_name = $1 FOR UPDATE',
+        read_since: 'SELECT id, payload, created_at FROM m WHERE id > $1 ORDER BY id LIMIT $2',
+        group_advance_cursor: 'UPDATE g SET last_delivered_id = $1 WHERE group_name = $2',
+        pending_insert: 'INSERT INTO p (message_id, group_name, consumer) VALUES ($1, $2, $3)',
+    },
+};
+
+describe('streamRead transaction wrapping', () => {
+    it('wraps the query sequence in BEGIN/COMMIT', async () => {
+        const client = {
+            _calls: [],
+            query: async (text, values) => {
+                client._calls.push({ text, values });
+                if (text.startsWith('SELECT last_delivered_id')) {
+                    return { rows: [{ last_delivered_id: 0 }], rowCount: 1 };
+                }
+                if (text.startsWith('SELECT id, payload')) {
+                    return { rows: [], rowCount: 0 };
+                }
+                return { rows: [], rowCount: 0, command: 'SELECT' };
+            },
+        };
+        await streamRead(client, 's', 'g', 'c', 10, { patterns: STREAM_PATTERNS });
+        const texts = client._calls.map(c => c.text);
+        assert.equal(texts[0], 'BEGIN');
+        assert.equal(texts[texts.length - 1], 'COMMIT');
+        assert.ok(texts.some(t => t.includes('FOR UPDATE')));
+    });
+
+    it('commits even when the group cursor row is missing', async () => {
+        const client = {
+            _calls: [],
+            query: async (text) => {
+                client._calls.push(text);
+                if (text.startsWith('SELECT last_delivered_id')) {
+                    return { rows: [], rowCount: 0 };
+                }
+                return { rows: [], rowCount: 0 };
+            },
+        };
+        const result = await streamRead(client, 's', 'g', 'c', 10, { patterns: STREAM_PATTERNS });
+        assert.deepEqual(result, []);
+        assert.equal(client._calls[0], 'BEGIN');
+        assert.equal(client._calls[client._calls.length - 1], 'COMMIT');
+    });
+
+    it('rolls back on error mid-transaction', async () => {
+        const client = {
+            _calls: [],
+            query: async (text) => {
+                client._calls.push(text);
+                if (text === 'BEGIN' || text === 'ROLLBACK' || text === 'COMMIT') {
+                    return { rows: [], rowCount: 0 };
+                }
+                throw new Error('boom');
+            },
+        };
+        await assert.rejects(
+            () => streamRead(client, 's', 'g', 'c', 10, { patterns: STREAM_PATTERNS }),
+            /boom/,
+        );
+        assert.equal(client._calls[0], 'BEGIN');
+        assert.equal(client._calls[client._calls.length - 1], 'ROLLBACK');
+        assert.ok(!client._calls.includes('COMMIT'));
+    });
+
+    it('concurrent consumers never claim the same message (serialized by tx)', async () => {
+        // Simulated Postgres-like engine where `FOR UPDATE` only blocks
+        // concurrent callers when it is inside an active transaction —
+        // under autocommit the lock is released immediately. This models
+        // the real bug: if `streamRead` forgets to BEGIN, two consumers
+        // race and can both read the same cursor value.
+        //
+        // With the fix in place, streamRead's BEGIN/COMMIT wrapping makes
+        // the cursor-update-insert block atomic and each message is
+        // delivered exactly once.
+        const messages = [
+            { id: 1, payload: { i: 1 }, created_at: 't' },
+            { id: 2, payload: { i: 2 }, created_at: 't' },
+            { id: 3, payload: { i: 3 }, created_at: 't' },
+            { id: 4, payload: { i: 4 }, created_at: 't' },
+        ];
+        const db = {
+            cursor: 0,
+            lockedByTx: null,       // tx id currently holding the group cursor row
+            waiters: [],            // [{ txId, resolve }]
+            nextTxId: 1,
+        };
+        function maybeWake() {
+            if (db.lockedByTx !== null) return;
+            const next = db.waiters.shift();
+            if (next) { db.lockedByTx = next.txId; next.resolve(); }
+        }
+        function acquire(txId) {
+            return new Promise(resolve => {
+                if (db.lockedByTx === null) {
+                    db.lockedByTx = txId;
+                    resolve();
+                } else if (db.lockedByTx === txId) {
+                    resolve(); // re-entrant within same tx
+                } else {
+                    db.waiters.push({ txId, resolve });
+                }
+            });
+        }
+        function release(txId) {
+            if (db.lockedByTx === txId) {
+                db.lockedByTx = null;
+                maybeWake();
+            }
+        }
+        function makeClient() {
+            let txId = null;
+            return {
+                query: async (text, values) => {
+                    if (text === 'BEGIN') {
+                        txId = db.nextTxId++;
+                        return { rows: [] };
+                    }
+                    if (text === 'COMMIT' || text === 'ROLLBACK') {
+                        if (txId !== null) { release(txId); txId = null; }
+                        return { rows: [] };
+                    }
+                    if (text.startsWith('SELECT last_delivered_id')) {
+                        // FOR UPDATE: if we're in a tx, hold the lock until
+                        // COMMIT/ROLLBACK. If not, release immediately
+                        // (autocommit — this is the bug case).
+                        if (txId === null) {
+                            await acquire(db.nextTxId++);
+                            db.lockedByTx = null;
+                            maybeWake();
+                        } else {
+                            await acquire(txId);
+                        }
+                        return { rows: [{ last_delivered_id: db.cursor }], rowCount: 1 };
+                    }
+                    if (text.startsWith('SELECT id, payload')) {
+                        const [lastId, count] = values;
+                        const rows = messages.filter(m => m.id > lastId).slice(0, count);
+                        return { rows, rowCount: rows.length };
+                    }
+                    if (text.startsWith('UPDATE g')) {
+                        db.cursor = Number(values[0]);
+                        return { rows: [], rowCount: 1 };
+                    }
+                    if (text.startsWith('INSERT INTO p')) {
+                        return { rows: [], rowCount: 1 };
+                    }
+                    return { rows: [], rowCount: 0 };
+                },
+            };
+        }
+
+        const [aResult, bResult] = await Promise.all([
+            streamRead(makeClient(), 's', 'g', 'ca', 10, { patterns: STREAM_PATTERNS }),
+            streamRead(makeClient(), 's', 'g', 'cb', 10, { patterns: STREAM_PATTERNS }),
+        ]);
+
+        const aIds = aResult.map(m => m.id);
+        const bIds = bResult.map(m => m.id);
+        const all = [...aIds, ...bIds].sort((x, y) => x - y);
+        assert.deepEqual(all, [1, 2, 3, 4], 'all messages delivered exactly once');
+        const overlap = aIds.filter(id => bIds.includes(id));
+        assert.deepEqual(overlap, [], 'no message delivered to both consumers');
+    });
+});
