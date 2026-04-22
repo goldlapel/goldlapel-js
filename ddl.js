@@ -13,7 +13,7 @@
 // - `GoldLapel` passes dashboardPort + dashboardToken explicitly when it
 //   spawned the proxy subprocess (the happy path).
 // - For externally-launched proxies, wrapper reads
-//   GOLDLAPEL_DASHBOARD_TOKEN env or ~/.goldlapel/dashboard_token file.
+//   GOLDLAPEL_DASHBOARD_TOKEN env or ~/.goldlapel/dashboard-token file.
 
 import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
@@ -33,7 +33,7 @@ export function supportedVersion(family) {
 export function tokenFromEnvOrFile() {
     const env = process.env.GOLDLAPEL_DASHBOARD_TOKEN;
     if (env && env.trim()) return env.trim();
-    const path = join(homedir(), '.goldlapel', 'dashboard_token');
+    const path = join(homedir(), '.goldlapel', 'dashboard-token');
     if (existsSync(path)) {
         try {
             const text = readFileSync(path, 'utf8').trim();
@@ -123,7 +123,7 @@ export async function fetchPatterns(owner, family, name, dashboardPort, dashboar
             throw new Error(
                 'Gold Lapel dashboard rejected the DDL request (403). ' +
                 'The dashboard token is missing or incorrect — check ' +
-                'GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard_token.'
+                'GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard-token.'
             );
         }
         throw new Error(
