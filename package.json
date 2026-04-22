@@ -8,6 +8,7 @@
     "index.js",
     "cli.js",
     "cache.js",
+    "ddl.js",
     "wrap.js",
     "utils.js",
     "bin/",

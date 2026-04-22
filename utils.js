@@ -327,58 +327,36 @@ export async function hdel(client, table, key, field) {
     return true;
 }
 
-export async function streamAdd(client, stream, payload) {
+function _requirePatterns(patterns, fn) {
+    if (!patterns || !patterns.query_patterns) {
+        throw new Error(
+            `${fn} requires DDL patterns from the proxy — call via ` +
+            `\`gl.${fn}(...)\` rather than the utils function directly.`
+        );
+    }
+    return patterns.query_patterns;
+}
+
+export async function streamAdd(client, stream, payload, { patterns } = {}) {
     validateIdentifier(stream);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${stream} (
-            id BIGSERIAL PRIMARY KEY,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    `);
-    const result = await client.query(
-        `INSERT INTO ${stream} (payload) VALUES ($1) RETURNING id`,
-        [JSON.stringify(payload)]
-    );
+    const qp = _requirePatterns(patterns, 'streamAdd');
+    const result = await client.query(qp.insert, [JSON.stringify(payload)]);
     return Number(result.rows[0].id);
 }
 
-export async function streamCreateGroup(client, stream, group) {
+export async function streamCreateGroup(client, stream, group, { patterns } = {}) {
     validateIdentifier(stream);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${stream}_groups (
-            group_name TEXT PRIMARY KEY,
-            last_delivered_id BIGINT NOT NULL DEFAULT 0
-        )
-    `);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${stream}_pending (
-            message_id BIGINT NOT NULL,
-            group_name TEXT NOT NULL,
-            consumer TEXT NOT NULL,
-            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            delivery_count INT NOT NULL DEFAULT 1,
-            PRIMARY KEY (group_name, message_id)
-        )
-    `);
-    await client.query(
-        `INSERT INTO ${stream}_groups (group_name) VALUES ($1) ON CONFLICT DO NOTHING`,
-        [group]
-    );
+    const qp = _requirePatterns(patterns, 'streamCreateGroup');
+    await client.query(qp.create_group, [group]);
 }
 
-export async function streamRead(client, stream, group, consumer, count = 1) {
+export async function streamRead(client, stream, group, consumer, count = 1, { patterns } = {}) {
     validateIdentifier(stream);
-    const cursorResult = await client.query(
-        `SELECT last_delivered_id FROM ${stream}_groups WHERE group_name = $1 FOR UPDATE`,
-        [group]
-    );
+    const qp = _requirePatterns(patterns, 'streamRead');
+    const cursorResult = await client.query(qp.group_get_cursor, [group]);
     if (cursorResult.rows.length === 0) return [];
     const lastId = Number(cursorResult.rows[0].last_delivered_id);
-    const msgResult = await client.query(
-        `SELECT id, payload, created_at FROM ${stream} WHERE id > $1 ORDER BY id LIMIT $2`,
-        [lastId, count]
-    );
+    const msgResult = await client.query(qp.read_since, [lastId, count]);
     const messages = msgResult.rows.map(row => ({
         id: Number(row.id),
         payload: typeof row.payload === 'object' ? row.payload : JSON.parse(row.payload),
@@ -386,45 +364,29 @@ export async function streamRead(client, stream, group, consumer, count = 1) {
     }));
     if (messages.length > 0) {
         const newLast = messages[messages.length - 1].id;
-        await client.query(
-            `UPDATE ${stream}_groups SET last_delivered_id = $1 WHERE group_name = $2`,
-            [newLast, group]
-        );
+        await client.query(qp.group_advance_cursor, [newLast, group]);
         for (const msg of messages) {
-            await client.query(
-                `INSERT INTO ${stream}_pending (message_id, group_name, consumer)
-                 VALUES ($1, $2, $3) ON CONFLICT (group_name, message_id) DO NOTHING`,
-                [msg.id, group, consumer]
-            );
+            await client.query(qp.pending_insert, [msg.id, group, consumer]);
         }
     }
     return messages;
 }
 
-export async function streamAck(client, stream, group, messageId) {
+export async function streamAck(client, stream, group, messageId, { patterns } = {}) {
     validateIdentifier(stream);
-    const result = await client.query(
-        `DELETE FROM ${stream}_pending WHERE group_name = $1 AND message_id = $2`,
-        [group, messageId]
-    );
+    const qp = _requirePatterns(patterns, 'streamAck');
+    const result = await client.query(qp.ack, [group, messageId]);
     return result.rowCount > 0;
 }
 
-export async function streamClaim(client, stream, group, consumer, minIdleMs = 60000) {
+export async function streamClaim(client, stream, group, consumer, minIdleMs = 60000, { patterns } = {}) {
     validateIdentifier(stream);
-    const claimResult = await client.query(`
-        UPDATE ${stream}_pending
-        SET consumer = $1, claimed_at = NOW(), delivery_count = delivery_count + 1
-        WHERE group_name = $2 AND claimed_at < NOW() - INTERVAL '${Number(minIdleMs)} milliseconds'
-        RETURNING message_id
-    `, [consumer, group]);
+    const qp = _requirePatterns(patterns, 'streamClaim');
+    const claimResult = await client.query(qp.claim, [consumer, group, minIdleMs]);
     const claimedIds = claimResult.rows.map(r => Number(r.message_id));
     const messages = [];
     for (const msgId of claimedIds) {
-        const result = await client.query(
-            `SELECT id, payload, created_at FROM ${stream} WHERE id = $1`,
-            [msgId]
-        );
+        const result = await client.query(qp.read_by_id, [msgId]);
         if (result.rows.length > 0) {
             const row = result.rows[0];
             messages.push({

@@ -143,6 +143,15 @@ describe('wrapper methods delegate to default conn', () => {
     it('streamAdd delegates with spread args', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         gl._defaultConn = mockClient({ rows: [{ id: '1' }], rowCount: 1 });
+        // Stub out the DDL fetch so this unit test doesn't try to POST to
+        // a nonexistent dashboard. The utils layer reads patterns from
+        // the returned object — supply just the fields streamAdd touches.
+        gl._streamPatterns = async () => ({
+            tables: { main: '_goldlapel.stream_events' },
+            query_patterns: {
+                insert: 'INSERT INTO _goldlapel.stream_events (payload) VALUES ($1) RETURNING id, created_at',
+            },
+        });
 
         const id = await gl.streamAdd('events', { type: 'click' });
         assert.strictEqual(id, 1);

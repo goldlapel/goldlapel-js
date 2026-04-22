@@ -438,6 +438,9 @@ export class GoldLapel {
         this._defaultConn = null;
         this._defaultClose = null;
         this._stopped = false;
+        // Dashboard token — provisioned on _spawn for internally-launched
+        // proxies, or resolved via env/file on first DDL call for external ones.
+        this._dashboardToken = null;
         // Per-instance scope for gl.using(). Module-scoped storage would leak
         // the scoped conn across sibling GoldLapel instances in the same process.
         this._connScope = new AsyncLocalStorage();
@@ -470,6 +473,15 @@ export class GoldLapel {
 
         const env = { ...process.env };
         if (!env.GOLDLAPEL_CLIENT) env.GOLDLAPEL_CLIENT = 'node';
+        // Provision a session-scoped dashboard token for /api/ddl/* calls.
+        // Pre-set env wins (user may already have their own token).
+        if (env.GOLDLAPEL_DASHBOARD_TOKEN) {
+            this._dashboardToken = env.GOLDLAPEL_DASHBOARD_TOKEN;
+        } else {
+            const { randomBytes } = await import('crypto');
+            this._dashboardToken = randomBytes(32).toString('hex');
+            env.GOLDLAPEL_DASHBOARD_TOKEN = this._dashboardToken;
+        }
         this._process = spawn(binary, args, {
             stdio: ['ignore', 'ignore', 'pipe'],
             env,
@@ -532,6 +544,13 @@ export class GoldLapel {
 
         _liveInstances.delete(this);
 
+        // Drop any cached DDL patterns — they're tied to the proxy we're
+        // about to kill.
+        try {
+            const ddl = await import('./ddl.js');
+            ddl.invalidate(this);
+        } catch {}
+
         const close = this._defaultClose;
         this._defaultConn = null;
         this._defaultClose = null;
@@ -542,6 +561,7 @@ export class GoldLapel {
         const proc = this._process;
         this._process = null;
         this._proxyUrl = null;
+        this._dashboardToken = null;
         if (proc && proc.exitCode === null) {
             proc.kill('SIGTERM');
             setTimeout(() => {
@@ -595,6 +615,21 @@ export class GoldLapel {
             return `http://127.0.0.1:${this._dashboardPort}`;
         }
         return null;
+    }
+
+    get dashboardPort() {
+        return this._dashboardPort;
+    }
+
+    get dashboardToken() {
+        return this._dashboardToken;
+    }
+
+    // Fetch (and cache per-instance) canonical DDL + query patterns for a helper.
+    async _streamPatterns(stream) {
+        const ddl = await import('./ddl.js');
+        const token = this._dashboardToken || ddl.tokenFromEnvOrFile();
+        return ddl.fetchPatterns(this, 'stream', stream, this._dashboardPort, token);
     }
 
     // ─── Wrapper methods ───────────────────────────────────────────────────
@@ -682,12 +717,32 @@ export class GoldLapel {
     async countDistinct(...args) { return _call(this, countDistinct, args); }
     async script(...args) { return _call(this, script, args); }
 
-    // Streams
-    async streamAdd(...args) { return _call(this, streamAdd, args); }
-    async streamCreateGroup(...args) { return _call(this, streamCreateGroup, args); }
-    async streamRead(...args) { return _call(this, streamRead, args); }
-    async streamAck(...args) { return _call(this, streamAck, args); }
-    async streamClaim(...args) { return _call(this, streamClaim, args); }
+    // Streams — thread DDL patterns from the proxy through each call.
+    async streamAdd(stream, payload, opts = {}) {
+        const patterns = await this._streamPatterns(stream);
+        const conn = this._resolveConn(opts.conn);
+        return streamAdd(conn, stream, payload, { patterns });
+    }
+    async streamCreateGroup(stream, group, opts = {}) {
+        const patterns = await this._streamPatterns(stream);
+        const conn = this._resolveConn(opts.conn);
+        return streamCreateGroup(conn, stream, group, { patterns });
+    }
+    async streamRead(stream, group, consumer, count = 1, opts = {}) {
+        const patterns = await this._streamPatterns(stream);
+        const conn = this._resolveConn(opts.conn);
+        return streamRead(conn, stream, group, consumer, count, { patterns });
+    }
+    async streamAck(stream, group, messageId, opts = {}) {
+        const patterns = await this._streamPatterns(stream);
+        const conn = this._resolveConn(opts.conn);
+        return streamAck(conn, stream, group, messageId, { patterns });
+    }
+    async streamClaim(stream, group, consumer, minIdleMs = 60000, opts = {}) {
+        const patterns = await this._streamPatterns(stream);
+        const conn = this._resolveConn(opts.conn);
+        return streamClaim(conn, stream, group, consumer, minIdleMs, { patterns });
+    }
 }
 
 // Splits out an optional `conn` from the trailing options arg.
