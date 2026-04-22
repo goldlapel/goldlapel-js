@@ -2,7 +2,9 @@ function validateIdentifier(name) {
     if (typeof name !== 'string' || name.length === 0) {
         throw new Error('Identifier must be a non-empty string');
     }
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+    // Bound to 63 chars (Postgres NAMEDATALEN-1) so identifiers match the
+    // proxy's server-side regex exactly: `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.test(name)) {
         throw new Error(`Invalid identifier: ${name}`);
     }
     return name;
