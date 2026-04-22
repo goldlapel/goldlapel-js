@@ -147,6 +147,74 @@ describe('gl.using(conn, callback)', () => {
             'gl1 published the gl1 message on its scoped conn',
         );
     });
+
+    it('scope does not leak across sibling Promise.all tasks (v0.2 Tests Q7 parity)', async () => {
+        // Regression: the scoped conn set by gl.using() must NOT be visible to
+        // a sibling async task running concurrently via Promise.all. Node's
+        // AsyncLocalStorage is the canonical primitive for per-async-context
+        // state — using shared instance state (e.g. this._scopeConn = conn)
+        // would produce the leak this test guards against. Ruby had this
+        // bug class once in its fiber-local handling (see
+        // goldlapel-ruby test_async_native.rb::test_using_scope_under_async_reactor).
+        //
+        // Determinism: coordinated with Promise barriers, never setTimeout.
+        //   1. Task A enters gl.using(connA, ...) and signals `aInsideUsing`.
+        //   2. Task B waits on `aInsideUsing`, then invokes gl.publish() —
+        //      this is the critical moment when a leak would manifest.
+        //   3. Task B records which mock conn it hit, then signals `bDone`.
+        //   4. Task A waits on `bDone` before exiting using() — this guarantees
+        //      B's observation happened with A still inside the `using()`
+        //      scope, which is the scenario a leaking impl would get wrong.
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        const def = mockClient({ rows: [], rowCount: 0 });
+        const connA = mockClient({ rows: [], rowCount: 0 });
+        gl._defaultConn = def;
+
+        let resolveAInsideUsing;
+        const aInsideUsing = new Promise((r) => { resolveAInsideUsing = r; });
+        let resolveBDone;
+        const bDone = new Promise((r) => { resolveBDone = r; });
+
+        const taskA = async () => {
+            await gl.using(connA, async (g) => {
+                resolveAInsideUsing();  // signal: B may proceed
+                await bDone;            // wait: hold the scope open until B finishes
+                // A's own call must still see connA (scope intact for A).
+                await g.publish('channel_a', 'from-a');
+            });
+        };
+
+        const taskB = async () => {
+            await aInsideUsing;  // wait: A is inside using()
+            // This call runs in a sibling Promise chain — it must resolve to
+            // `def`, not `connA`. Under AsyncLocalStorage, B's async context
+            // was never entered via connScope.run(), so getStore() returns
+            // undefined and _resolveConn falls back to _defaultConn.
+            await gl.publish('channel_b', 'from-b');
+            resolveBDone();
+        };
+
+        await Promise.all([taskA(), taskB()]);
+
+        // Task A: used connA (scoped).
+        assert.strictEqual(connA._calls.length, 1, 'task A used its scoped connA');
+        assert.strictEqual(
+            connA._calls[0].values[0],
+            'channel_a',
+            'task A published channel_a on connA',
+        );
+        // Task B: used default conn (no leak).
+        assert.strictEqual(
+            def._calls.length,
+            1,
+            'task B used the default conn (no scope leak from sibling task A)',
+        );
+        assert.strictEqual(
+            def._calls[0].values[0],
+            'channel_b',
+            'task B published channel_b on the default conn',
+        );
+    });
 });
 
 // ─── Symbol.asyncDispose ───────────────────────────────────────────────────
