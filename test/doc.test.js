@@ -1015,16 +1015,23 @@ describe('docWatch', () => {
         const events = [];
         const watcher = await docWatch(client, 'orders', (ev) => events.push(ev));
 
-        // Should have: CREATE FUNCTION, DROP TRIGGER IF EXISTS, CREATE TRIGGER, LISTEN
-        assert.equal(client._calls.length, 4);
+        // Should have: CREATE FUNCTION, CREATE OR REPLACE TRIGGER, LISTEN.
+        // CREATE OR REPLACE TRIGGER (PG14+) replaces the old DROP + CREATE
+        // pair to avoid a race between concurrent docWatch calls; matches
+        // the Go wrapper.
+        assert.equal(client._calls.length, 3);
         assert.ok(client._calls[0].text.includes('CREATE OR REPLACE FUNCTION orders_notify_fn'));
         assert.ok(client._calls[0].text.includes('pg_notify'));
         assert.ok(client._calls[0].text.includes('TG_OP'));
-        assert.ok(client._calls[1].text.includes('DROP TRIGGER IF EXISTS orders_notify_trg ON orders'));
-        assert.ok(client._calls[2].text.includes('CREATE TRIGGER orders_notify_trg'));
-        assert.ok(client._calls[2].text.includes('AFTER INSERT OR UPDATE OR DELETE ON orders'));
-        assert.ok(client._calls[2].text.includes('EXECUTE FUNCTION orders_notify_fn'));
-        assert.ok(client._calls[3].text.includes('LISTEN orders_changes'));
+        assert.ok(client._calls[1].text.includes('CREATE OR REPLACE TRIGGER orders_notify_trg'));
+        assert.ok(client._calls[1].text.includes('AFTER INSERT OR UPDATE OR DELETE ON orders'));
+        assert.ok(client._calls[1].text.includes('EXECUTE FUNCTION orders_notify_fn'));
+        assert.ok(client._calls[2].text.includes('LISTEN orders_changes'));
+        // Guard against the racy DROP + CREATE pair regressing.
+        assert.ok(
+            !client._calls.some(c => c.text.includes('DROP TRIGGER IF EXISTS orders_notify_trg')),
+            'docWatch should not emit DROP TRIGGER IF EXISTS (racy); use CREATE OR REPLACE TRIGGER',
+        );
 
         // Listener registered
         assert.equal(client._listeners.notification.length, 1);
@@ -1071,14 +1078,21 @@ describe('docCreateTtlIndex', () => {
     it('creates index, trigger function, and trigger with default field', async () => {
         const client = mockClient();
         await docCreateTtlIndex(client, 'sessions', 3600);
-        assert.equal(client._calls.length, 4);
+        // CREATE INDEX + CREATE FUNCTION + CREATE OR REPLACE TRIGGER.
+        // Atomic CREATE OR REPLACE TRIGGER (PG14+) replaces the old DROP +
+        // CREATE pair — matches the Go wrapper.
+        assert.equal(client._calls.length, 3);
         assert.ok(client._calls[0].text.includes('CREATE INDEX IF NOT EXISTS sessions_ttl_idx ON sessions (created_at)'));
         assert.ok(client._calls[1].text.includes('CREATE OR REPLACE FUNCTION sessions_ttl_fn'));
         assert.ok(client._calls[1].text.includes("INTERVAL '3600 seconds'"));
         assert.ok(client._calls[1].text.includes('DELETE FROM sessions WHERE created_at'));
-        assert.ok(client._calls[2].text.includes('DROP TRIGGER IF EXISTS sessions_ttl_trg ON sessions'));
-        assert.ok(client._calls[3].text.includes('CREATE TRIGGER sessions_ttl_trg'));
-        assert.ok(client._calls[3].text.includes('BEFORE INSERT ON sessions'));
+        assert.ok(client._calls[2].text.includes('CREATE OR REPLACE TRIGGER sessions_ttl_trg'));
+        assert.ok(client._calls[2].text.includes('BEFORE INSERT ON sessions'));
+        // Guard against the racy DROP + CREATE pair regressing.
+        assert.ok(
+            !client._calls.some(c => c.text.includes('DROP TRIGGER IF EXISTS sessions_ttl_trg')),
+            'docCreateTtlIndex should not emit DROP TRIGGER IF EXISTS (racy); use CREATE OR REPLACE TRIGGER',
+        );
     });
 
     it('uses custom field', async () => {
@@ -1120,17 +1134,23 @@ describe('docCreateCapped', () => {
     it('ensures collection and creates cap trigger', async () => {
         const client = mockClient();
         await docCreateCapped(client, 'logs', 1000);
-        // ensureCollection (1) + CREATE FUNCTION (2) + DROP TRIGGER (3) + CREATE TRIGGER (4)
-        assert.equal(client._calls.length, 4);
+        // ensureCollection (1) + CREATE FUNCTION (2) + CREATE OR REPLACE TRIGGER (3).
+        // Atomic CREATE OR REPLACE TRIGGER (PG14+) replaces the old DROP +
+        // CREATE pair — matches the Go wrapper.
+        assert.equal(client._calls.length, 3);
         assert.ok(client._calls[0].text.includes('CREATE TABLE IF NOT EXISTS logs'));
         assert.ok(client._calls[1].text.includes('CREATE OR REPLACE FUNCTION logs_cap_fn'));
         assert.ok(client._calls[1].text.includes('DELETE FROM logs'));
         assert.ok(client._calls[1].text.includes('ORDER BY created_at ASC'));
         assert.ok(client._calls[1].text.includes('LIMIT GREATEST'));
         assert.ok(client._calls[1].text.includes('1000'));
-        assert.ok(client._calls[2].text.includes('DROP TRIGGER IF EXISTS logs_cap_trg ON logs'));
-        assert.ok(client._calls[3].text.includes('CREATE TRIGGER logs_cap_trg'));
-        assert.ok(client._calls[3].text.includes('AFTER INSERT ON logs'));
+        assert.ok(client._calls[2].text.includes('CREATE OR REPLACE TRIGGER logs_cap_trg'));
+        assert.ok(client._calls[2].text.includes('AFTER INSERT ON logs'));
+        // Guard against the racy DROP + CREATE pair regressing.
+        assert.ok(
+            !client._calls.some(c => c.text.includes('DROP TRIGGER IF EXISTS logs_cap_trg')),
+            'docCreateCapped should not emit DROP TRIGGER IF EXISTS (racy); use CREATE OR REPLACE TRIGGER',
+        );
     });
 
     it('rejects non-positive maxDocuments', async () => {

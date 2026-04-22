@@ -1570,12 +1570,12 @@ export async function docWatch(client, collection, callback) {
         $$
     `);
 
+    // CREATE OR REPLACE TRIGGER (Postgres 14+) is atomic — avoids the race
+    // where a DROP + CREATE pair could have two concurrent docWatch calls
+    // replace each other's triggers mid-flight and end up with a partially
+    // dropped one. GL targets PG14+ across the product, so this is safe.
     await client.query(`
-        DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}
-    `);
-
-    await client.query(`
-        CREATE TRIGGER ${triggerName}
+        CREATE OR REPLACE TRIGGER ${triggerName}
         AFTER INSERT OR UPDATE OR DELETE ON ${collection}
         FOR EACH ROW EXECUTE FUNCTION ${funcName}()
     `);
@@ -1637,12 +1637,10 @@ export async function docCreateTtlIndex(client, collection, expireAfterSeconds, 
         $$
     `);
 
+    // CREATE OR REPLACE TRIGGER (Postgres 14+): atomic, avoids the same
+    // race documented in docWatch.
     await client.query(`
-        DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}
-    `);
-
-    await client.query(`
-        CREATE TRIGGER ${triggerName}
+        CREATE OR REPLACE TRIGGER ${triggerName}
         BEFORE INSERT ON ${collection}
         FOR EACH ROW EXECUTE FUNCTION ${funcName}()
     `);
@@ -1687,12 +1685,10 @@ export async function docCreateCapped(client, collection, maxDocuments) {
         $$
     `);
 
+    // CREATE OR REPLACE TRIGGER (Postgres 14+): atomic, avoids the same
+    // race documented in docWatch.
     await client.query(`
-        DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}
-    `);
-
-    await client.query(`
-        CREATE TRIGGER ${triggerName}
+        CREATE OR REPLACE TRIGGER ${triggerName}
         AFTER INSERT ON ${collection}
         FOR EACH ROW EXECUTE FUNCTION ${funcName}()
     `);
