@@ -320,3 +320,113 @@ describe('push invalidation', () => {
         cache.stopInvalidation();
     });
 });
+
+// --- Concurrent access ---
+//
+// Node's event loop runs JS on a single thread, so there is no classical data
+// race inside a single synchronous put()/get()/invalidateTable() call. But the
+// push-invalidation socket's 'data' callback fires asynchronously and will
+// interleave with any user async flow that awaits between cache operations.
+// This test exercises that interleaving: ~100 put()s and ~100 get()s racing
+// in parallel via Promise.all, plus ~10 invalidation signals delivered via
+// the real socket path, all yielding to each other on every iteration.
+// Mirrors Python's TestThreadSafety and Go's TestConcurrent{PutAndGet,Invalidation}.
+
+describe('concurrent put/get/invalidate', () => {
+    it('no exceptions, stats consistent, size bounded', async () => {
+        const OPS = 100;
+        const TABLES = 10; // t0..t9
+        const MAX = 50;    // below OPS*2 so eviction races with invalidation
+        const cache = makeCache({ maxEntries: MAX });
+
+        // Stand up a real invalidation server so socket signals drive real
+        // invalidation callbacks (the only genuine async source here).
+        const server = createServer();
+        await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+        const port = server.address().port;
+
+        cache._invalidationConnected = false;
+        cache.connectInvalidation(port);
+        const conn = await new Promise(resolve => server.once('connection', resolve));
+        // Wait for the client-side 'connect' event to flip the flag.
+        await new Promise(resolve => setTimeout(resolve, 50));
+        assert.ok(cache.connected, 'socket should be connected before racing');
+
+        const yieldTick = () => new Promise(resolve => setImmediate(resolve));
+        const sqlFor = i => `SELECT * FROM t${i % TABLES} WHERE id = ${i}`;
+
+        // Writers: OPS puts, each yielding so socket data can interleave.
+        const writer = async (start) => {
+            for (let i = start; i < start + OPS; i++) {
+                cache.put(sqlFor(i), [i], [{ id: i }], [{ name: 'id' }]);
+                await yieldTick();
+            }
+        };
+
+        // Readers: OPS gets, counting local hits/misses to cross-check stats.
+        let localHits = 0;
+        let localMisses = 0;
+        const reader = async (start) => {
+            for (let i = start; i < start + OPS; i++) {
+                const r = cache.get(sqlFor(i), [i]);
+                if (r) localHits++; else localMisses++;
+                await yieldTick();
+            }
+        };
+
+        // Invalidator: drives invalidation via the real socket listener path.
+        const invalidator = async () => {
+            for (let i = 0; i < TABLES; i++) {
+                conn.write(`I:t${i}\n`);
+                // Give the data handler a tick to drain.
+                await new Promise(resolve => setTimeout(resolve, 2));
+            }
+        };
+
+        await assert.doesNotReject(Promise.all([
+            writer(0),
+            writer(OPS),
+            reader(0),
+            reader(OPS),
+            invalidator(),
+        ]));
+
+        // Drain any straggler socket data before asserting stats.
+        await new Promise(resolve => setTimeout(resolve, 50));
+
+        // Stats invariants: every get() call bumped exactly one counter.
+        assert.equal(
+            cache.statsHits + cache.statsMisses,
+            OPS * 2,
+            'hits + misses must equal total get() calls',
+        );
+        assert.equal(cache.statsHits, localHits, 'cache.statsHits matches observed hits');
+        assert.equal(cache.statsMisses, localMisses, 'cache.statsMisses matches observed misses');
+
+        // Size invariant: never exceeds configured max.
+        assert.ok(cache.size <= MAX, `cache.size=${cache.size} exceeds max ${MAX}`);
+
+        // statsInvalidations must equal the number of keys actually removed
+        // by invalidation — never negative, never exceed total puts.
+        assert.ok(cache.statsInvalidations >= 0);
+        assert.ok(
+            cache.statsInvalidations <= OPS * 2,
+            `statsInvalidations=${cache.statsInvalidations} exceeds total puts`,
+        );
+
+        // Table index invariant: every key it references must still be in _cache.
+        for (const [table, keys] of cache._tableIndex) {
+            assert.ok(keys.size > 0, `empty key set left for table ${table}`);
+            for (const key of keys) {
+                assert.ok(
+                    cache._cache.has(key),
+                    `tableIndex[${table}] references missing cache key`,
+                );
+            }
+        }
+
+        conn.destroy();
+        server.close();
+        cache.stopInvalidation();
+    });
+});
