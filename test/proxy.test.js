@@ -195,14 +195,14 @@ describe('waitForPort', () => {
 
 
 describe('GoldLapel class', () => {
-    it('uses default port', () => {
+    it('uses default proxy port', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._port, 7932);
+        assert.strictEqual(gl._proxyPort, 7932);
     });
 
-    it('accepts custom port', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { port: 9000 });
-        assert.strictEqual(gl._port, 9000);
+    it('accepts custom proxy port', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { proxyPort: 9000 });
+        assert.strictEqual(gl._proxyPort, 9000);
     });
 
     it('not running initially', () => {
@@ -234,23 +234,27 @@ describe('dashboardUrl', () => {
         assert.strictEqual(gl._dashboardPort, 7933);
     });
 
-    it('custom port from config', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            config: { dashboardPort: 8080 },
-        });
-        assert.strictEqual(gl._dashboardPort, 8080);
+    it('dashboard port inside config map is rejected', () => {
+        // Regression guard: dashboardPort was promoted out of the config
+        // map to a top-level option. Passing it via `config` must raise.
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                config: { dashboardPort: 8080 },
+            }),
+            { message: /Unknown config keys: dashboardPort/ }
+        );
     });
 
     it('derives from custom proxy port when dashboardPort not supplied', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            port: 17932,
+            proxyPort: 17932,
         });
         assert.strictEqual(gl._dashboardPort, 17933);
     });
 
     it('explicit dashboardPort wins over proxy-port derivation', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            port: 17932,
+            proxyPort: 17932,
             dashboardPort: 9999,
         });
         assert.strictEqual(gl._dashboardPort, 9999);
@@ -263,9 +267,9 @@ describe('dashboardUrl', () => {
         assert.strictEqual(gl._dashboardPort, 8080);
     });
 
-    it('port 0 means disabled (dashboardUrl returns null)', () => {
+    it('top-level dashboardPort=0 disables (dashboardUrl returns null)', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            config: { dashboardPort: 0 },
+            dashboardPort: 0,
         });
         assert.strictEqual(gl._dashboardPort, 0);
         assert.strictEqual(gl.dashboardUrl, null);
@@ -294,8 +298,8 @@ describe('dashboardUrl', () => {
 
 describe('configToArgs', () => {
     it('converts string value to correct flags', () => {
-        const args = _configToArgs({ mode: 'waiter' });
-        assert.deepStrictEqual(args, ['--mode', 'waiter']);
+        const args = _configToArgs({ poolMode: 'transaction' });
+        assert.deepStrictEqual(args, ['--pool-mode', 'transaction']);
     });
 
     it('converts numeric value to stringified flag', () => {
@@ -337,9 +341,9 @@ describe('configToArgs', () => {
     });
 
     it('converts multiple keys to all flags', () => {
-        const args = _configToArgs({ mode: 'waiter', poolSize: 5, disablePool: true });
-        assert.ok(args.includes('--mode'));
-        assert.ok(args.includes('waiter'));
+        const args = _configToArgs({ poolMode: 'transaction', poolSize: 5, disablePool: true });
+        assert.ok(args.includes('--pool-mode'));
+        assert.ok(args.includes('transaction'));
         assert.ok(args.includes('--pool-size'));
         assert.ok(args.includes('5'));
         assert.ok(args.includes('--disable-pool'));
@@ -379,9 +383,23 @@ describe('configToArgs', () => {
 
     it('config passed through constructor is stored', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            config: { mode: 'waiter', disablePool: true },
+            config: { poolMode: 'transaction', disablePool: true },
         });
-        assert.deepStrictEqual(gl._config, { mode: 'waiter', disablePool: true });
+        assert.deepStrictEqual(gl._config, { poolMode: 'transaction', disablePool: true });
+    });
+
+    it('rejects log_level / mode / dashboardPort inside config map', () => {
+        // Regression guard: these are top-level options on the canonical
+        // surface. Passing them through `config` must raise.
+        for (const bad of ['logLevel', 'mode', 'dashboardPort', 'invalidationPort', 'license', 'client', 'config']) {
+            assert.throws(
+                () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                    config: { [bad]: 'x' },
+                }),
+                { message: new RegExp(`Unknown config keys: ${bad}`) },
+                `expected rejection of promoted top-level key '${bad}' in config map`
+            );
+        }
     });
 });
 
@@ -390,9 +408,14 @@ describe('configKeys', () => {
     it('returns a Set of valid config keys', () => {
         const keys = configKeys();
         assert.ok(keys instanceof Set);
-        assert.ok(keys.has('mode'));
+        // Tuning knobs still live in the structured config map.
         assert.ok(keys.has('poolSize'));
-        assert.strictEqual(keys.size, 42);
+        assert.ok(keys.has('disableMatviews'));
+        // Top-level concepts must NOT appear — passing them via config is a
+        // user error.
+        assert.ok(!keys.has('mode'));
+        assert.ok(!keys.has('logLevel'));
+        assert.ok(!keys.has('dashboardPort'));
     });
 
     it('returns a new Set each call (not the internal reference)', () => {

@@ -65,7 +65,7 @@ describe('withGoldLapel', () => {
 
         assert.strictEqual(calls.length, 1)
         assert.strictEqual(calls[0].upstream, 'postgresql://user:pass@host:5432/mydb')
-        assert.deepStrictEqual(calls[0].opts, { config: undefined, port: undefined, extraArgs: undefined, noConnect: true })
+        assert.deepStrictEqual(calls[0].opts, { config: undefined, proxyPort: undefined, invalidationPort: undefined, extraArgs: undefined, noConnect: true })
         assert(client instanceof MockPrismaClient)
         assert.strictEqual(client._opts.datasources.db.url, 'postgresql://user:pass@localhost:7932/mydb')
         assert.strictEqual(process.env.DATABASE_URL, 'postgresql://user:pass@localhost:7932/mydb')
@@ -92,13 +92,13 @@ describe('withGoldLapel', () => {
         )
     })
 
-    it('passes port to start', async () => {
+    it('passes proxyPort to start', async () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start, calls } = mockStart('postgresql://user:pass@localhost:9000/mydb')
 
-        await withGoldLapel({ port: 9000, _start, _PrismaClient: MockPrismaClient })
+        await withGoldLapel({ proxyPort: 9000, _start, _PrismaClient: MockPrismaClient })
 
-        assert.strictEqual(calls[0].opts.port, 9000)
+        assert.strictEqual(calls[0].opts.proxyPort, 9000)
     })
 
     it('passes extraArgs to start', async () => {
@@ -144,14 +144,14 @@ describe('withGoldLapel', () => {
         assert.strictEqual(typeof client._extensions[0].query.$allOperations, 'function')
     })
 
-    it('uses custom invalidation port from config', async () => {
+    it('uses custom invalidation port from top-level option', async () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
 
         const client = await withGoldLapel({
             _start,
             _PrismaClient: MockPrismaClient,
-            config: { invalidationPort: 9999 },
+            invalidationPort: 9999,
         })
 
         assert.strictEqual(client._extensions.length, 1)
@@ -162,7 +162,7 @@ describe('withGoldLapel', () => {
         const { _start } = mockStart('postgresql://user:pass@localhost:9000/mydb')
 
         const client = await withGoldLapel({
-            port: 9000,
+            proxyPort: 9000,
             _start,
             _PrismaClient: MockPrismaClient,
         })
@@ -253,13 +253,13 @@ describe('init', () => {
         assert.strictEqual(result, 'postgresql://user:pass@localhost:7932/mydb')
     })
 
-    it('passes port to start', async () => {
+    it('passes proxyPort to start', async () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start, calls } = mockStart('postgresql://user:pass@localhost:9000/mydb')
 
-        await init({ port: 9000, _start })
+        await init({ proxyPort: 9000, _start })
 
-        assert.strictEqual(calls[0].opts.port, 9000)
+        assert.strictEqual(calls[0].opts.proxyPort, 9000)
     })
 
     it('passes extraArgs to start', async () => {

@@ -35,25 +35,29 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
-const DEFAULT_PORT = 7932;
+const DEFAULT_PROXY_PORT = 7932;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
 
+// Keys that are valid inside the structured `config` map. Top-level concepts
+// (proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
+// client, configFile) are exposed as their own options on GoldLapel's
+// constructor and are NOT accepted here — passing them through `config`
+// raises at argv build time.
 const VALID_CONFIG_KEYS = new Set([
-    'mode', 'minPatternCount', 'refreshIntervalSecs', 'patternTtlSecs',
+    'minPatternCount', 'refreshIntervalSecs', 'patternTtlSecs',
     'maxTablesPerView', 'maxColumnsPerView', 'deepPaginationThreshold',
     'reportIntervalSecs', 'resultCacheSize', 'batchCacheSize',
     'batchCacheTtlSecs', 'poolSize', 'poolTimeoutSecs',
     'poolMode', 'mgmtIdleTimeout', 'fallback', 'readAfterWriteSecs',
     'n1Threshold', 'n1WindowMs', 'n1CrossThreshold',
-    'tlsCert', 'tlsKey', 'tlsClientCa', 'config', 'dashboardPort',
+    'tlsCert', 'tlsKey', 'tlsClientCa',
     'disableMatviews', 'disableConsolidation', 'disableBtreeIndexes',
     'disableTrigramIndexes', 'disableExpressionIndexes',
     'disablePartialIndexes', 'disableRewrite', 'disablePreparedCache',
     'disableResultCache', 'disablePool',
     'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
     'enableCoalescing', 'replica', 'excludeTables',
-    'invalidationPort',
 ]);
 
 const BOOLEAN_KEYS = new Set([
@@ -409,21 +413,28 @@ function _cleanup() {
 
 export class GoldLapel {
     constructor(upstream, {
-        port, dashboardPort, logLevel, config, extraArgs, noConnect, silent,
+        proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
+        client, configFile, config, extraArgs, noConnect, silent,
     } = {}) {
         this._upstream = upstream;
-        this._port = port ?? DEFAULT_PORT;
-        // Dashboard defaults to proxy port + 1 (matches what the Rust binary
-        // binds when no --dashboard-port is passed). An explicit dashboardPort
-        // (top-level opt or via config) always wins. This ensures `port:
-        // 17932` reports the dashboard at :17933 rather than the hardcoded
-        // 7933.
+        this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
+        // Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
+        // unset (matches what the Rust binary binds when no --dashboard-port /
+        // --invalidation-port is passed). A user-supplied value (including 0
+        // for "disable dashboard") overrides the derivation.
+        this._dashboardPortSet = dashboardPort !== undefined;
         this._dashboardPort = dashboardPort !== undefined
             ? Number(dashboardPort)
-            : (config && config.dashboardPort !== undefined
-                ? Number(config.dashboardPort)
-                : this._port + 1);
+            : this._proxyPort + 1;
+        this._invalidationPortSet = invalidationPort !== undefined;
+        this._invalidationPort = invalidationPort !== undefined
+            ? Number(invalidationPort)
+            : this._proxyPort + 2;
         this._logLevel = logLevel;
+        this._mode = mode;
+        this._license = license;
+        this._client = client;
+        this._configFile = configFile;
         this._config = config || {};
         this._extraArgs = extraArgs || [];
         this._noConnect = !!noConnect;
@@ -433,6 +444,12 @@ export class GoldLapel {
         // argv builder only ever walks `this._config` through _configToArgs,
         // which enforces VALID_CONFIG_KEYS.
         this._silent = !!silent;
+        // Validate structured-config keys eagerly so a test that constructs
+        // without spawning still catches bad keys.
+        const unknown = Object.keys(this._config).filter(k => !VALID_CONFIG_KEYS.has(k));
+        if (unknown.length > 0) {
+            throw new Error(`Unknown config keys: ${unknown.sort().join(', ')}`);
+        }
         this._process = null;
         this._proxyUrl = null;
         this._defaultConn = null;
@@ -453,13 +470,35 @@ export class GoldLapel {
         const verboseFlag = _logLevelToVerboseFlag(this._logLevel);
         const args = [
             '--upstream', this._upstream,
-            '--proxy-port', String(this._port),
-            ..._configToArgs(this._config),
-            ...this._extraArgs,
+            '--proxy-port', String(this._proxyPort),
         ];
+        // Top-level options (promoted out of the config map) emit their own
+        // CLI flags before the tuning-knob config map. Each is suppressed
+        // when the user hasn't set it, so the Rust binary applies its own
+        // defaults.
+        if (this._dashboardPortSet) {
+            args.push('--dashboard-port', String(this._dashboardPort));
+        }
+        if (this._invalidationPortSet) {
+            args.push('--invalidation-port', String(this._invalidationPort));
+        }
         if (verboseFlag) {
             args.push(verboseFlag);
         }
+        if (this._mode) {
+            args.push('--mode', this._mode);
+        }
+        if (this._license) {
+            args.push('--license', this._license);
+        }
+        if (this._client) {
+            args.push('--client', this._client);
+        }
+        if (this._configFile) {
+            args.push('--config', this._configFile);
+        }
+        args.push(..._configToArgs(this._config));
+        args.push(...this._extraArgs);
         return args;
     }
 
@@ -472,7 +511,10 @@ export class GoldLapel {
         const binary = _findBinary();
 
         const env = { ...process.env };
-        if (!env.GOLDLAPEL_CLIENT) env.GOLDLAPEL_CLIENT = 'node';
+        // GOLDLAPEL_CLIENT env var is only set when the user hasn't opted
+        // in via the top-level `client` option (which emits --client and
+        // takes precedence over the env var).
+        if (!this._client && !env.GOLDLAPEL_CLIENT) env.GOLDLAPEL_CLIENT = 'node';
         // Provision a session-scoped dashboard token for /api/ddl/* calls.
         // Pre-set env wins (user may already have their own token).
         if (env.GOLDLAPEL_DASHBOARD_TOKEN) {
@@ -494,7 +536,7 @@ export class GoldLapel {
         this._process.on('error', (err) => { stderr += err.message; });
 
         const ready = await Promise.race([
-            _waitForPort('127.0.0.1', this._port, STARTUP_TIMEOUT),
+            _waitForPort('127.0.0.1', this._proxyPort, STARTUP_TIMEOUT),
             new Promise((resolve) => {
                 this._process.on('exit', () => resolve(false));
             }),
@@ -503,14 +545,14 @@ export class GoldLapel {
             this._process.stderr.removeListener('data', onData);
             this._process.kill();
             throw new Error(
-                `Gold Lapel failed to start on port ${this._port} ` +
+                `Gold Lapel failed to start on port ${this._proxyPort} ` +
                 `within ${STARTUP_TIMEOUT / 1000}s.\nstderr: ${stderr}`
             );
         }
 
         this._process.stderr.removeListener('data', onData);
 
-        this._proxyUrl = _makeProxyUrl(this._upstream, this._port);
+        this._proxyUrl = _makeProxyUrl(this._upstream, this._proxyPort);
     }
 
     async _openDefaultConn() {
@@ -533,8 +575,8 @@ export class GoldLapel {
         // banner entirely.
         if (this._silent) return;
         const banner = this._dashboardPort
-            ? `goldlapel → :${this._port} (proxy) | http://127.0.0.1:${this._dashboardPort} (dashboard)`
-            : `goldlapel → :${this._port} (proxy)`;
+            ? `goldlapel → :${this._proxyPort} (proxy) | http://127.0.0.1:${this._dashboardPort} (dashboard)`
+            : `goldlapel → :${this._proxyPort} (proxy)`;
         console.error(banner);
     }
 
@@ -802,10 +844,15 @@ function _call(gl, fn, args) {
  *
  * @param {string} upstream  Postgres connection string (upstream database).
  * @param {object} [opts]
- * @param {number} [opts.port=7932]  Proxy listen port.
- * @param {number} [opts.dashboardPort]  Dashboard port. Defaults to `port + 1` (7933 when `port` is the 7932 default). `0` disables.
+ * @param {number} [opts.proxyPort=7932]  Proxy listen port.
+ * @param {number} [opts.dashboardPort]  Dashboard port. Defaults to `proxyPort + 1` (7933 when `proxyPort` is the 7932 default). `0` disables.
+ * @param {number} [opts.invalidationPort]  Cache-invalidation port. Defaults to `proxyPort + 2`.
  * @param {'trace'|'debug'|'info'|'warn'|'error'} [opts.logLevel]  Binary log level.
- * @param {object} [opts.config]  camelCase → CLI flags (see configKeys()).
+ * @param {string} [opts.mode]  Operating mode (`waiter`, `bellhop`, etc).
+ * @param {string} [opts.license]  Path to the license file.
+ * @param {string} [opts.client]  Client identifier; sets `GOLDLAPEL_CLIENT` for telemetry tagging.
+ * @param {string} [opts.configFile]  Path to a TOML config file for the Rust binary (`--config`).
+ * @param {object} [opts.config]  Structured tuning knobs — camelCase keys → CLI flags (see configKeys()). Top-level concepts listed above are NOT accepted here.
  * @param {string[]} [opts.extraArgs]  Raw CLI flags passed to the binary.
  * @param {boolean} [opts.noConnect]  Skip opening the internal driver connection.
  * @param {boolean} [opts.silent]  Suppress the one-line startup banner (wrapper-only; never forwarded to the binary).

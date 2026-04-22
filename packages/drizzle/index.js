@@ -7,7 +7,7 @@
 // drizzle instance with the proxy URL.
 import { start, wrap } from 'goldlapel'
 
-const DEFAULT_PORT = 7932
+const DEFAULT_PROXY_PORT = 7932
 
 // Resolve the proxy URL from whatever `start()` returned. start() in v0.2
 // returns a GoldLapel instance; older/mocked versions may return a string.
@@ -24,16 +24,16 @@ export async function drizzle(options = {}) {
     if (!url) throw new Error('Gold Lapel: DATABASE_URL not set. Pass { url } or set DATABASE_URL.')
     if (!process.env.GOLDLAPEL_CLIENT) process.env.GOLDLAPEL_CLIENT = 'drizzle'
     const {
-        url: _, port, config, extraArgs, invalidationPort, nativeCache,
+        url: _, proxyPort, config, extraArgs, invalidationPort, nativeCache,
         _start, _drizzle, _wrap, _pg,
         ...drizzleOptions
     } = options
     const startFn = _start || start
     const wrapFn = _wrap || wrap
-    const proxyPort = port ?? DEFAULT_PORT
+    const resolvedProxyPort = proxyPort ?? DEFAULT_PROXY_PORT
     // This plugin builds its own pg.Pool against the proxy URL, so the core
     // wrapper doesn't need to open its own driver connection.
-    const result = await startFn(url, { config, port, extraArgs, noConnect: true })
+    const result = await startFn(url, { config, proxyPort, extraArgs, noConnect: true })
 
     // Resolve proxy URL — start() may return a GoldLapel instance or a URL string
     const proxyUrlStr = _resolveProxyUrl(result)
@@ -45,7 +45,7 @@ export async function drizzle(options = {}) {
     // Wrap pool with L1 native cache unless explicitly disabled
     let client = pool
     if (nativeCache !== false) {
-        const invPort = invalidationPort ?? (proxyPort + 2)
+        const invPort = invalidationPort ?? (resolvedProxyPort + 2)
         client = wrapFn(pool, invPort)
     }
 
@@ -60,7 +60,7 @@ export async function init(options = {}) {
     const startFn = options._start || start
     const result = await startFn(url, {
         config: options.config,
-        port: options.port,
+        proxyPort: options.proxyPort,
         extraArgs: options.extraArgs,
         noConnect: true,
     })

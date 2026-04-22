@@ -473,17 +473,16 @@ describe('silent option', () => {
             `argv must not contain any silent flag: ${args.join(' ')}`);
     });
 
-    it('silent in config object is rejected by _configToArgs (wrapper-only key)', () => {
+    it('silent in config object is rejected at construction (wrapper-only key)', () => {
         // Belt-and-suspenders: even if a user tried to pass silent via config
-        // (e.g. copy-pasted from Python docs), the config validator rejects
-        // it because it's not in VALID_CONFIG_KEYS — the Rust binary has no
-        // --silent flag, so forwarding it would be a silent no-op at best
-        // and a spawn error at worst.
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            config: { silent: true },
-        });
+        // (e.g. copy-pasted from Python docs), the constructor rejects it at
+        // construction time because it's not in VALID_CONFIG_KEYS — the Rust
+        // binary has no --silent flag, so forwarding it would be a silent
+        // no-op at best and a spawn error at worst.
         assert.throws(
-            () => gl._buildSpawnArgs(),
+            () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                config: { silent: true },
+            }),
             /Unknown config keys: silent/,
         );
     });

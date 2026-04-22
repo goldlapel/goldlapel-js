@@ -1,6 +1,6 @@
 import { start, NativeCache } from 'goldlapel'
 
-const DEFAULT_PORT = 7932
+const DEFAULT_PROXY_PORT = 7932
 const READ_OPS = new Set([
     'findFirst', 'findFirstOrThrow',
     'findUnique', 'findUniqueOrThrow',
@@ -42,7 +42,7 @@ function modelToTable(model, tableMap) {
 }
 
 export function cacheExtension(options = {}) {
-    const port = options.invalidationPort ?? options._invalidationPort ?? (DEFAULT_PORT + 2)
+    const port = options.invalidationPort ?? options._invalidationPort ?? (DEFAULT_PROXY_PORT + 2)
     const cache = options._cache || new NativeCache()
     if (!options._cache && !cache._socket) {
         cache.connectInvalidation(port)
@@ -117,7 +117,8 @@ export async function withGoldLapel(options = {}) {
     const startFn = options._start || start
     const result = await startFn(url, {
         config: options.config,
-        port: options.port,
+        proxyPort: options.proxyPort,
+        invalidationPort: options.invalidationPort,
         extraArgs: options.extraArgs,
         // Prisma has its own driver; we don't need the wrapper's internal conn.
         noConnect: true,
@@ -125,8 +126,8 @@ export async function withGoldLapel(options = {}) {
     const proxyUrlStr = _resolveProxyUrl(result)
     process.env.DATABASE_URL = proxyUrlStr
 
-    const proxyPort = options.port ?? DEFAULT_PORT
-    const invPort = options.config?.invalidationPort ?? (proxyPort + 2)
+    const proxyPort = options.proxyPort ?? DEFAULT_PROXY_PORT
+    const invPort = options.invalidationPort ?? (proxyPort + 2)
 
     const PC = options._PrismaClient || (await import('@prisma/client')).PrismaClient
 
@@ -160,7 +161,7 @@ export async function init(options = {}) {
     const startFn = options._start || start
     const result = await startFn(url, {
         config: options.config,
-        port: options.port,
+        proxyPort: options.proxyPort,
         extraArgs: options.extraArgs,
         noConnect: true,
     })

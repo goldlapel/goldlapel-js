@@ -196,7 +196,7 @@ describe('subprocess-cleanup-on-connect-failure', () => {
         // code must handle.
         await assert.rejects(
             () => start('postgresql://u:p@localhost:1/nope', {
-                port,
+                proxyPort: port,
                 silent: true,
             }),
             (err) => {
@@ -238,7 +238,7 @@ describe('subprocess-cleanup-on-connect-failure', () => {
         process.env.GL_FAKE_PIDFILE = pidfile;
 
         const gl = new GoldLapel('postgresql://u:p@localhost:1/nope', {
-            port,
+            proxyPort: port,
             silent: true,
         });
 

@@ -72,8 +72,8 @@ Both `drizzle()` and `init()` accept an options object:
 ```javascript
 const db = await drizzle({
   url: 'postgresql://user:pass@host:5432/mydb',
-  port: 9000,
-  config: { mode: 'waiter', poolSize: 30 },
+  proxyPort: 9000,
+  config: { poolSize: 30 },
   invalidationPort: 9002,
   schema,
   logger: true,
