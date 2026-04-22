@@ -27,9 +27,12 @@
   "author": "Stephen Gibson",
   "license": "MIT",
   "homepage": "https://goldlapel.com",
+  "bugs": {
+    "url": "https://github.com/goldlapel/goldlapel-js/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/goldlapel/goldlapel-js",
+    "url": "git+https://github.com/goldlapel/goldlapel-js.git",
     "directory": "packages/prisma"
   },
   "devDependencies": {

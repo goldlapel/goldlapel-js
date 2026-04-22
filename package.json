@@ -28,7 +28,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/goldlapel/goldlapel-js"
+    "url": "git+https://github.com/goldlapel/goldlapel-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/goldlapel/goldlapel-js/issues"
   },
   "homepage": "https://goldlapel.com",
   "scripts": {
