@@ -52,6 +52,10 @@ jobs:
 
       - name: Run tests
         env:
+          # Standardized integration-test gate — both must be set for
+          # integration tests to run. See test/_integration-gate.js.
+          GOLDLAPEL_INTEGRATION: "1"
+          GOLDLAPEL_TEST_UPSTREAM: postgresql://postgres:postgres@localhost:5432/postgres
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres

@@ -1,12 +1,13 @@
 // End-to-end streams integration test — proxy-owned DDL (Phase 2).
 //
-// Skipped unless both DATABASE_URL + a real goldlapel binary are reachable.
-// Mirrors goldlapel-python/tests/test_streams_integration.py.
+// Gated on GOLDLAPEL_INTEGRATION=1 + GOLDLAPEL_TEST_UPSTREAM — the
+// standardized integration-test convention shared across all Gold Lapel
+// wrappers. See test/_integration-gate.js.
 //
 // Set:
-//   DATABASE_URL=postgresql://postgres@localhost:5432/postgres
-//   GOLDLAPEL_BINARY=/path/to/goldlapel
 //   GOLDLAPEL_INTEGRATION=1
+//   GOLDLAPEL_TEST_UPSTREAM=postgresql://postgres@localhost:5432/postgres
+//   GOLDLAPEL_BINARY=/path/to/goldlapel
 //
 // Without GOLDLAPEL_INTEGRATION=1, the whole file is skipped so ordinary
 // `npm test` runs remain hermetic.
@@ -14,14 +15,24 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const SHOULD_RUN = !!process.env.GOLDLAPEL_INTEGRATION;
-const PG_URL = process.env.DATABASE_URL || 'postgresql://sgibson@localhost:5432/postgres';
+import { integrationGate } from './_integration-gate.js';
 
-if (!SHOULD_RUN) {
-    describe('streams integration (skipped)', { skip: 'set GOLDLAPEL_INTEGRATION=1 to run' }, () => {
+const gate = integrationGate();
+
+if (gate.failReason) {
+    // Half-configured CI — fail loudly to prevent false-green.
+    describe('streams integration (misconfigured)', () => {
+        it('fails when GOLDLAPEL_INTEGRATION=1 but GOLDLAPEL_TEST_UPSTREAM missing', () => {
+            throw new Error(gate.failReason);
+        });
+    });
+} else if (!gate.shouldRun) {
+    describe('streams integration (skipped)', { skip: gate.skipReason }, () => {
         it('skipped', () => {});
     });
 } else {
+
+const PG_URL = gate.upstream;
 
 describe('stream DDL ownership (proxy-owned tables)', () => {
     let goldlapel, gl, pg, streamName;
