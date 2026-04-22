@@ -1,2 +1,7 @@
 node_modules/
 bin/
+
+# Local secrets
+.env
+.env.local
+.env.*.local
