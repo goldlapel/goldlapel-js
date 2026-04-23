@@ -416,6 +416,7 @@ export class GoldLapel {
     constructor(upstream, {
         proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
         client, configFile, config, extraArgs, noConnect, silent,
+        mesh, meshTag,
     } = {}) {
         this._upstream = upstream;
         this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
@@ -445,6 +446,9 @@ export class GoldLapel {
         // argv builder only ever walks `this._config` through _configToArgs,
         // which enforces VALID_CONFIG_KEYS.
         this._silent = !!silent;
+        // Mesh membership (startup intent — HQ enforces license).
+        this._mesh = !!mesh;
+        this._meshTag = meshTag ? String(meshTag) : null;
         // Validate structured-config keys eagerly so a test that constructs
         // without spawning still catches bad keys.
         const unknown = Object.keys(this._config).filter(k => !VALID_CONFIG_KEYS.has(k));
@@ -497,6 +501,12 @@ export class GoldLapel {
         }
         if (this._configFile) {
             args.push('--config', this._configFile);
+        }
+        if (this._mesh) {
+            args.push('--mesh');
+        }
+        if (this._meshTag) {
+            args.push('--mesh-tag', this._meshTag);
         }
         args.push(..._configToArgs(this._config));
         args.push(...this._extraArgs);
@@ -858,6 +868,8 @@ function _call(gl, fn, args) {
  * @param {string[]} [opts.extraArgs]  Raw CLI flags passed to the binary.
  * @param {boolean} [opts.noConnect]  Skip opening the internal driver connection.
  * @param {boolean} [opts.silent]  Suppress the one-line startup banner (wrapper-only; never forwarded to the binary).
+ * @param {boolean} [opts.mesh]  Opt into the mesh at startup. HQ enforces the license; denial is non-fatal — proxy runs without clustering.
+ * @param {string}  [opts.meshTag]  Mesh tag — instances sharing a tag cluster together.
  * @returns {Promise<GoldLapel>}
  */
 export async function start(upstream, opts = {}) {

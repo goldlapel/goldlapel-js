@@ -404,6 +404,72 @@ describe('configToArgs', () => {
 });
 
 
+describe('mesh startup options', () => {
+    // Top-level canonical-surface options: mesh (bool) + meshTag (string).
+    // Translate to --mesh / --mesh-tag CLI flags; never valid inside `config`.
+
+    it('defaults to disabled', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.strictEqual(gl._mesh, false);
+        assert.strictEqual(gl._meshTag, null);
+    });
+
+    it('stores mesh=true', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { mesh: true });
+        assert.strictEqual(gl._mesh, true);
+    });
+
+    it('stores meshTag', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            mesh: true, meshTag: 'prod-east',
+        });
+        assert.strictEqual(gl._meshTag, 'prod-east');
+    });
+
+    it('emits --mesh and --mesh-tag flags when set', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            mesh: true, meshTag: 'prod-east',
+        });
+        const args = gl._buildSpawnArgs();
+        assert.ok(args.includes('--mesh'));
+        const idx = args.indexOf('--mesh-tag');
+        assert.ok(idx >= 0);
+        assert.strictEqual(args[idx + 1], 'prod-east');
+    });
+
+    it('omits --mesh flags when unset', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        const args = gl._buildSpawnArgs();
+        assert.ok(!args.includes('--mesh'));
+        assert.ok(!args.includes('--mesh-tag'));
+    });
+
+    it('emits --mesh alone when meshTag omitted', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { mesh: true });
+        const args = gl._buildSpawnArgs();
+        assert.ok(args.includes('--mesh'));
+        assert.ok(!args.includes('--mesh-tag'));
+    });
+
+    it('rejects mesh / meshTag inside config map', () => {
+        for (const bad of ['mesh', 'meshTag']) {
+            assert.throws(
+                () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                    config: { [bad]: true },
+                }),
+                { message: new RegExp(`Unknown config keys: ${bad}`) },
+            );
+        }
+    });
+
+    it('mesh / meshTag are not valid config keys', () => {
+        const keys = configKeys();
+        assert.ok(!keys.has('mesh'));
+        assert.ok(!keys.has('meshTag'));
+    });
+});
+
+
 describe('configKeys', () => {
     it('returns a Set of valid config keys', () => {
         const keys = configKeys();
