@@ -9,6 +9,7 @@ import { platform, arch } from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import {
+    validateIdentifier,
     publish, subscribe, enqueue, dequeue,
     incr, getCounter,
     zadd, zincrby, zrange, zrank, zscore, zrem,
@@ -669,6 +670,7 @@ export class GoldLapel {
 
     // Fetch (and cache per-instance) canonical DDL + query patterns for a helper.
     async _streamPatterns(stream) {
+        validateIdentifier(stream);
         const ddl = await import('./ddl.js');
         const token = this._dashboardToken || ddl.tokenFromEnvOrFile();
         return ddl.fetchPatterns(this, 'stream', stream, this._dashboardPort, token);

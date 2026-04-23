@@ -1,4 +1,4 @@
-function validateIdentifier(name) {
+export function validateIdentifier(name) {
     if (typeof name !== 'string' || name.length === 0) {
         throw new Error('Identifier must be a non-empty string');
     }
