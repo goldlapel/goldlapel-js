@@ -23,9 +23,13 @@
     "proxy",
     "optimization",
     "materialized-views",
-    "database"
+    "database",
+    "cache",
+    "redis-compat",
+    "mongo-compat",
+    "query-optimization"
   ],
-  "author": "Stephen Gibson",
+  "author": "The Waiter of Gold Lapel <thewaiter@goldlapel.com>",
   "license": "MIT",
   "repository": {
     "type": "git",
