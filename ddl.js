@@ -22,6 +22,11 @@ import { join } from 'path';
 const SUPPORTED_VERSIONS = {
     stream: 'v1',
     doc_store: 'v1',
+    counter: 'v1',
+    zset: 'v1',
+    hash: 'v1',
+    queue: 'v1',
+    geo: 'v1',
 };
 
 // Per-instance cache. WeakMap so entries are GC'd with the owner.

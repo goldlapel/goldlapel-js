@@ -4,10 +4,60 @@
 
 ### Breaking changes
 
-**Doc-store and stream methods moved under nested namespaces.** The flat
-`gl.doc*` and `gl.stream*` methods are gone; document and stream operations
-now live under `gl.documents.<verb>` and `gl.streams.<verb>`. No
-backwards-compat aliases — search and replace once.
+**Phase 5 — Redis-compat helpers moved under nested namespaces.** The flat
+counter / zset / hash / queue / geo methods are gone; each family lives
+under its own sub-API. No backwards-compat aliases — search and replace
+once. The new schemas have richer semantics than the old fire-and-forget
+helpers, so a one-time migration is the right cost: `gl.queues.claim` /
+`gl.queues.ack` replaces `gl.dequeue` (at-least-once with visibility
+timeout, not lossy delete-on-fetch); `gl.zsets.add(name, zsetKey, …)` adds
+a `zsetKey` column so one namespace table holds many sorted sets;
+`gl.hashes` is row-per-field instead of JSONB-blob-per-key; `gl.geos` is
+GEOGRAPHY-native and idempotent on the member name.
+
+Migration map (Phase 5):
+
+| Old (flat)                                | New (nested)                              |
+| ----------------------------------------- | ----------------------------------------- |
+| `gl.incr(name, key, n)`                   | `gl.counters.incr(name, key, n)`          |
+| `gl.getCounter(name, key)`                | `gl.counters.get(name, key)`              |
+| `gl.zadd(name, member, score)`            | `gl.zsets.add(name, zsetKey, member, score)` |
+| `gl.zincrby(name, member, delta)`         | `gl.zsets.incrBy(name, zsetKey, member, delta)` |
+| `gl.zrange(name, start, stop, desc)`      | `gl.zsets.range(name, zsetKey, { start, stop, desc })` |
+| `gl.zrank(name, member, desc)`            | `gl.zsets.rank(name, zsetKey, member, { desc })` |
+| `gl.zscore(name, member)`                 | `gl.zsets.score(name, zsetKey, member)`   |
+| `gl.zrem(name, member)`                   | `gl.zsets.remove(name, zsetKey, member)`  |
+| `gl.hset(name, key, field, value)`        | `gl.hashes.set(name, hashKey, field, value)` |
+| `gl.hget(name, key, field)`               | `gl.hashes.get(name, hashKey, field)`     |
+| `gl.hgetall(name, key)`                   | `gl.hashes.getAll(name, hashKey)`         |
+| `gl.hdel(name, key, field)`               | `gl.hashes.delete(name, hashKey, field)`  |
+| `gl.enqueue(name, payload)`               | `gl.queues.enqueue(name, payload)`        |
+| `gl.dequeue(name)` (delete-on-fetch)      | `gl.queues.claim(name)` + `gl.queues.ack(name, id)` (at-least-once) |
+| `gl.geoadd(name, …)` (GEOMETRY, BIGSERIAL pk) | `gl.geos.add(name, member, lon, lat)` (GEOGRAPHY, member pk, idempotent) |
+| `gl.georadius(name, …)`                   | `gl.geos.radius(name, lon, lat, radius, { unit, limit })` |
+| `gl.geodist(name, …)`                     | `gl.geos.dist(name, memberA, memberB, { unit })` |
+
+Schema/contract changes worth knowing about:
+
+- **counter**: every UPDATE path stamps `updated_at = NOW()` (proxy-side).
+- **zset**: schema gains `zset_key` column; one namespace table now holds
+  many sorted sets, partitioned by `zset_key`.
+- **hash**: storage flips from JSONB-blob-per-key to row-per-(hash_key,
+  field). `set` is a single-row UPSERT; `getAll` rebuilds a JS object from
+  rows.
+- **queue**: at-least-once delivery with visibility timeout. `dequeue`
+  (delete-on-fetch, lossy on consumer crash) is gone. Use `claim` →
+  process → `ack` (or `abandon` to release the lease without ack). No
+  `dequeue` compat shim — explicit by design.
+- **geo**: column type is GEOGRAPHY (not GEOMETRY); `member` is the
+  primary key. Re-adding a member updates its location (idempotent).
+  Distances are meters-native; methods accept `{ unit: 'm' | 'km' | 'mi' |
+  'ft' }`.
+
+**Phase 4 — Doc-store and stream methods moved under nested namespaces.**
+The flat `gl.doc*` and `gl.stream*` methods are gone; document and stream
+operations now live under `gl.documents.<verb>` and `gl.streams.<verb>`.
+No backwards-compat aliases — search and replace once.
 
 Migration map:
 
@@ -41,10 +91,9 @@ Migration map:
 | `gl.streamAck(name, group, id)`           | `gl.streams.ack(name, group, id)`         |
 | `gl.streamClaim(name, g, c, ...)`         | `gl.streams.claim(name, g, c, ...)`       |
 
-Other namespaces (`gl.search`, `gl.publish` / `gl.subscribe`, `gl.incr`,
-`gl.zadd`, `gl.hset`, `gl.geoadd`, …) remain flat and will migrate to
-nested form in subsequent releases (one namespace per schema-to-core
-phase).
+Other namespaces (`gl.search`, `gl.publish` / `gl.subscribe`,
+`gl.percolate*`, `gl.analyze`, …) remain flat and will migrate to nested
+form in subsequent releases (one namespace per schema-to-core phase).
 
 The standalone `utils.js` exports (`docInsert`, `docFind`, …) still exist
 but now require a `patterns` argument supplied by the proxy; direct callers

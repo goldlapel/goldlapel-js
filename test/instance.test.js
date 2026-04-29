@@ -122,34 +122,6 @@ describe('wrapper methods delegate to default conn', () => {
         assert.ok(sql.includes("to_tsvector($1, coalesce(body, ''))"));
     });
 
-    it('incr delegates with spread args', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        gl._defaultConn = mockClient({ rows: [{ value: '5' }], rowCount: 1 });
-
-        const result = await gl.incr('counters', 'page_views', 1);
-        assert.strictEqual(result, 5);
-    });
-
-    it('hset delegates with spread args', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        gl._defaultConn = mockClient({ rows: [], rowCount: 0 });
-
-        await gl.hset('cache', 'session1', 'user', { id: 42 });
-        // CREATE TABLE + INSERT = 2 calls
-        assert.strictEqual(gl._defaultConn._calls.length, 2);
-        assert.ok(gl._defaultConn._calls[1].text.includes('jsonb_build_object'));
-    });
-
-    it('zadd delegates with spread args', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        gl._defaultConn = mockClient({ rows: [], rowCount: 0 });
-
-        await gl.zadd('leaderboard', 'player1', 100);
-        // CREATE TABLE + INSERT = 2 calls
-        assert.strictEqual(gl._defaultConn._calls.length, 2);
-        assert.ok(gl._defaultConn._calls[1].text.includes('INSERT INTO leaderboard'));
-    });
-
     it('publish delegates with spread args', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         gl._defaultConn = mockClient({ rows: [], rowCount: 0 });
@@ -197,14 +169,6 @@ describe('wrapper methods throw before conn is available', () => {
         );
     });
 
-    it('hset throws', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        await assert.rejects(
-            () => gl.hset('cache', 'k', 'f', 'v'),
-            /Not connected/
-        );
-    });
-
     it('gl.documents.find throws', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         // Before start(), there's no dashboard token + no default conn —
@@ -229,7 +193,10 @@ describe('wrapper methods throw before conn is available', () => {
 
 describe('all wrapper methods exist', () => {
     // Note: doc* and stream* methods moved under gl.documents.<verb> /
-    // gl.streams.<verb> in Phase 4. Other namespaces stay flat for now.
+    // gl.streams.<verb> in Phase 4. Phase 5 moved the Redis-compat helpers
+    // (counter / zset / hash / queue / geo) to their own namespaces too.
+    // Search / pub-sub / analysis / misc stay flat — they'll migrate when
+    // their own schema-to-core phase fires.
     const expectedMethods = [
         // Search
         'search', 'searchFuzzy', 'searchPhonetic', 'similar', 'suggest',
@@ -238,16 +205,8 @@ describe('all wrapper methods exist', () => {
         'percolateAdd', 'percolate', 'percolateDelete',
         // Analysis
         'analyze', 'explainScore',
-        // Pub/Sub & Queues
-        'publish', 'subscribe', 'enqueue', 'dequeue',
-        // Counters
-        'incr', 'getCounter',
-        // Hash maps
-        'hset', 'hget', 'hgetall', 'hdel',
-        // Sorted sets
-        'zadd', 'zincrby', 'zrange', 'zrank', 'zscore', 'zrem',
-        // Geo
-        'geoadd', 'georadius', 'geodist',
+        // Pub/Sub
+        'publish', 'subscribe',
         // Misc
         'countDistinct', 'script',
     ];
@@ -260,13 +219,38 @@ describe('all wrapper methods exist', () => {
         });
     }
 
-    it('count matches expected total (34)', () => {
-        assert.strictEqual(expectedMethods.length, 34);
+    it('count matches expected total (17)', () => {
+        assert.strictEqual(expectedMethods.length, 17);
     });
 
-    it('has gl.documents and gl.streams sub-APIs', () => {
+    it('has all Phase 4 + Phase 5 sub-APIs', async () => {
+        const { CountersAPI, ZsetsAPI, HashesAPI, QueuesAPI, GeosAPI } = await import('../index.js');
         assert.ok(gl.documents instanceof DocumentsAPI);
         assert.ok(gl.streams instanceof StreamsAPI);
+        assert.ok(gl.counters instanceof CountersAPI);
+        assert.ok(gl.zsets instanceof ZsetsAPI);
+        assert.ok(gl.hashes instanceof HashesAPI);
+        assert.ok(gl.queues instanceof QueuesAPI);
+        assert.ok(gl.geos instanceof GeosAPI);
+    });
+
+    it('Phase 5 hard cut — legacy flat methods are gone (no aliases)', () => {
+        // Per CLAUDE.md / master-plan no-aliases rule: every Phase-5 helper
+        // moved to its sub-API namespace. Search/replace migration on
+        // upgrade; no compat shims.
+        const removed = [
+            'incr', 'getCounter',
+            'hset', 'hget', 'hgetall', 'hdel',
+            'zadd', 'zincrby', 'zrange', 'zrank', 'zscore', 'zrem',
+            'geoadd', 'georadius', 'geodist',
+            'enqueue', 'dequeue',
+        ];
+        for (const legacy of removed) {
+            assert.strictEqual(
+                gl[legacy], undefined,
+                `Phase 5 removed flat ${legacy} — use gl.<family>.<verb> instead.`,
+            );
+        }
     });
 
     it('list matches actual public wrapper surface', () => {

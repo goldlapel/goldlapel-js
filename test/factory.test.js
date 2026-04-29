@@ -27,8 +27,8 @@ describe('gl.using(conn, callback)', () => {
         gl._defaultConn = def;
 
         await gl.using(override, async (g) => {
-            await g.incr('counters', 'x');
-            await g.incr('counters', 'y');
+            await g.publish('events', 'x');
+            await g.publish('events', 'y');
         });
 
         assert.strictEqual(def._calls.length, 0, 'default conn untouched inside using()');
