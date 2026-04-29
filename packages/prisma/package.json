@@ -6,7 +6,10 @@
   "main": "index.js",
   "exports": "./index.js",
   "files": [
-    "index.js"
+    "index.js",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE"
   ],
   "peerDependencies": {
     "@prisma/client": "^5.22.0",

@@ -90,8 +90,29 @@ const prisma = await withGoldLapel({
 
 ## Re-exports
 
-For convenience, `@goldlapel/prisma` re-exports from `@goldlapel/goldlapel`:
+For convenience, `@goldlapel/prisma` re-exports the core wrapper surface from `goldlapel`:
 
 ```javascript
-import { start, stop, proxyUrl, GoldLapel, NativeCache } from '@goldlapel/prisma'
+import {
+  start, GoldLapel, NativeCache,
+  DocumentsAPI, StreamsAPI,
+} from '@goldlapel/prisma'
 ```
+
+`DocumentsAPI` and `StreamsAPI` are exported for type-checking / extension.
+
+### Document store and streams
+
+The flat `docInsert` / `docFind` / `streamAdd` / etc. utility re-exports were removed. Document-store and stream operations now live on the `GoldLapel` instance under the `documents` and `streams` namespaces — call them after `start()`:
+
+```javascript
+import { start } from '@goldlapel/prisma'
+
+const gl = await start(process.env.DATABASE_URL)
+await gl.documents.insert('users', { name: 'Alice' })
+const alice = await gl.documents.findOne('users', { name: 'Alice' })
+await gl.streams.add('events', { kind: 'login', userId: alice._id })
+await gl.stop()
+```
+
+`withGoldLapel()` and `init()` are still the recommended entry points for ORM-only usage; reach for `start()` only when you also want the doc-store / stream APIs.
