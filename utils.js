@@ -945,48 +945,67 @@ function buildFilter(filterDict, startParam = 1) {
     };
 }
 
-async function ensureCollection(client, collection, { unlogged = false } = {}) {
-    const prefix = unlogged ? 'CREATE UNLOGGED TABLE' : 'CREATE TABLE';
-    await client.query(
-        `${prefix} IF NOT EXISTS ${collection} (` +
-        `_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), ` +
-        `data JSONB NOT NULL, ` +
-        `created_at TIMESTAMPTZ DEFAULT NOW())`
-    );
+// Resolve the canonical doc-store table name from proxy-fetched patterns.
+// Returns the FQ table name (e.g. `_goldlapel.doc_users`). Throws if
+// `patterns` is missing — the wrapper API never builds DDL itself anymore;
+// `gl.documents.<verb>(...)` always supplies patterns.
+function _docTable(patterns, fn) {
+    if (!patterns || !patterns.tables || !patterns.tables.main) {
+        throw new Error(
+            `${fn} requires DDL patterns from the proxy — call via ` +
+            `\`gl.documents.${fn.replace(/^doc/, '').replace(/^./, c => c.toLowerCase())}(...)\` ` +
+            `rather than the utils function directly.`
+        );
+    }
+    return patterns.tables.main;
 }
 
-export async function docCreateCollection(client, collection, { unlogged = false } = {}) {
-    validateIdentifier(collection);
-    await ensureCollection(client, collection, { unlogged });
+// Build a deterministic index name from a (possibly schema-qualified) table
+// reference. Strips any `schema.` prefix so the index name doesn't contain
+// a dot — Postgres rejects those without quoting.
+function _docIndexName(table, suffix) {
+    const bare = table.includes('.') ? table.slice(table.lastIndexOf('.') + 1) : table;
+    return `idx_${bare}_${suffix}`;
 }
 
-export async function docInsert(client, collection, document) {
+export async function docCreateCollection(client, collection, { patterns } = {}) {
     validateIdentifier(collection);
-    await ensureCollection(client, collection);
+    // Calling _patterns on DocumentsAPI already issued the create — nothing
+    // left to do on the wrapper side. We accept `patterns` undefined so direct
+    // `docCreateCollection(client, "users")` calls fail loud instead of
+    // silently doing nothing.
+    _docTable(patterns, 'docCreateCollection');
+    // No commit: the proxy already executed the DDL on its mgmt connection.
+}
+
+export async function docInsert(client, collection, document, { patterns } = {}) {
+    validateIdentifier(collection);
+    const table = _docTable(patterns, 'docInsert');
     const result = await client.query(
-        `INSERT INTO ${collection} (data) VALUES ($1::jsonb) RETURNING _id, data, created_at`,
+        `INSERT INTO ${table} (data) VALUES ($1::jsonb) RETURNING _id, data, created_at`,
         [JSON.stringify(document)]
     );
     return result.rows[0];
 }
 
-export async function docInsertMany(client, collection, documents) {
+export async function docInsertMany(client, collection, documents, { patterns } = {}) {
     validateIdentifier(collection);
-    await ensureCollection(client, collection);
+    const table = _docTable(patterns, 'docInsertMany');
     const placeholders = documents.map((_, i) => `($${i + 1}::jsonb)`).join(', ');
     const params = documents.map(d => JSON.stringify(d));
     const result = await client.query(
-        `INSERT INTO ${collection} (data) VALUES ${placeholders} RETURNING _id, data, created_at`,
+        `INSERT INTO ${table} (data) VALUES ${placeholders} RETURNING _id, data, created_at`,
         params
     );
     return result.rows;
 }
 
-export async function docFind(client, collection, filter, { sort, limit, skip } = {}) {
+export async function docFind(client, collection, filter, { sort, limit, skip, patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docFind');
     const { clause, params, nextParam } = buildFilter(filter);
     let paramIdx = nextParam;
-    let sql = `SELECT _id, data, created_at FROM ${collection}`;
+    let sql = `SELECT _id, data, created_at FROM ${table}`;
     if (clause) {
         sql += ` WHERE ${clause}`;
     }
@@ -1014,11 +1033,12 @@ export async function docFind(client, collection, filter, { sort, limit, skip } 
     return result.rows;
 }
 
-export async function* docFindCursor(client, collection, filter = null, { sort, limit, skip, batchSize = 100 } = {}) {
+export async function* docFindCursor(client, collection, filter = null, { sort, limit, skip, batchSize = 100, patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docFindCursor');
     const { clause, params, nextParam } = buildFilter(filter);
     let paramIdx = nextParam;
-    let sql = `SELECT _id, data, created_at FROM ${collection}`;
+    let sql = `SELECT _id, data, created_at FROM ${table}`;
     if (clause) {
         sql += ` WHERE ${clause}`;
     }
@@ -1058,10 +1078,11 @@ export async function* docFindCursor(client, collection, filter = null, { sort, 
     }
 }
 
-export async function docFindOne(client, collection, filter) {
+export async function docFindOne(client, collection, filter, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docFindOne');
     const { clause, params } = buildFilter(filter);
-    let sql = `SELECT _id, data, created_at FROM ${collection}`;
+    let sql = `SELECT _id, data, created_at FROM ${table}`;
     if (clause) {
         sql += ` WHERE ${clause}`;
     }
@@ -1070,93 +1091,100 @@ export async function docFindOne(client, collection, filter) {
     return result.rows[0] || null;
 }
 
-export async function docUpdate(client, collection, filter, update) {
+export async function docUpdate(client, collection, filter, update, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docUpdate');
     const { clause, params: filterParams, nextParam } = buildFilter(filter);
     const upd = buildUpdate(update, nextParam);
     const allParams = [...filterParams, ...upd.params];
     const where = clause || 'TRUE';
     const result = await client.query(
-        `UPDATE ${collection} SET data = ${upd.expr} WHERE ${where}`,
+        `UPDATE ${table} SET data = ${upd.expr} WHERE ${where}`,
         allParams
     );
     return result.rowCount;
 }
 
-export async function docUpdateOne(client, collection, filter, update) {
+export async function docUpdateOne(client, collection, filter, update, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docUpdateOne');
     const { clause, params: filterParams, nextParam } = buildFilter(filter);
     const upd = buildUpdate(update, nextParam);
     const allParams = [...filterParams, ...upd.params];
     const where = clause || 'TRUE';
     const result = await client.query(
         `WITH target AS (` +
-        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
-        `) UPDATE ${collection} SET data = ${upd.expr} ` +
-        `FROM target WHERE ${collection}._id = target._id`,
+        `SELECT _id FROM ${table} WHERE ${where} LIMIT 1` +
+        `) UPDATE ${table} SET data = ${upd.expr} ` +
+        `FROM target WHERE ${table}._id = target._id`,
         allParams
     );
     return result.rowCount;
 }
 
-export async function docDelete(client, collection, filter) {
+export async function docDelete(client, collection, filter, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docDelete');
     const { clause, params } = buildFilter(filter);
     const where = clause || 'TRUE';
     const result = await client.query(
-        `DELETE FROM ${collection} WHERE ${where}`,
+        `DELETE FROM ${table} WHERE ${where}`,
         params
     );
     return result.rowCount;
 }
 
-export async function docDeleteOne(client, collection, filter) {
+export async function docDeleteOne(client, collection, filter, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docDeleteOne');
     const { clause, params } = buildFilter(filter);
     const where = clause || 'TRUE';
     const result = await client.query(
         `WITH target AS (` +
-        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
-        `) DELETE FROM ${collection} USING target WHERE ${collection}._id = target._id`,
+        `SELECT _id FROM ${table} WHERE ${where} LIMIT 1` +
+        `) DELETE FROM ${table} USING target WHERE ${table}._id = target._id`,
         params
     );
     return result.rowCount;
 }
 
-export async function docFindOneAndUpdate(client, collection, filter, update) {
+export async function docFindOneAndUpdate(client, collection, filter, update, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docFindOneAndUpdate');
     const { clause, params: filterParams, nextParam } = buildFilter(filter);
     const upd = buildUpdate(update, nextParam);
     const allParams = [...filterParams, ...upd.params];
     const where = clause || 'TRUE';
     const result = await client.query(
         `WITH target AS (` +
-        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
-        `) UPDATE ${collection} SET data = ${upd.expr} ` +
-        `FROM target WHERE ${collection}._id = target._id ` +
-        `RETURNING ${collection}._id, ${collection}.data, ${collection}.created_at`,
+        `SELECT _id FROM ${table} WHERE ${where} LIMIT 1` +
+        `) UPDATE ${table} SET data = ${upd.expr} ` +
+        `FROM target WHERE ${table}._id = target._id ` +
+        `RETURNING ${table}._id, ${table}.data, ${table}.created_at`,
         allParams
     );
     return result.rows[0] || null;
 }
 
-export async function docFindOneAndDelete(client, collection, filter) {
+export async function docFindOneAndDelete(client, collection, filter, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docFindOneAndDelete');
     const { clause, params } = buildFilter(filter);
     const where = clause || 'TRUE';
     const result = await client.query(
         `WITH target AS (` +
-        `SELECT _id FROM ${collection} WHERE ${where} LIMIT 1` +
-        `) DELETE FROM ${collection} USING target ` +
-        `WHERE ${collection}._id = target._id ` +
-        `RETURNING ${collection}._id, ${collection}.data, ${collection}.created_at`,
+        `SELECT _id FROM ${table} WHERE ${where} LIMIT 1` +
+        `) DELETE FROM ${table} USING target ` +
+        `WHERE ${table}._id = target._id ` +
+        `RETURNING ${table}._id, ${table}.data, ${table}.created_at`,
         params
     );
     return result.rows[0] || null;
 }
 
-export async function docDistinct(client, collection, field, filter = null) {
+export async function docDistinct(client, collection, field, filter = null, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docDistinct');
     for (const part of field.split('.')) {
         if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(part)) {
             throw new Error(`Invalid field key: ${field}`);
@@ -1168,15 +1196,16 @@ export async function docDistinct(client, collection, field, filter = null) {
     if (clause) {
         whereParts.push(clause);
     }
-    const sql = `SELECT DISTINCT ${fp} FROM ${collection} WHERE ${whereParts.join(' AND ')}`;
+    const sql = `SELECT DISTINCT ${fp} FROM ${table} WHERE ${whereParts.join(' AND ')}`;
     const result = await client.query(sql, params.length > 0 ? params : undefined);
     return result.rows.map(row => Object.values(row)[0]);
 }
 
-export async function docCount(client, collection, filter) {
+export async function docCount(client, collection, filter, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docCount');
     const { clause, params } = buildFilter(filter);
-    let sql = `SELECT COUNT(*) FROM ${collection}`;
+    let sql = `SELECT COUNT(*) FROM ${table}`;
     if (clause) {
         sql += ` WHERE ${clause}`;
     }
@@ -1353,8 +1382,13 @@ function buildGroup(group, unwindMap) {
     return { selectParts, groupBy, aliases };
 }
 
-export async function docAggregate(client, collection, pipeline) {
+// `lookupTables` is a `{userCollectionName: canonicalProxyTable}` map used to
+// rewrite `$lookup.from` references to their proxy-canonical FQ tables
+// (`_goldlapel.doc_<name>`). Supplied by `gl.documents.aggregate` — direct
+// util callers may omit it (in which case `from` is used verbatim).
+export async function docAggregate(client, collection, pipeline, { patterns, lookupTables } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docAggregate');
 
     const params = [];
     let paramIdx = 1;
@@ -1439,8 +1473,13 @@ export async function docAggregate(client, collection, pipeline) {
             if (!fieldKeyPattern.test(spec.as)) {
                 throw new Error(`Invalid as: ${spec.as}`);
             }
+            // Resolve `from` to the canonical proxy table when the caller
+            // (gl.documents.aggregate) supplied a lookup map. Without a map,
+            // direct util callers are responsible for using fully-qualified
+            // names if they want anything other than `public.<from>`.
+            const fromTable = (lookupTables && lookupTables[spec.from]) || spec.from;
             lookupParts.push(
-                `COALESCE((SELECT json_agg(b.data) FROM ${spec.from} b WHERE b.data->>'${spec.foreignField}' = ${collection}.data->>'${spec.localField}'), '[]'::json) AS ${spec.as}`
+                `COALESCE((SELECT json_agg(b.data) FROM ${fromTable} b WHERE b.data->>'${spec.foreignField}' = ${table}.data->>'${spec.localField}'), '[]'::json) AS ${spec.as}`
             );
         } else if (op === '$sort') {
             const sortEntries = Object.entries(stage.$sort);
@@ -1479,9 +1518,9 @@ export async function docAggregate(client, collection, pipeline) {
     }
 
     // Build FROM clause
-    let fromClause = collection;
+    let fromClause = table;
     if (fromClauses.length > 0) {
-        fromClause = `${collection}, ${fromClauses.join(', ')}`;
+        fromClause = `${table}, ${fromClauses.join(', ')}`;
     }
 
     let sql = `SELECT ${select} FROM ${fromClause}`;
@@ -1505,11 +1544,19 @@ export async function docAggregate(client, collection, pipeline) {
     return result.rows;
 }
 
-export async function docCreateIndex(client, collection, keys) {
+// Helper: derive a "bare" identifier from a possibly schema-qualified table
+// name. Used to name triggers/functions that can't carry a schema dot.
+function _bareName(table) {
+    return table.includes('.') ? table.slice(table.lastIndexOf('.') + 1) : table;
+}
+
+export async function docCreateIndex(client, collection, keys, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docCreateIndex');
     if (!keys || Object.keys(keys).length === 0) {
+        const idxName = _docIndexName(table, 'gin');
         await client.query(
-            `CREATE INDEX IF NOT EXISTS ${collection}_data_gin ON ${collection} USING GIN (data)`
+            `CREATE INDEX IF NOT EXISTS ${idxName} ON ${table} USING GIN (data)`
         );
         return;
     }
@@ -1519,19 +1566,22 @@ export async function docCreateIndex(client, collection, keys) {
         }
         const order = dir === -1 ? 'DESC' : 'ASC';
         const safeName = key.replace(/\./g, '_');
+        const idxName = _docIndexName(table, `${safeName}_idx`);
         await client.query(
-            `CREATE INDEX IF NOT EXISTS ${collection}_${safeName}_idx ON ${collection} ((data->>'${key}') ${order})`
+            `CREATE INDEX IF NOT EXISTS ${idxName} ON ${table} ((data->>'${key}') ${order})`
         );
     }
 }
 
 // ─── Change Streams ───────────────────────────────────────────────────────
 
-export async function docWatch(client, collection, callback) {
+export async function docWatch(client, collection, callback, { patterns } = {}) {
     validateIdentifier(collection);
-    const channel = `${collection}_changes`;
-    const funcName = `${collection}_notify_fn`;
-    const triggerName = `${collection}_notify_trg`;
+    const table = _docTable(patterns, 'docWatch');
+    const bare = _bareName(table);
+    const channel = `${bare}_changes`;
+    const funcName = `${bare}_notify_fn`;
+    const triggerName = `${bare}_notify_trg`;
 
     await client.query(`
         CREATE OR REPLACE FUNCTION ${funcName}()
@@ -1554,7 +1604,7 @@ export async function docWatch(client, collection, callback) {
     // dropped one. GL targets PG14+ across the product, so this is safe.
     await client.query(`
         CREATE OR REPLACE TRIGGER ${triggerName}
-        AFTER INSERT OR UPDATE OR DELETE ON ${collection}
+        AFTER INSERT OR UPDATE OR DELETE ON ${table}
         FOR EACH ROW EXECUTE FUNCTION ${funcName}()
     `);
 
@@ -1577,39 +1627,43 @@ export async function docWatch(client, collection, callback) {
     };
 }
 
-export async function docUnwatch(client, collection) {
+export async function docUnwatch(client, collection, { patterns } = {}) {
     validateIdentifier(collection);
-    const channel = `${collection}_changes`;
-    const funcName = `${collection}_notify_fn`;
-    const triggerName = `${collection}_notify_trg`;
+    const table = _docTable(patterns, 'docUnwatch');
+    const bare = _bareName(table);
+    const channel = `${bare}_changes`;
+    const funcName = `${bare}_notify_fn`;
+    const triggerName = `${bare}_notify_trg`;
 
-    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}`);
+    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${table}`);
     await client.query(`DROP FUNCTION IF EXISTS ${funcName}()`);
     await client.query(`UNLISTEN ${channel}`);
 }
 
 // ─── TTL Indexes ──────────────────────────────────────────────────────────
 
-export async function docCreateTtlIndex(client, collection, expireAfterSeconds, { field = 'created_at' } = {}) {
+export async function docCreateTtlIndex(client, collection, expireAfterSeconds, { field = 'created_at', patterns } = {}) {
     validateIdentifier(collection);
     validateIdentifier(field);
     if (typeof expireAfterSeconds !== 'number' || expireAfterSeconds <= 0) {
         throw new Error('expireAfterSeconds must be a positive number');
     }
+    const table = _docTable(patterns, 'docCreateTtlIndex');
+    const bare = _bareName(table);
 
-    const idxName = `${collection}_ttl_idx`;
-    const funcName = `${collection}_ttl_fn`;
-    const triggerName = `${collection}_ttl_trg`;
+    const idxName = `${bare}_ttl_idx`;
+    const funcName = `${bare}_ttl_fn`;
+    const triggerName = `${bare}_ttl_trg`;
 
     await client.query(
-        `CREATE INDEX IF NOT EXISTS ${idxName} ON ${collection} (${field})`
+        `CREATE INDEX IF NOT EXISTS ${idxName} ON ${table} (${field})`
     );
 
     await client.query(`
         CREATE OR REPLACE FUNCTION ${funcName}()
         RETURNS TRIGGER LANGUAGE plpgsql AS $$
         BEGIN
-            DELETE FROM ${collection} WHERE ${field} < NOW() - INTERVAL '${Number(expireAfterSeconds)} seconds';
+            DELETE FROM ${table} WHERE ${field} < NOW() - INTERVAL '${Number(expireAfterSeconds)} seconds';
             RETURN NEW;
         END;
         $$
@@ -1619,44 +1673,49 @@ export async function docCreateTtlIndex(client, collection, expireAfterSeconds, 
     // race documented in docWatch.
     await client.query(`
         CREATE OR REPLACE TRIGGER ${triggerName}
-        BEFORE INSERT ON ${collection}
+        BEFORE INSERT ON ${table}
         FOR EACH ROW EXECUTE FUNCTION ${funcName}()
     `);
 }
 
-export async function docRemoveTtlIndex(client, collection) {
+export async function docRemoveTtlIndex(client, collection, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docRemoveTtlIndex');
+    const bare = _bareName(table);
 
-    const idxName = `${collection}_ttl_idx`;
-    const funcName = `${collection}_ttl_fn`;
-    const triggerName = `${collection}_ttl_trg`;
+    const idxName = `${bare}_ttl_idx`;
+    const funcName = `${bare}_ttl_fn`;
+    const triggerName = `${bare}_ttl_trg`;
 
-    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}`);
+    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${table}`);
     await client.query(`DROP FUNCTION IF EXISTS ${funcName}()`);
     await client.query(`DROP INDEX IF EXISTS ${idxName}`);
 }
 
 // ─── Capped Collections ──────────────────────────────────────────────────
 
-export async function docCreateCapped(client, collection, maxDocuments) {
+export async function docCreateCapped(client, collection, maxDocuments, { patterns } = {}) {
     validateIdentifier(collection);
     if (typeof maxDocuments !== 'number' || maxDocuments <= 0) {
         throw new Error('maxDocuments must be a positive number');
     }
+    const table = _docTable(patterns, 'docCreateCapped');
+    const bare = _bareName(table);
 
-    await ensureCollection(client, collection);
+    // No ensureCollection — proxy already created the table when the
+    // sub-API fetched patterns.
 
-    const funcName = `${collection}_cap_fn`;
-    const triggerName = `${collection}_cap_trg`;
+    const funcName = `${bare}_cap_fn`;
+    const triggerName = `${bare}_cap_trg`;
 
     await client.query(`
         CREATE OR REPLACE FUNCTION ${funcName}()
         RETURNS TRIGGER LANGUAGE plpgsql AS $$
         BEGIN
-            DELETE FROM ${collection} WHERE _id IN (
-                SELECT _id FROM ${collection}
+            DELETE FROM ${table} WHERE _id IN (
+                SELECT _id FROM ${table}
                 ORDER BY created_at ASC, _id ASC
-                LIMIT GREATEST((SELECT COUNT(*) FROM ${collection}) - ${Number(maxDocuments)}, 0)
+                LIMIT GREATEST((SELECT COUNT(*) FROM ${table}) - ${Number(maxDocuments)}, 0)
             );
             RETURN NEW;
         END;
@@ -1667,17 +1726,19 @@ export async function docCreateCapped(client, collection, maxDocuments) {
     // race documented in docWatch.
     await client.query(`
         CREATE OR REPLACE TRIGGER ${triggerName}
-        AFTER INSERT ON ${collection}
+        AFTER INSERT ON ${table}
         FOR EACH ROW EXECUTE FUNCTION ${funcName}()
     `);
 }
 
-export async function docRemoveCap(client, collection) {
+export async function docRemoveCap(client, collection, { patterns } = {}) {
     validateIdentifier(collection);
+    const table = _docTable(patterns, 'docRemoveCap');
+    const bare = _bareName(table);
 
-    const funcName = `${collection}_cap_fn`;
-    const triggerName = `${collection}_cap_trg`;
+    const funcName = `${bare}_cap_fn`;
+    const triggerName = `${bare}_cap_trg`;
 
-    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${collection}`);
+    await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${table}`);
     await client.query(`DROP FUNCTION IF EXISTS ${funcName}()`);
 }

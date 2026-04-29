@@ -9,7 +9,6 @@ import { platform, arch } from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import {
-    validateIdentifier,
     publish, subscribe, enqueue, dequeue,
     incr, getCounter,
     zadd, zincrby, zrange, zrank, zscore, zrem,
@@ -32,6 +31,8 @@ import {
     docCreateTtlIndex, docRemoveTtlIndex,
     docCreateCapped, docRemoveCap,
 } from './utils.js';
+import { DocumentsAPI } from './documents.js';
+import { StreamsAPI } from './streams.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -466,6 +467,16 @@ export class GoldLapel {
         // Per-instance scope for gl.using(). Module-scoped storage would leak
         // the scoped conn across sibling GoldLapel instances in the same process.
         this._connScope = new AsyncLocalStorage();
+
+        // Nested namespaces — see documents.js and streams.js. These are the
+        // canonical schema-to-core sub-API instances. Each holds a back-
+        // reference to this client for shared state (license, dashboard
+        // token, http session, conn, DDL pattern cache). Other namespaces
+        // (cache, search, queues, counters, hashes, zsets, geo, auth, …)
+        // stay flat for now; they migrate to nested form one-at-a-time as
+        // their own schema-to-core phase fires.
+        this.documents = new DocumentsAPI(this);
+        this.streams = new StreamsAPI(this);
     }
 
     // Builds the argv passed to the proxy binary. Pure — no side effects —
@@ -678,46 +689,14 @@ export class GoldLapel {
         return this._dashboardToken;
     }
 
-    // Fetch (and cache per-instance) canonical DDL + query patterns for a helper.
-    async _streamPatterns(stream) {
-        validateIdentifier(stream);
-        const ddl = await import('./ddl.js');
-        const token = this._dashboardToken || ddl.tokenFromEnvOrFile();
-        return ddl.fetchPatterns(this, 'stream', stream, this._dashboardPort, token);
-    }
-
     // ─── Wrapper methods ───────────────────────────────────────────────────
     //
     // Every method accepts an optional trailing `{ conn }` option that
     // overrides the default connection for that call. If absent, the
     // connection is resolved from the `using()` scope or the internal default.
 
-    // Document store
-    async docCreateCollection(...args) { return _call(this, docCreateCollection, args); }
-    async docInsert(...args) { return _call(this, docInsert, args); }
-    async docInsertMany(...args) { return _call(this, docInsertMany, args); }
-    async docFind(...args) { return _call(this, docFind, args); }
-    async *docFindCursor(...args) {
-        const { conn, rest } = _splitArgs(this, args);
-        yield* docFindCursor(conn, ...rest);
-    }
-    async docFindOne(...args) { return _call(this, docFindOne, args); }
-    async docUpdate(...args) { return _call(this, docUpdate, args); }
-    async docUpdateOne(...args) { return _call(this, docUpdateOne, args); }
-    async docDelete(...args) { return _call(this, docDelete, args); }
-    async docDeleteOne(...args) { return _call(this, docDeleteOne, args); }
-    async docFindOneAndUpdate(...args) { return _call(this, docFindOneAndUpdate, args); }
-    async docFindOneAndDelete(...args) { return _call(this, docFindOneAndDelete, args); }
-    async docDistinct(...args) { return _call(this, docDistinct, args); }
-    async docCount(...args) { return _call(this, docCount, args); }
-    async docCreateIndex(...args) { return _call(this, docCreateIndex, args); }
-    async docAggregate(...args) { return _call(this, docAggregate, args); }
-    async docWatch(...args) { return _call(this, docWatch, args); }
-    async docUnwatch(...args) { return _call(this, docUnwatch, args); }
-    async docCreateTtlIndex(...args) { return _call(this, docCreateTtlIndex, args); }
-    async docRemoveTtlIndex(...args) { return _call(this, docRemoveTtlIndex, args); }
-    async docCreateCapped(...args) { return _call(this, docCreateCapped, args); }
-    async docRemoveCap(...args) { return _call(this, docRemoveCap, args); }
+    // Document store: gl.documents.<verb>(...). See documents.js.
+    // Streams:        gl.streams.<verb>(...).   See streams.js.
 
     // Search
     async search(...args) { return _call(this, search, args); }
@@ -770,33 +749,6 @@ export class GoldLapel {
     // Misc
     async countDistinct(...args) { return _call(this, countDistinct, args); }
     async script(...args) { return _call(this, script, args); }
-
-    // Streams — thread DDL patterns from the proxy through each call.
-    async streamAdd(stream, payload, opts = {}) {
-        const patterns = await this._streamPatterns(stream);
-        const conn = this._resolveConn(opts.conn);
-        return streamAdd(conn, stream, payload, { patterns });
-    }
-    async streamCreateGroup(stream, group, opts = {}) {
-        const patterns = await this._streamPatterns(stream);
-        const conn = this._resolveConn(opts.conn);
-        return streamCreateGroup(conn, stream, group, { patterns });
-    }
-    async streamRead(stream, group, consumer, count = 1, opts = {}) {
-        const patterns = await this._streamPatterns(stream);
-        const conn = this._resolveConn(opts.conn);
-        return streamRead(conn, stream, group, consumer, count, { patterns });
-    }
-    async streamAck(stream, group, messageId, opts = {}) {
-        const patterns = await this._streamPatterns(stream);
-        const conn = this._resolveConn(opts.conn);
-        return streamAck(conn, stream, group, messageId, { patterns });
-    }
-    async streamClaim(stream, group, consumer, minIdleMs = 60000, opts = {}) {
-        const patterns = await this._streamPatterns(stream);
-        const conn = this._resolveConn(opts.conn);
-        return streamClaim(conn, stream, group, consumer, minIdleMs, { patterns });
-    }
 }
 
 // Splits out an optional `conn` from the trailing options arg.
@@ -896,6 +848,8 @@ export async function start(upstream, opts = {}) {
 
 export { wrap } from './wrap.js';
 export { NativeCache } from './cache.js';
+export { DocumentsAPI } from './documents.js';
+export { StreamsAPI } from './streams.js';
 export {
     publish, subscribe, enqueue, dequeue,
     incr, getCounter,
@@ -927,6 +881,7 @@ export {
 export default {
     GoldLapel, start, configKeys, _configToArgs, _logLevelToVerboseFlag,
     wrap, NativeCache,
+    DocumentsAPI, StreamsAPI,
     publish, subscribe, enqueue, dequeue,
     incr, getCounter,
     zadd, zincrby, zrange, zrank, zscore, zrem,

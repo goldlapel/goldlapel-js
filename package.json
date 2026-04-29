@@ -9,9 +9,12 @@
     "cli.js",
     "cache.js",
     "ddl.js",
+    "documents.js",
+    "streams.js",
     "wrap.js",
     "utils.js",
     "bin/",
+    "CHANGELOG.md",
     "README.md",
     "THIRD-PARTY-NOTICES.md"
   ],

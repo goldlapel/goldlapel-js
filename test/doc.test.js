@@ -1,29 +1,22 @@
+// Tests for the wire-level doc* utilities in utils.js.
+//
+// Phase 4 (schema-to-core) made the proxy own doc-store DDL. Each doc*
+// function now requires a `patterns` argument supplying the canonical
+// `{ tables: { main: '_goldlapel.doc_<name>' }, query_patterns: {…} }`
+// payload that `gl.documents.<verb>` would normally fetch from
+// `/api/ddl/doc_store/create` and pass through.
+//
+// To keep these tests focused on SQL shape (rather than re-testing the DDL
+// HTTP layer covered in test/ddl.test.js), each test wraps each doc util in
+// a thin shim that auto-injects a fake patterns bag whose `tables.main`
+// equals the collection name. Existing assertions that check `FROM users`
+// remain valid: the test pretends the proxy returned `users` as the
+// canonical table. Sub-API integration (gl.documents.<verb>) is exercised in
+// test/documents.test.js.
+
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-    docCreateCollection,
-    docInsert,
-    docInsertMany,
-    docFind,
-    docFindCursor,
-    docFindOne,
-    docUpdate,
-    docUpdateOne,
-    docDelete,
-    docDeleteOne,
-    docFindOneAndUpdate,
-    docFindOneAndDelete,
-    docDistinct,
-    docCount,
-    docCreateIndex,
-    docAggregate,
-    docWatch,
-    docUnwatch,
-    docCreateTtlIndex,
-    docRemoveTtlIndex,
-    docCreateCapped,
-    docRemoveCap,
-} from '../utils.js';
+import * as utils from '../utils.js';
 
 function mockClient(queryResult) {
     const calls = [];
@@ -36,23 +29,61 @@ function mockClient(queryResult) {
     };
 }
 
+// Build a fake patterns bag for `collection` — `tables.main` is the same
+// string the test passed in, so existing `FROM users` assertions still match.
+// `query_patterns` is empty: doc_store doesn't surface SQL templates from the
+// proxy yet (the wrapper builds Mongo-style SQL itself).
+function patternsFor(collection) {
+    return { tables: { main: collection }, query_patterns: {} };
+}
+
+// Auto-inject a `patterns` bag into the trailing options arg. Used by every
+// doc* test below so the test bodies stay focused on SQL-shape assertions.
+function withPatterns(name, fn, opts = {}) {
+    return { ...opts, patterns: patternsFor(name) };
+}
+
+// Patched versions of every util — auto-supply patterns for tests that pass
+// the collection name as the second argument.
+const docCreateCollection = (c, n, o = {}) => utils.docCreateCollection(c, n, withPatterns(n, 'docCreateCollection', o));
+const docInsert = (c, n, doc, o = {}) => utils.docInsert(c, n, doc, withPatterns(n, 'docInsert', o));
+const docInsertMany = (c, n, docs, o = {}) => utils.docInsertMany(c, n, docs, withPatterns(n, 'docInsertMany', o));
+const docFind = (c, n, filter, o = {}) => utils.docFind(c, n, filter, withPatterns(n, 'docFind', o));
+function docFindCursor(c, n, filter, o = {}) {
+    return utils.docFindCursor(c, n, filter, withPatterns(n, 'docFindCursor', o));
+}
+const docFindOne = (c, n, filter, o = {}) => utils.docFindOne(c, n, filter, withPatterns(n, 'docFindOne', o));
+const docUpdate = (c, n, f, u, o = {}) => utils.docUpdate(c, n, f, u, withPatterns(n, 'docUpdate', o));
+const docUpdateOne = (c, n, f, u, o = {}) => utils.docUpdateOne(c, n, f, u, withPatterns(n, 'docUpdateOne', o));
+const docDelete = (c, n, f, o = {}) => utils.docDelete(c, n, f, withPatterns(n, 'docDelete', o));
+const docDeleteOne = (c, n, f, o = {}) => utils.docDeleteOne(c, n, f, withPatterns(n, 'docDeleteOne', o));
+const docFindOneAndUpdate = (c, n, f, u, o = {}) => utils.docFindOneAndUpdate(c, n, f, u, withPatterns(n, 'docFindOneAndUpdate', o));
+const docFindOneAndDelete = (c, n, f, o = {}) => utils.docFindOneAndDelete(c, n, f, withPatterns(n, 'docFindOneAndDelete', o));
+const docDistinct = (c, n, field, filter, o = {}) => utils.docDistinct(c, n, field, filter, withPatterns(n, 'docDistinct', o));
+const docCount = (c, n, f, o = {}) => utils.docCount(c, n, f, withPatterns(n, 'docCount', o));
+const docCreateIndex = (c, n, keys, o = {}) => utils.docCreateIndex(c, n, keys, withPatterns(n, 'docCreateIndex', o));
+const docAggregate = (c, n, pipeline, o = {}) => utils.docAggregate(c, n, pipeline, withPatterns(n, 'docAggregate', o));
+const docWatch = (c, n, cb, o = {}) => utils.docWatch(c, n, cb, withPatterns(n, 'docWatch', o));
+const docUnwatch = (c, n, o = {}) => utils.docUnwatch(c, n, withPatterns(n, 'docUnwatch', o));
+const docCreateTtlIndex = (c, n, secs, o = {}) => utils.docCreateTtlIndex(c, n, secs, withPatterns(n, 'docCreateTtlIndex', o));
+const docRemoveTtlIndex = (c, n, o = {}) => utils.docRemoveTtlIndex(c, n, withPatterns(n, 'docRemoveTtlIndex', o));
+const docCreateCapped = (c, n, max, o = {}) => utils.docCreateCapped(c, n, max, withPatterns(n, 'docCreateCapped', o));
+const docRemoveCap = (c, n, o = {}) => utils.docRemoveCap(c, n, withPatterns(n, 'docRemoveCap', o));
+
 // ─── docInsert ─────────────────────────────────────────────────────────────
 
 describe('docInsert', () => {
-    it('ensures collection and inserts document', async () => {
+    it('inserts document against the canonical proxy table', async () => {
         const row = { _id: 'abc-123', data: { name: 'Alice' }, created_at: '2026-01-01' };
         const client = mockClient({ rows: [row], rowCount: 1 });
         const result = await docInsert(client, 'users', { name: 'Alice' });
-        assert.equal(client._calls.length, 2);
-        assert.ok(client._calls[0].text.includes('CREATE TABLE IF NOT EXISTS users'));
-        assert.ok(client._calls[0].text.includes('_id UUID PRIMARY KEY'));
-        assert.ok(client._calls[0].text.includes('data JSONB NOT NULL'));
-        assert.ok(client._calls[0].text.includes('created_at TIMESTAMPTZ'));
-        const sql = client._calls[1].text;
+        // Phase 4: proxy owns DDL — wrapper does not emit CREATE TABLE.
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('INSERT INTO users'));
         assert.ok(sql.includes('$1::jsonb'));
         assert.ok(sql.includes('RETURNING _id, data, created_at'));
-        assert.deepEqual(client._calls[1].values, [JSON.stringify({ name: 'Alice' })]);
+        assert.deepEqual(client._calls[0].values, [JSON.stringify({ name: 'Alice' })]);
         assert.deepEqual(result, row);
     });
 
@@ -70,25 +101,33 @@ describe('docInsert', () => {
             /Invalid identifier/
         );
     });
+
+    it('throws if patterns missing (utils called directly)', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => utils.docInsert(client, 'users', { a: 1 }),
+            /requires DDL patterns from the proxy/
+        );
+    });
 });
 
 // ─── docInsertMany ─────────────────────────────────────────────────────────
 
 describe('docInsertMany', () => {
-    it('ensures collection and batch inserts', async () => {
+    it('batch inserts against the canonical proxy table', async () => {
         const rows = [
             { _id: 'a', data: { x: 1 }, created_at: 'now' },
             { _id: 'b', data: { x: 2 }, created_at: 'now' },
         ];
         const client = mockClient({ rows, rowCount: 2 });
         const result = await docInsertMany(client, 'items', [{ x: 1 }, { x: 2 }]);
-        assert.equal(client._calls.length, 2);
-        assert.ok(client._calls[0].text.includes('CREATE TABLE IF NOT EXISTS items'));
-        const sql = client._calls[1].text;
+        // Phase 4: proxy owns DDL.
+        assert.equal(client._calls.length, 1);
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('INSERT INTO items'));
         assert.ok(sql.includes('($1::jsonb), ($2::jsonb)'));
         assert.ok(sql.includes('RETURNING _id, data, created_at'));
-        assert.deepEqual(client._calls[1].values, [
+        assert.deepEqual(client._calls[0].values, [
             JSON.stringify({ x: 1 }),
             JSON.stringify({ x: 2 }),
         ]);
@@ -98,7 +137,7 @@ describe('docInsertMany', () => {
     it('handles single document', async () => {
         const client = mockClient({ rows: [{ _id: 'a' }], rowCount: 1 });
         await docInsertMany(client, 'items', [{ name: 'solo' }]);
-        const sql = client._calls[1].text;
+        const sql = client._calls[0].text;
         assert.ok(sql.includes('($1::jsonb)'));
         assert.ok(!sql.includes('$2'));
     });
@@ -386,12 +425,15 @@ describe('docCount', () => {
 // ─── docCreateIndex ────────────────────────────────────────────────────────
 
 describe('docCreateIndex', () => {
+    // Phase 4: index names changed to `idx_<bare>_<suffix>` (matches
+    // the canonical pattern in goldlapel-python). The "bare" name strips
+    // any `schema.` prefix from the proxy-resolved table.
     it('creates GIN index when no keys provided', async () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await docCreateIndex(client, 'users');
         assert.equal(client._calls.length, 1);
         const sql = client._calls[0].text;
-        assert.ok(sql.includes('CREATE INDEX IF NOT EXISTS users_data_gin'));
+        assert.ok(sql.includes('CREATE INDEX IF NOT EXISTS idx_users_gin'));
         assert.ok(sql.includes('ON users USING GIN (data)'));
     });
 
@@ -407,10 +449,10 @@ describe('docCreateIndex', () => {
         await docCreateIndex(client, 'users', { name: 1, age: -1 });
         assert.equal(client._calls.length, 2);
         const sql0 = client._calls[0].text;
-        assert.ok(sql0.includes('CREATE INDEX IF NOT EXISTS users_name_idx'));
+        assert.ok(sql0.includes('CREATE INDEX IF NOT EXISTS idx_users_name_idx'));
         assert.ok(sql0.includes("(data->>'name') ASC"));
         const sql1 = client._calls[1].text;
-        assert.ok(sql1.includes('CREATE INDEX IF NOT EXISTS users_age_idx'));
+        assert.ok(sql1.includes('CREATE INDEX IF NOT EXISTS idx_users_age_idx'));
         assert.ok(sql1.includes("(data->>'age') DESC"));
     });
 
@@ -418,7 +460,7 @@ describe('docCreateIndex', () => {
         const client = mockClient({ rows: [], rowCount: 0 });
         await docCreateIndex(client, 'events', { 'user.email': 1 });
         const sql = client._calls[0].text;
-        assert.ok(sql.includes('users_email_idx') || sql.includes('events_user_email_idx'));
+        assert.ok(sql.includes('idx_events_user_email_idx'));
         assert.ok(sql.includes("(data->>'user.email') ASC"));
     });
 
@@ -1131,21 +1173,26 @@ describe('docRemoveTtlIndex', () => {
 // ─── docCreateCapped ────────────────────────────────────────────────────
 
 describe('docCreateCapped', () => {
-    it('ensures collection and creates cap trigger', async () => {
+    it('creates cap function and trigger (proxy owns the table)', async () => {
         const client = mockClient();
         await docCreateCapped(client, 'logs', 1000);
-        // ensureCollection (1) + CREATE FUNCTION (2) + CREATE OR REPLACE TRIGGER (3).
-        // Atomic CREATE OR REPLACE TRIGGER (PG14+) replaces the old DROP +
-        // CREATE pair — matches the Go wrapper.
-        assert.equal(client._calls.length, 3);
-        assert.ok(client._calls[0].text.includes('CREATE TABLE IF NOT EXISTS logs'));
-        assert.ok(client._calls[1].text.includes('CREATE OR REPLACE FUNCTION logs_cap_fn'));
-        assert.ok(client._calls[1].text.includes('DELETE FROM logs'));
-        assert.ok(client._calls[1].text.includes('ORDER BY created_at ASC'));
-        assert.ok(client._calls[1].text.includes('LIMIT GREATEST'));
-        assert.ok(client._calls[1].text.includes('1000'));
-        assert.ok(client._calls[2].text.includes('CREATE OR REPLACE TRIGGER logs_cap_trg'));
-        assert.ok(client._calls[2].text.includes('AFTER INSERT ON logs'));
+        // Phase 4: proxy owns the table — wrapper does NOT issue
+        // CREATE TABLE. Just CREATE FUNCTION (1) + CREATE OR REPLACE
+        // TRIGGER (2). Atomic CREATE OR REPLACE TRIGGER (PG14+) replaces
+        // the old DROP + CREATE pair — matches the Go wrapper.
+        assert.equal(client._calls.length, 2);
+        assert.ok(client._calls[0].text.includes('CREATE OR REPLACE FUNCTION logs_cap_fn'));
+        assert.ok(client._calls[0].text.includes('DELETE FROM logs'));
+        assert.ok(client._calls[0].text.includes('ORDER BY created_at ASC'));
+        assert.ok(client._calls[0].text.includes('LIMIT GREATEST'));
+        assert.ok(client._calls[0].text.includes('1000'));
+        assert.ok(client._calls[1].text.includes('CREATE OR REPLACE TRIGGER logs_cap_trg'));
+        assert.ok(client._calls[1].text.includes('AFTER INSERT ON logs'));
+        // Wrapper must not emit CREATE TABLE — that lives on the proxy now.
+        assert.ok(
+            !client._calls.some(c => c.text.includes('CREATE TABLE')),
+            'docCreateCapped must not emit CREATE TABLE — proxy owns DDL.',
+        );
         // Guard against the racy DROP + CREATE pair regressing.
         assert.ok(
             !client._calls.some(c => c.text.includes('DROP TRIGGER IF EXISTS logs_cap_trg')),
@@ -1786,30 +1833,20 @@ describe('docFindCursor', () => {
 // ─── docCreateCollection ──────────────────────────────────────────────────
 
 describe('docCreateCollection', () => {
-    it('creates a regular table by default (not UNLOGGED)', async () => {
+    // Phase 4: proxy owns DDL. The sub-API's `_patterns` call already
+    // POST'd /api/ddl/doc_store/create on the wrapper's behalf; by the
+    // time the util function runs there's nothing left to do client-side.
+    // The patterns fixture stands in for that prior round-trip.
+    it('emits no client-side SQL — proxy owns DDL', async () => {
         const client = mockClient();
         await docCreateCollection(client, 'events');
-        assert.equal(client._calls.length, 1);
-        const sql = client._calls[0].text;
-        assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS events'));
-        assert.ok(!sql.includes('UNLOGGED'));
+        assert.equal(client._calls.length, 0);
     });
 
-    it('creates an UNLOGGED table when unlogged: true', async () => {
+    it('still emits no SQL when unlogged: true (option flows through patterns)', async () => {
         const client = mockClient();
         await docCreateCollection(client, 'events', { unlogged: true });
-        assert.equal(client._calls.length, 1);
-        const sql = client._calls[0].text;
-        assert.ok(sql.includes('CREATE UNLOGGED TABLE IF NOT EXISTS events'));
-    });
-
-    it('unlogged table has correct schema (_id UUID, data JSONB, created_at)', async () => {
-        const client = mockClient();
-        await docCreateCollection(client, 'metrics', { unlogged: true });
-        const sql = client._calls[0].text;
-        assert.ok(sql.includes('_id UUID PRIMARY KEY DEFAULT gen_random_uuid()'));
-        assert.ok(sql.includes('data JSONB NOT NULL'));
-        assert.ok(sql.includes('created_at TIMESTAMPTZ DEFAULT NOW()'));
+        assert.equal(client._calls.length, 0);
     });
 
     it('validates collection identifier', async () => {
@@ -1817,6 +1854,14 @@ describe('docCreateCollection', () => {
         await assert.rejects(
             () => docCreateCollection(client, 'DROP TABLE x; --'),
             /Invalid identifier/
+        );
+    });
+
+    it('throws if patterns missing (utils called directly)', async () => {
+        const client = mockClient();
+        await assert.rejects(
+            () => utils.docCreateCollection(client, 'events'),
+            /requires DDL patterns from the proxy/
         );
     });
 });
