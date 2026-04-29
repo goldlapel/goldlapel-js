@@ -1,7 +1,12 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert'
 
-import { drizzle, init, start, GoldLapel, wrap, NativeCache } from '../index.js'
+import {
+    drizzle, init,
+    start, GoldLapel, wrap, NativeCache,
+    DocumentsAPI, StreamsAPI,
+} from '../index.js'
+import * as plugin from '../index.js'
 
 function mockStart(returnUrl) {
     const calls = []
@@ -514,5 +519,31 @@ describe('re-exports', () => {
 
     it('re-exports NativeCache from goldlapel', () => {
         assert.strictEqual(typeof NativeCache, 'function')
+    })
+
+    it('re-exports DocumentsAPI from goldlapel', () => {
+        assert.strictEqual(typeof DocumentsAPI, 'function')
+    })
+
+    it('re-exports StreamsAPI from goldlapel', () => {
+        assert.strictEqual(typeof StreamsAPI, 'function')
+    })
+
+    // Regression guard: the broken flat doc-store re-exports were dropped in
+    // favor of the nested gl.documents.<verb> surface (see CHANGELOG). Make
+    // sure they don't sneak back in — re-adding any of them would silently
+    // break callers, since the underlying utils now require a `patterns`
+    // arg they can't supply.
+    it('does not re-export flat doc-store utilities', () => {
+        const removed = [
+            'docInsert', 'docInsertMany', 'docFind', 'docFindOne',
+            'docUpdate', 'docUpdateOne', 'docDelete', 'docDeleteOne',
+            'docCount', 'docCreateIndex', 'docAggregate',
+            'docWatch', 'docUnwatch', 'docCreateTtlIndex', 'docRemoveTtlIndex',
+            'docCreateCapped', 'docRemoveCap',
+        ]
+        for (const name of removed) {
+            assert.strictEqual(plugin[name], undefined, `${name} should not be re-exported`)
+        }
     })
 })

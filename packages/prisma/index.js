@@ -170,13 +170,13 @@ export async function init(options = {}) {
     return proxyUrlStr
 }
 
+// Re-exports — let plugin users reach the core wrapper without a second
+// `import 'goldlapel'`. `start` and `GoldLapel` are the doors into the
+// nested `gl.documents.<verb>` / `gl.streams.<verb>` APIs (Phase 4 of
+// schema-to-core). The flat `doc*` / `stream*` utility re-exports were
+// dropped — they require a `patterns` argument resolved from the proxy's
+// dashboard and only the sub-API classes know how to fetch it.
 export {
     start, GoldLapel, NativeCache,
-} from 'goldlapel'
-export {
-    docInsert, docInsertMany, docFind, docFindOne,
-    docUpdate, docUpdateOne, docDelete, docDeleteOne,
-    docCount, docCreateIndex, docAggregate,
-    docWatch, docUnwatch, docCreateTtlIndex, docRemoveTtlIndex,
-    docCreateCapped, docRemoveCap,
+    DocumentsAPI, StreamsAPI,
 } from 'goldlapel'
