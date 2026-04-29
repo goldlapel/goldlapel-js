@@ -41,16 +41,16 @@ describe('stream DDL ownership (proxy-owned tables)', () => {
         goldlapel = await import('../index.js');
         // Use a high port to avoid collisions with default installs.
         const port = 7700 + (Date.now() % 100);
-        gl = await goldlapel.start(PG_URL, { port });
+        gl = await goldlapel.start(PG_URL, { proxyPort: port });
     });
 
     after(async () => {
         if (gl) await gl.stop();
     });
 
-    it('stream_add creates _goldlapel.stream_<name> table', async () => {
+    it('streams.add creates _goldlapel.stream_<name> table', async () => {
         streamName = `gl_int_stream_${Date.now()}`;
-        await gl.streamAdd(streamName, { type: 'click' });
+        await gl.streams.add(streamName, { type: 'click' });
 
         // Open a direct pg connection to verify table layout.
         const { Client } = await import('pg');
@@ -103,10 +103,10 @@ describe('stream DDL ownership (proxy-owned tables)', () => {
 
         try {
             const freshName = `gl_int_stream_count_${Date.now()}`;
-            await gl.streamAdd(freshName, { i: 1 });
+            await gl.streams.add(freshName, { i: 1 });
             assert.equal(count, 1, 'first call posts once');
-            await gl.streamAdd(freshName, { i: 2 });
-            await gl.streamAdd(freshName, { i: 3 });
+            await gl.streams.add(freshName, { i: 2 });
+            await gl.streams.add(freshName, { i: 3 });
             assert.equal(count, 1, 'subsequent calls use cache — no new POST');
         } finally {
             ddl._internals.post = real;
@@ -120,18 +120,18 @@ describe('stream round-trip', () => {
     before(async () => {
         const goldlapel = await import('../index.js');
         const port = 7800 + (Date.now() % 100);
-        gl = await goldlapel.start(PG_URL, { port });
+        gl = await goldlapel.start(PG_URL, { proxyPort: port });
         name = `gl_int_rt_${Date.now()}`;
     });
 
     after(async () => { if (gl) await gl.stop(); });
 
     it('add and read round-trips via proxy patterns', async () => {
-        await gl.streamCreateGroup(name, 'workers');
-        const id1 = await gl.streamAdd(name, { i: 1 });
-        const id2 = await gl.streamAdd(name, { i: 2 });
+        await gl.streams.createGroup(name, 'workers');
+        const id1 = await gl.streams.add(name, { i: 1 });
+        const id2 = await gl.streams.add(name, { i: 2 });
         assert.ok(id2 > id1);
-        const messages = await gl.streamRead(name, 'workers', 'c', 10);
+        const messages = await gl.streams.read(name, 'workers', 'c', 10);
         assert.equal(messages.length, 2);
         assert.deepEqual(messages[0].payload, { i: 1 });
         assert.deepEqual(messages[1].payload, { i: 2 });
@@ -139,21 +139,21 @@ describe('stream round-trip', () => {
 
     it('ack removes pending', async () => {
         const ackName = `${name}_ack`;
-        await gl.streamCreateGroup(ackName, 'workers');
-        const id = await gl.streamAdd(ackName, { i: 1 });
-        await gl.streamRead(ackName, 'workers', 'c', 10);
-        const first = await gl.streamAck(ackName, 'workers', id);
+        await gl.streams.createGroup(ackName, 'workers');
+        const id = await gl.streams.add(ackName, { i: 1 });
+        await gl.streams.read(ackName, 'workers', 'c', 10);
+        const first = await gl.streams.ack(ackName, 'workers', id);
         assert.equal(first, true);
-        const second = await gl.streamAck(ackName, 'workers', id);
+        const second = await gl.streams.ack(ackName, 'workers', id);
         assert.equal(second, false);
     });
 
     it('claim reassigns idle pending (min_idle_ms=0)', async () => {
         const claimName = `${name}_claim`;
-        await gl.streamCreateGroup(claimName, 'workers');
-        await gl.streamAdd(claimName, { i: 1 });
-        await gl.streamRead(claimName, 'workers', 'consumer-a', 10);
-        const claimed = await gl.streamClaim(claimName, 'workers', 'consumer-b', 0);
+        await gl.streams.createGroup(claimName, 'workers');
+        await gl.streams.add(claimName, { i: 1 });
+        await gl.streams.read(claimName, 'workers', 'consumer-a', 10);
+        const claimed = await gl.streams.claim(claimName, 'workers', 'consumer-b', 0);
         assert.equal(claimed.length, 1);
         assert.deepEqual(claimed[0].payload, { i: 1 });
     });

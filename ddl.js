@@ -21,6 +21,7 @@ import { join } from 'path';
 
 const SUPPORTED_VERSIONS = {
     stream: 'v1',
+    doc_store: 'v1',
 };
 
 // Per-instance cache. WeakMap so entries are GC'd with the owner.
@@ -84,7 +85,17 @@ async function _postDefault(url, token, body) {
     return { status: resp.status, body: parsed };
 }
 
-export async function fetchPatterns(owner, family, name, dashboardPort, dashboardToken) {
+// Fetch (and cache) the canonical { tables, query_patterns } for a helper.
+//
+// Per-session cache: one HTTP call on the first call for a given
+// (family, name); cached result for every subsequent call in the same
+// session.
+//
+// `options` is a per-family creation options bag (e.g. doc_store accepts
+// `{ unlogged: true }`). Only used on the create call — once the table
+// exists, its shape is fixed and subsequent options are silently ignored on
+// the proxy side (idempotent CREATE TABLE IF NOT EXISTS).
+export async function fetchPatterns(owner, family, name, dashboardPort, dashboardToken, { options = null } = {}) {
     const cache = _cacheFor(owner);
     const key = `${family}:${name}`;
     if (cache.has(key)) return cache.get(key);
@@ -103,12 +114,14 @@ export async function fetchPatterns(owner, family, name, dashboardPort, dashboar
     }
 
     const url = `http://127.0.0.1:${dashboardPort}/api/ddl/${family}/create`;
-    // Indirect through `_internals.post` so tests can swap the HTTP layer
-    // for a counting spy — see test/streams-integration.test.js + test/ddl.test.js.
-    const { status, body } = await _internals.post(url, dashboardToken, {
+    const reqBody = {
         name,
         schema_version: supportedVersion(family),
-    });
+    };
+    if (options) reqBody.options = options;
+    // Indirect through `_internals.post` so tests can swap the HTTP layer
+    // for a counting spy — see test/streams-integration.test.js + test/ddl.test.js.
+    const { status, body } = await _internals.post(url, dashboardToken, reqBody);
 
     if (status !== 200) {
         const error = (body && body.error) || 'unknown';

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { GoldLapel } from '../index.js';
+import { GoldLapel, DocumentsAPI, StreamsAPI } from '../index.js';
 
 function mockClient(queryResult) {
     const calls = [];
@@ -64,22 +64,51 @@ describe('stop() with default conn', () => {
     });
 });
 
+// ─── nested namespaces (Phase 4 schema-to-core) ───────────────────────────
+
+describe('nested namespaces', () => {
+    it('gl.documents is a DocumentsAPI bound to the parent client', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.ok(gl.documents instanceof DocumentsAPI);
+        assert.strictEqual(gl.documents._gl, gl);
+    });
+
+    it('gl.streams is a StreamsAPI bound to the parent client', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.ok(gl.streams instanceof StreamsAPI);
+        assert.strictEqual(gl.streams._gl, gl);
+    });
+
+    it('legacy flat doc* methods are gone (hard cut, no aliases)', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        for (const legacy of [
+            'docInsert', 'docFind', 'docUpdate', 'docDelete', 'docCount',
+            'docCreateCollection', 'docCreateIndex', 'docAggregate',
+        ]) {
+            assert.strictEqual(
+                gl[legacy], undefined,
+                `Legacy flat method ${legacy} should have been removed; use gl.documents.<verb> instead.`,
+            );
+        }
+    });
+
+    it('legacy flat stream* methods are gone (hard cut, no aliases)', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        for (const legacy of [
+            'streamAdd', 'streamCreateGroup', 'streamRead',
+            'streamAck', 'streamClaim',
+        ]) {
+            assert.strictEqual(
+                gl[legacy], undefined,
+                `Legacy flat method ${legacy} should have been removed; use gl.streams.<verb> instead.`,
+            );
+        }
+    });
+});
+
 // ─── wrapper method delegation to default conn ────────────────────────────
 
 describe('wrapper methods delegate to default conn', () => {
-    it('docInsert delegates with spread args', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        const row = { _id: 'abc', data: { name: 'Alice' }, created_at: 'now' };
-        gl._defaultConn = mockClient({ rows: [row], rowCount: 1 });
-
-        const result = await gl.docInsert('users', { name: 'Alice' });
-        assert.deepEqual(result, row);
-        // ensureCollection + INSERT = 2 calls
-        assert.strictEqual(gl._defaultConn._calls.length, 2);
-        assert.ok(gl._defaultConn._calls[0].text.includes('CREATE TABLE IF NOT EXISTS users'));
-        assert.ok(gl._defaultConn._calls[1].text.includes('INSERT INTO users'));
-    });
-
     it('search delegates with spread args', async () => {
         const rows = [{ id: 1, _score: 0.8 }];
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
@@ -91,16 +120,6 @@ describe('wrapper methods delegate to default conn', () => {
         const sql = gl._defaultConn._calls[0].text;
         assert.ok(sql.includes('FROM articles'));
         assert.ok(sql.includes("to_tsvector($1, coalesce(body, ''))"));
-    });
-
-    it('docFind delegates with spread args', async () => {
-        const rows = [{ _id: 'a', data: { x: 1 } }];
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        gl._defaultConn = mockClient({ rows, rowCount: 1 });
-
-        const result = await gl.docFind('items', { x: 1 });
-        assert.deepEqual(result, rows);
-        assert.ok(gl._defaultConn._calls[0].text.includes('FROM items'));
     });
 
     it('incr delegates with spread args', async () => {
@@ -140,23 +159,6 @@ describe('wrapper methods delegate to default conn', () => {
         assert.ok(gl._defaultConn._calls[0].text.includes('pg_notify'));
     });
 
-    it('streamAdd delegates with spread args', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        gl._defaultConn = mockClient({ rows: [{ id: '1' }], rowCount: 1 });
-        // Stub out the DDL fetch so this unit test doesn't try to POST to
-        // a nonexistent dashboard. The utils layer reads patterns from
-        // the returned object — supply just the fields streamAdd touches.
-        gl._streamPatterns = async () => ({
-            tables: { main: '_goldlapel.stream_events' },
-            query_patterns: {
-                insert: 'INSERT INTO _goldlapel.stream_events (payload) VALUES ($1) RETURNING id, created_at',
-            },
-        });
-
-        const id = await gl.streamAdd('events', { type: 'click' });
-        assert.strictEqual(id, 1);
-    });
-
     it('percolateAdd delegates with spread args', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         gl._defaultConn = mockClient({ rows: [], rowCount: 0 });
@@ -187,14 +189,6 @@ describe('wrapper methods delegate to default conn', () => {
 // ─── wrapper methods throw when no conn resolvable ────────────────────────
 
 describe('wrapper methods throw before conn is available', () => {
-    it('docInsert throws', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        await assert.rejects(
-            () => gl.docInsert('users', { name: 'Alice' }),
-            /Not connected/
-        );
-    });
-
     it('search throws', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         await assert.rejects(
@@ -210,22 +204,33 @@ describe('wrapper methods throw before conn is available', () => {
             /Not connected/
         );
     });
+
+    it('gl.documents.find throws', async () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        // Before start(), there's no dashboard token + no default conn —
+        // expect either flavour of "not connected" (no token, or no
+        // conn after a token came from env/file).
+        await assert.rejects(
+            () => gl.documents.find('users', { x: 1 }),
+            /(No dashboard token|Not connected|dashboard not reachable|No dashboard port)/i,
+        );
+    });
+
+    it('gl.streams.add throws', async () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        await assert.rejects(
+            () => gl.streams.add('events', { type: 'click' }),
+            /(No dashboard token|Not connected|dashboard not reachable|No dashboard port)/i,
+        );
+    });
 });
 
 // ─── all methods exist on the class ───────────────────────────────────────
 
 describe('all wrapper methods exist', () => {
+    // Note: doc* and stream* methods moved under gl.documents.<verb> /
+    // gl.streams.<verb> in Phase 4. Other namespaces stay flat for now.
     const expectedMethods = [
-        // Document store
-        'docCreateCollection',
-        'docInsert', 'docInsertMany', 'docFind', 'docFindCursor', 'docFindOne',
-        'docUpdate', 'docUpdateOne', 'docDelete', 'docDeleteOne',
-        'docFindOneAndUpdate', 'docFindOneAndDelete',
-        'docDistinct',
-        'docCount', 'docCreateIndex', 'docAggregate',
-        'docWatch', 'docUnwatch',
-        'docCreateTtlIndex', 'docRemoveTtlIndex',
-        'docCreateCapped', 'docRemoveCap',
         // Search
         'search', 'searchFuzzy', 'searchPhonetic', 'similar', 'suggest',
         'facets', 'aggregate', 'createSearchConfig',
@@ -245,8 +250,6 @@ describe('all wrapper methods exist', () => {
         'geoadd', 'georadius', 'geodist',
         // Misc
         'countDistinct', 'script',
-        // Streams
-        'streamAdd', 'streamCreateGroup', 'streamRead', 'streamAck', 'streamClaim',
     ];
 
     const gl = new GoldLapel('postgresql://localhost:5432/mydb');
@@ -257,8 +260,13 @@ describe('all wrapper methods exist', () => {
         });
     }
 
-    it('count matches expected total (61)', () => {
-        assert.strictEqual(expectedMethods.length, 61);
+    it('count matches expected total (34)', () => {
+        assert.strictEqual(expectedMethods.length, 34);
+    });
+
+    it('has gl.documents and gl.streams sub-APIs', () => {
+        assert.ok(gl.documents instanceof DocumentsAPI);
+        assert.ok(gl.streams instanceof StreamsAPI);
     });
 
     it('list matches actual public wrapper surface', () => {
@@ -298,18 +306,6 @@ describe('all wrapper methods exist', () => {
 // ─── per-method { conn } override ─────────────────────────────────────────
 
 describe('per-method { conn } override', () => {
-    it('docInsert uses override conn', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        const def = mockClient({ rows: [{ _id: 'd', data: {}, created_at: 'now' }], rowCount: 1 });
-        const override = mockClient({ rows: [{ _id: 'o', data: {}, created_at: 'now' }], rowCount: 1 });
-        gl._defaultConn = def;
-
-        const result = await gl.docInsert('users', { name: 'Alice' }, { conn: override });
-        assert.strictEqual(result._id, 'o');
-        assert.strictEqual(def._calls.length, 0, 'default conn not touched');
-        assert.strictEqual(override._calls.length, 2, 'override conn used');
-    });
-
     it('search uses override conn', async () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
         const def = mockClient({ rows: [], rowCount: 0 });
@@ -357,23 +353,5 @@ describe('per-method { conn } override', () => {
         assert.strictEqual(override._calls.length, 1);
         // limit still respected: values: [lang, lang, query, limit]
         assert.deepEqual(override._calls[0].values, ['english', 'english', 'hello', 10]);
-    });
-
-    it('docInsertMany uses override conn', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        const def = mockClient({ rows: [], rowCount: 0 });
-        const override = mockClient({
-            rows: [
-                { _id: 'a', data: {}, created_at: 'now' },
-                { _id: 'b', data: {}, created_at: 'now' },
-            ],
-            rowCount: 2,
-        });
-        gl._defaultConn = def;
-
-        const result = await gl.docInsertMany('items', [{ x: 1 }, { x: 2 }], { conn: override });
-        assert.strictEqual(result.length, 2);
-        assert.strictEqual(def._calls.length, 0);
-        assert.strictEqual(override._calls.length, 2);
     });
 });
