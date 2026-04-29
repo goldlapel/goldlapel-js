@@ -87,226 +87,446 @@ export async function subscribe(client, channel, callback) {
     });
 }
 
-export async function enqueue(client, queueTable, payload) {
-    validateIdentifier(queueTable);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${queueTable} (
-            id BIGSERIAL PRIMARY KEY,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    `);
-    await client.query(
-        `INSERT INTO ${queueTable} (payload) VALUES ($1)`,
-        [JSON.stringify(payload)]
-    );
+// ─── Phase 5 Redis-compat families ─────────────────────────────────────────
+//
+// Counter / zset / hash / queue / geo. The proxy owns DDL (one canonical
+// table per (family, name)) and emits query patterns parameterized with
+// `$N`. `pg` binds `$N` natively, so the wrapper runs each pattern verbatim
+// with no placeholder translation — same SQL across all wrappers.
+//
+// Flat helper functions accept `{ patterns }` from the namespace classes
+// (`gl.counters` / `gl.zsets` / …) and never reach for the dashboard
+// directly. Calling these functions without `patterns` is an error — the
+// wrapper API never builds DDL itself anymore.
+
+// _familyPattern: pull a query pattern from the proxy's response. Family is
+// only used to make the error message helpful when callers forget to pass
+// `patterns=` (i.e. they invoked the util directly rather than via the
+// namespaced API).
+function _familyPattern(patterns, key, family) {
+    if (!patterns || !patterns.query_patterns) {
+        throw new Error(
+            `${family} utils require DDL patterns from the proxy — call via ` +
+            `\`gl.${family}s.<verb>(...)\` rather than the utils function directly.`
+        );
+    }
+    const sql = patterns.query_patterns[key];
+    if (sql === undefined) {
+        throw new Error(
+            `${family} pattern '${key}' missing from proxy response — ` +
+            `wrapper/proxy version mismatch?`
+        );
+    }
+    return sql;
 }
 
-export async function dequeue(client, queueTable) {
-    validateIdentifier(queueTable);
-    const result = await client.query(`
-        DELETE FROM ${queueTable}
-        WHERE id = (
-            SELECT id FROM ${queueTable}
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        )
-        RETURNING payload
-    `);
-    if (result.rows.length === 0) return null;
-    const val = result.rows[0].payload;
-    return typeof val === 'object' ? val : JSON.parse(val);
+// JSONB column values: psycopg-style drivers may hand back the row value as
+// either a decoded object/array/scalar or as the raw JSON text. Normalize
+// either shape to the user's actual JS value.
+function _decodeJsonb(value) {
+    if (value === null || value === undefined) return value;
+    if (typeof value !== 'string') return value;
+    try {
+        return JSON.parse(value);
+    } catch {
+        return value;
+    }
 }
 
-export async function incr(client, table, key, amount = 1) {
-    validateIdentifier(table);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${table} (
-            key TEXT PRIMARY KEY,
-            value BIGINT NOT NULL DEFAULT 0
-        )
-    `);
-    const result = await client.query(`
-        INSERT INTO ${table} (key, value) VALUES ($1, $2)
-        ON CONFLICT (key) DO UPDATE SET value = ${table}.value + $3
-        RETURNING value
-    `, [key, amount, amount]);
+// ─── Counter family ────────────────────────────────────────────────────────
+
+export async function counterIncr(client, name, key, amount = 1, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'incr', 'counter');
+    const result = await client.query(sql, [String(key), Number(amount)]);
     return Number(result.rows[0].value);
 }
 
-export async function getCounter(client, table, key) {
-    validateIdentifier(table);
-    const result = await client.query(
-        `SELECT value FROM ${table} WHERE key = $1`, [key]
-    );
+// Decrement is `incr` with a negative amount. Provided as a separate method
+// so callers don't need to remember the sign convention.
+export async function counterDecr(client, name, key, amount = 1, { patterns } = {}) {
+    return counterIncr(client, name, key, -Number(amount), { patterns });
+}
+
+export async function counterSet(client, name, key, value, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'set', 'counter');
+    const result = await client.query(sql, [String(key), Number(value)]);
+    return Number(result.rows[0].value);
+}
+
+// Returns 0 for unknown keys (matches the Redis convention — no NULL
+// surprise on cold cache).
+export async function counterGet(client, name, key, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'get', 'counter');
+    const result = await client.query(sql, [String(key)]);
     if (result.rows.length === 0) return 0;
     return Number(result.rows[0].value);
 }
 
-export async function zadd(client, table, member, score) {
-    validateIdentifier(table);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${table} (
-            member TEXT PRIMARY KEY,
-            score DOUBLE PRECISION NOT NULL
-        )
-    `);
-    await client.query(`
-        INSERT INTO ${table} (member, score) VALUES ($1, $2)
-        ON CONFLICT (member) DO UPDATE SET score = EXCLUDED.score
-    `, [String(member), Number(score)]);
+// Returns true if a row was deleted, false if the key was already absent.
+export async function counterDelete(client, name, key, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'delete', 'counter');
+    const result = await client.query(sql, [String(key)]);
+    return result.rowCount > 0;
 }
 
-export async function zincrby(client, table, member, amount = 1) {
-    validateIdentifier(table);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${table} (
-            member TEXT PRIMARY KEY,
-            score DOUBLE PRECISION NOT NULL
-        )
-    `);
-    const result = await client.query(`
-        INSERT INTO ${table} (member, score) VALUES ($1, $2)
-        ON CONFLICT (member) DO UPDATE SET score = ${table}.score + $3
-        RETURNING score
-    `, [String(member), Number(amount), Number(amount)]);
-    return result.rows[0].score;
+export async function counterCountKeys(client, name, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'count_keys', 'counter');
+    const result = await client.query(sql);
+    if (result.rows.length === 0) return 0;
+    // Postgres COUNT(*) returns BIGINT → Node `pg` decodes as a string;
+    // cast through Number so callers get a number.
+    return Number(result.rows[0].count);
 }
 
-export async function zrange(client, table, start = 0, stop = 10, desc = true) {
-    validateIdentifier(table);
-    const order = desc ? 'DESC' : 'ASC';
-    const limit = stop - start;
-    const result = await client.query(`
-        SELECT member, score FROM ${table}
-        ORDER BY score ${order}
-        LIMIT $1 OFFSET $2
-    `, [limit, start]);
-    return result.rows.map(row => [row.member, row.score]);
+// ─── Sorted-set (zset) family ──────────────────────────────────────────────
+
+export async function zsetAdd(client, name, zsetKey, member, score, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'zadd', 'zset');
+    const result = await client.query(sql, [String(zsetKey), String(member), Number(score)]);
+    return Number(result.rows[0].score);
 }
 
-export async function zrank(client, table, member, desc = true) {
-    validateIdentifier(table);
-    const order = desc ? 'DESC' : 'ASC';
-    const result = await client.query(`
-        SELECT rank FROM (
-            SELECT member, ROW_NUMBER() OVER (ORDER BY score ${order}) - 1 AS rank
-            FROM ${table}
-        ) ranked
-        WHERE member = $1
-    `, [String(member)]);
+export async function zsetIncrBy(client, name, zsetKey, member, delta = 1, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'zincrby', 'zset');
+    const result = await client.query(sql, [String(zsetKey), String(member), Number(delta)]);
+    return Number(result.rows[0].score);
+}
+
+// Returns the member's score as a number, or null if absent.
+export async function zsetScore(client, name, zsetKey, member, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'zscore', 'zset');
+    const result = await client.query(sql, [String(zsetKey), String(member)]);
+    if (result.rows.length === 0) return null;
+    return Number(result.rows[0].score);
+}
+
+export async function zsetRemove(client, name, zsetKey, member, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'zrem', 'zset');
+    const result = await client.query(sql, [String(zsetKey), String(member)]);
+    return result.rowCount > 0;
+}
+
+// Members by rank within `zsetKey`. Returns an array of `[member, score]`
+// tuples. `desc=true` orders highest score first (leaderboard order).
+// `start`/`stop` are 0-based inclusive bounds Redis-style; the SQL converts
+// to LIMIT/OFFSET.
+export async function zsetRange(client, name, zsetKey, start = 0, stop = 10, desc = true, { patterns } = {}) {
+    validateIdentifier(name);
+    const key = desc ? 'zrange_desc' : 'zrange_asc';
+    const sql = _familyPattern(patterns, key, 'zset');
+    const limit = Math.max(0, Number(stop) - Number(start) + 1);
+    const result = await client.query(sql, [String(zsetKey), limit, Number(start)]);
+    return result.rows.map(row => [row.member, Number(row.score)]);
+}
+
+// Get members whose score is between min and max (inclusive).
+export async function zsetRangeByScore(client, name, zsetKey, minScore, maxScore, limit = 100, offset = 0, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'zrangebyscore', 'zset');
+    const result = await client.query(sql, [
+        String(zsetKey), Number(minScore), Number(maxScore),
+        Number(limit), Number(offset),
+    ]);
+    return result.rows.map(row => [row.member, Number(row.score)]);
+}
+
+// 0-based rank within `zsetKey`, or null if member is absent.
+export async function zsetRank(client, name, zsetKey, member, { desc = true, patterns } = {}) {
+    validateIdentifier(name);
+    const key = desc ? 'zrank_desc' : 'zrank_asc';
+    const sql = _familyPattern(patterns, key, 'zset');
+    const result = await client.query(sql, [String(zsetKey), String(member)]);
     if (result.rows.length === 0) return null;
     return Number(result.rows[0].rank);
 }
 
-export async function zscore(client, table, member) {
-    validateIdentifier(table);
-    const result = await client.query(
-        `SELECT score FROM ${table} WHERE member = $1`, [String(member)]
-    );
-    if (result.rows.length === 0) return null;
-    return result.rows[0].score;
+// Cardinality of one zsetKey namespace.
+export async function zsetCard(client, name, zsetKey, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'zcard', 'zset');
+    const result = await client.query(sql, [String(zsetKey)]);
+    if (result.rows.length === 0) return 0;
+    return Number(result.rows[0].count);
 }
 
-export async function zrem(client, table, member) {
-    validateIdentifier(table);
-    const result = await client.query(
-        `DELETE FROM ${table} WHERE member = $1`, [String(member)]
-    );
+// ─── Hash family ───────────────────────────────────────────────────────────
+
+// Set a field's value (single-row UPSERT). Value is JSON-encoded so callers
+// can store arbitrary structured payloads.
+export async function hashSet(client, name, hashKey, field, value, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hset', 'hash');
+    const result = await client.query(sql, [
+        String(hashKey), String(field), JSON.stringify(value),
+    ]);
+    if (result.rows.length === 0) return null;
+    return _decodeJsonb(result.rows[0].value);
+}
+
+export async function hashGet(client, name, hashKey, field, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hget', 'hash');
+    const result = await client.query(sql, [String(hashKey), String(field)]);
+    if (result.rows.length === 0) return null;
+    return _decodeJsonb(result.rows[0].value);
+}
+
+// Reassemble every (field, value) under `hashKey` into a JS object. Empty
+// object if the key has no fields.
+export async function hashGetAll(client, name, hashKey, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hgetall', 'hash');
+    const result = await client.query(sql, [String(hashKey)]);
+    const out = {};
+    for (const row of result.rows) {
+        out[row.field] = _decodeJsonb(row.value);
+    }
+    return out;
+}
+
+export async function hashKeys(client, name, hashKey, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hkeys', 'hash');
+    const result = await client.query(sql, [String(hashKey)]);
+    return result.rows.map(row => row.field);
+}
+
+export async function hashValues(client, name, hashKey, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hvals', 'hash');
+    const result = await client.query(sql, [String(hashKey)]);
+    return result.rows.map(row => _decodeJsonb(row.value));
+}
+
+export async function hashExists(client, name, hashKey, field, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hexists', 'hash');
+    const result = await client.query(sql, [String(hashKey), String(field)]);
+    if (result.rows.length === 0) return false;
+    return Boolean(result.rows[0].exists);
+}
+
+export async function hashDelete(client, name, hashKey, field, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hdel', 'hash');
+    const result = await client.query(sql, [String(hashKey), String(field)]);
     return result.rowCount > 0;
 }
 
-export async function geoadd(client, table, nameColumn, geomColumn, name, lon, lat) {
-    validateIdentifier(table);
-    validateIdentifier(nameColumn);
-    validateIdentifier(geomColumn);
-    await client.query('CREATE EXTENSION IF NOT EXISTS postgis');
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${table} (
-            id BIGSERIAL PRIMARY KEY,
-            ${nameColumn} TEXT NOT NULL,
-            ${geomColumn} GEOMETRY(Point, 4326) NOT NULL
-        )
-    `);
-    await client.query(`
-        INSERT INTO ${table} (${nameColumn}, ${geomColumn})
-        VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326))
-    `, [name, lon, lat]);
+export async function hashLen(client, name, hashKey, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'hlen', 'hash');
+    const result = await client.query(sql, [String(hashKey)]);
+    if (result.rows.length === 0) return 0;
+    return Number(result.rows[0].count);
 }
 
-export async function georadius(client, table, geomColumn, lon, lat, radiusMeters, limit = 50) {
-    validateIdentifier(table);
-    validateIdentifier(geomColumn);
-    const result = await client.query(`
-        SELECT *, ST_Distance(
-            ${geomColumn}::geography,
-            ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
-        ) AS distance_m
-        FROM ${table}
-        WHERE ST_DWithin(
-            ${geomColumn}::geography,
-            ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-            $5
-        )
-        ORDER BY distance_m
-        LIMIT $6
-    `, [lon, lat, lon, lat, radiusMeters, limit]);
+// ─── Queue family (at-least-once with visibility timeout) ──────────────────
+
+// Add a message; returns its assigned `id`.
+export async function queueEnqueue(client, name, payload, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'enqueue', 'queue');
+    const result = await client.query(sql, [JSON.stringify(payload)]);
+    if (result.rows.length === 0) return null;
+    return Number(result.rows[0].id);
+}
+
+// Lease the next ready message. Returns `{ id, payload }` or null if the
+// queue is empty. Caller MUST `ack(id)` to commit, or `abandon(id)` to
+// release the lease immediately. A consumer that crashes leaves the lease
+// standing; the message becomes ready again after `visibilityTimeoutMs` and
+// is redelivered to the next claim.
+export async function queueClaim(client, name, visibilityTimeoutMs = 30000, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'claim', 'queue');
+    const result = await client.query(sql, [Number(visibilityTimeoutMs)]);
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    return {
+        id: Number(row.id),
+        payload: _decodeJsonb(row.payload),
+    };
+}
+
+// Mark a claimed message done (DELETEs the row). Returns true if the
+// message existed and was removed.
+export async function queueAck(client, name, messageId, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'ack', 'queue');
+    const result = await client.query(sql, [Number(messageId)]);
+    return result.rowCount > 0;
+}
+
+// Release a claimed message back to ready immediately. Returns true if the
+// message existed and was a claim. Equivalent to a NACK in queue parlance —
+// the message stays in the queue and is redelivered to the next claim.
+export async function queueAbandon(client, name, messageId, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'nack', 'queue');
+    const result = await client.query(sql, [Number(messageId)]);
+    return result.rows.length > 0;
+}
+
+// Extend a claimed message's visibility deadline by `additionalMs`
+// milliseconds. Returns the new `visible_at`, or null if the id wasn't a
+// claimed message.
+//
+// Proxy contract: `$1 = id`, `$2 = additional_ms`. Match that order.
+export async function queueExtend(client, name, messageId, additionalMs, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'extend', 'queue');
+    const result = await client.query(sql, [Number(messageId), Number(additionalMs)]);
+    if (result.rows.length === 0) return null;
+    return result.rows[0].visible_at;
+}
+
+// Look at the next-visible message without claiming it. Returns an object
+// with `id`, `payload`, `visible_at`, `status`, `created_at`, or null when
+// nothing is ready.
+export async function queuePeek(client, name, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'peek', 'queue');
+    const result = await client.query(sql);
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    return {
+        id: Number(row.id),
+        payload: _decodeJsonb(row.payload),
+        visible_at: row.visible_at,
+        status: row.status,
+        created_at: row.created_at,
+    };
+}
+
+export async function queueCountReady(client, name, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'count_ready', 'queue');
+    const result = await client.query(sql);
+    if (result.rows.length === 0) return 0;
+    return Number(result.rows[0].count);
+}
+
+export async function queueCountClaimed(client, name, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'count_claimed', 'queue');
+    const result = await client.query(sql);
+    if (result.rows.length === 0) return 0;
+    return Number(result.rows[0].count);
+}
+
+// ─── Geo family (PostGIS GEOGRAPHY-native) ─────────────────────────────────
+
+// Distance unit conversion: proxy returns meters always (GEOGRAPHY default);
+// wrappers translate at the edge so callers can ask in km/mi/ft.
+const _GEO_UNITS = { m: 1.0, km: 1000.0, mi: 1609.344, ft: 0.3048 };
+
+function _toMeters(value, unit) {
+    const factor = _GEO_UNITS[unit];
+    if (factor === undefined) {
+        throw new Error(`Unknown distance unit: '${unit}' (choose m/km/mi/ft)`);
+    }
+    return Number(value) * factor;
+}
+
+function _convertDistanceMeters(meters, unit) {
+    const factor = _GEO_UNITS[unit];
+    if (factor === undefined) {
+        throw new Error(`Unknown distance unit: '${unit}' (choose m/km/mi/ft)`);
+    }
+    return Number(meters) / factor;
+}
+
+// Set-or-update a member's lon/lat. Idempotent on the member name (PK).
+// Returns the just-stored `[lon, lat]` tuple.
+export async function geoAdd(client, name, member, lon, lat, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'geoadd', 'geo');
+    const result = await client.query(sql, [String(member), Number(lon), Number(lat)]);
+    if (result.rows.length === 0) return null;
+    return [Number(result.rows[0].lon), Number(result.rows[0].lat)];
+}
+
+// Fetch a member's `[lon, lat]` tuple, or null if absent.
+export async function geoPos(client, name, member, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'geopos', 'geo');
+    const result = await client.query(sql, [String(member)]);
+    if (result.rows.length === 0) return null;
+    return [Number(result.rows[0].lon), Number(result.rows[0].lat)];
+}
+
+// Distance between two members. `unit` accepts m / km / mi / ft. Returns a
+// number in the requested unit, or null if either member is absent.
+export async function geoDist(client, name, memberA, memberB, { unit = 'm', patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'geodist', 'geo');
+    const result = await client.query(sql, [String(memberA), String(memberB)]);
+    if (result.rows.length === 0) return null;
+    const meters = result.rows[0].distance_m;
+    if (meters === null || meters === undefined) return null;
+    return _convertDistanceMeters(meters, unit);
+}
+
+// Members within `radius` of (lon, lat). Returns an array of objects with
+// `member`, `lon`, `lat`, `distance_m`.
+//
+// Proxy contract (CTE-anchor): `$1=lon`, `$2=lat`, `$3=radius_m`,
+// `$4=limit`. Each `$N` appears exactly once in the rendered SQL. `pg`
+// binds natively, so we pass a 4-tuple `[lon, lat, radius_m, limit]` — no
+// duplicate-expansion needed.
+export async function geoRadius(client, name, lon, lat, radius, { unit = 'm', limit = 50, patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'georadius_with_dist', 'geo');
+    const radiusM = _toMeters(radius, unit);
+    const result = await client.query(sql, [
+        Number(lon), Number(lat), Number(radiusM), Number(limit),
+    ]);
     return result.rows;
 }
 
-export async function geodist(client, table, geomColumn, nameColumn, nameA, nameB) {
-    validateIdentifier(table);
-    validateIdentifier(geomColumn);
-    validateIdentifier(nameColumn);
-    const result = await client.query(`
-        SELECT ST_Distance(a.${geomColumn}::geography, b.${geomColumn}::geography)
-        FROM ${table} a, ${table} b
-        WHERE a.${nameColumn} = $1 AND b.${nameColumn} = $2
-    `, [nameA, nameB]);
-    if (result.rows.length === 0) return null;
-    return result.rows[0].st_distance;
+// Members within `radius` of `member`'s location.
+//
+// Proxy contract (NOT a CTE): `$1` and `$2` are both the anchor member
+// name; `$3=radius_m`; `$4=limit`. `pg` binds `$N` natively, so the
+// `$1`/`$2` pair both reads its value from the array slot for `$N`. We pass
+// `[member, member, radius_m, limit]` — the proxy SQL `WHERE a.member=$1 …
+// b.member<>$2` resolves both halves without expansion.
+export async function geoRadiusByMember(client, name, member, radius, { unit = 'm', limit = 50, patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'geosearch_member', 'geo');
+    const radiusM = _toMeters(radius, unit);
+    const result = await client.query(sql, [
+        String(member), String(member), Number(radiusM), Number(limit),
+    ]);
+    return result.rows;
 }
 
-export async function hset(client, table, key, field, value) {
-    validateIdentifier(table);
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS ${table} (
-            key TEXT PRIMARY KEY,
-            data JSONB NOT NULL DEFAULT '{}'::jsonb
-        )
-    `);
-    await client.query(`
-        INSERT INTO ${table} (key, data) VALUES ($1, jsonb_build_object($2, $3::jsonb))
-        ON CONFLICT (key) DO UPDATE SET data = ${table}.data || jsonb_build_object($4, $5::jsonb)
-    `, [key, field, JSON.stringify(value), field, JSON.stringify(value)]);
+export async function geoRemove(client, name, member, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'geo_remove', 'geo');
+    const result = await client.query(sql, [String(member)]);
+    return result.rowCount > 0;
 }
 
-export async function hget(client, table, key, field) {
-    validateIdentifier(table);
-    const result = await client.query(
-        `SELECT data->>$1 AS val FROM ${table} WHERE key = $2`, [field, key]
-    );
-    if (result.rows.length === 0) return null;
-    const val = result.rows[0].val;
-    if (val === null || val === undefined) return null;
-    try {
-        return JSON.parse(val);
-    } catch {
-        return val;
-    }
+export async function geoCount(client, name, { patterns } = {}) {
+    validateIdentifier(name);
+    const sql = _familyPattern(patterns, 'geo_count', 'geo');
+    const result = await client.query(sql);
+    if (result.rows.length === 0) return 0;
+    return Number(result.rows[0].count);
 }
 
-export async function hgetall(client, table, key) {
-    validateIdentifier(table);
-    const result = await client.query(
-        `SELECT data FROM ${table} WHERE key = $1`, [key]
-    );
-    if (result.rows.length === 0) return {};
-    const val = result.rows[0].data;
-    if (!val) return {};
-    return typeof val === 'object' ? val : JSON.parse(val);
-}
+// ─── Misc ──────────────────────────────────────────────────────────────────
 
 export async function countDistinct(client, table, column) {
     validateIdentifier(table);
@@ -315,18 +535,6 @@ export async function countDistinct(client, table, column) {
         `SELECT COUNT(DISTINCT ${column}) AS cnt FROM ${table}`
     );
     return Number(result.rows[0].cnt);
-}
-
-export async function hdel(client, table, key, field) {
-    validateIdentifier(table);
-    const result = await client.query(
-        `SELECT data ? $1 AS existed FROM ${table} WHERE key = $2`, [field, key]
-    );
-    if (result.rows.length === 0 || !result.rows[0].existed) return false;
-    await client.query(
-        `UPDATE ${table} SET data = data - $1 WHERE key = $2`, [field, key]
-    );
-    return true;
 }
 
 function _requirePatterns(patterns, fn) {

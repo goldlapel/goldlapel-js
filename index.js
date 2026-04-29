@@ -9,13 +9,18 @@ import { platform, arch } from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import {
-    publish, subscribe, enqueue, dequeue,
-    incr, getCounter,
-    zadd, zincrby, zrange, zrank, zscore, zrem,
-    geoadd, georadius, geodist,
-    hset, hget, hgetall, hdel,
+    publish, subscribe,
     countDistinct,
     script,
+    // Phase 5 family helpers — exported for power users / direct use with
+    // `{ patterns }` from the namespace classes. Most callers should use the
+    // namespaces (gl.counters / gl.zsets / gl.hashes / gl.queues / gl.geos).
+    counterIncr, counterDecr, counterSet, counterGet, counterDelete, counterCountKeys,
+    zsetAdd, zsetIncrBy, zsetScore, zsetRank, zsetRange, zsetRangeByScore, zsetRemove, zsetCard,
+    hashSet, hashGet, hashGetAll, hashKeys, hashValues, hashExists, hashDelete, hashLen,
+    queueEnqueue, queueClaim, queueAck, queueAbandon, queueExtend, queuePeek,
+    queueCountReady, queueCountClaimed,
+    geoAdd, geoPos, geoDist, geoRadius, geoRadiusByMember, geoRemove, geoCount,
     streamAdd, streamCreateGroup, streamRead, streamAck, streamClaim,
     search, searchFuzzy, searchPhonetic, similar, suggest,
     facets, aggregate, createSearchConfig,
@@ -33,6 +38,11 @@ import {
 } from './utils.js';
 import { DocumentsAPI } from './documents.js';
 import { StreamsAPI } from './streams.js';
+import { CountersAPI } from './counters.js';
+import { ZsetsAPI } from './zsets.js';
+import { HashesAPI } from './hashes.js';
+import { QueuesAPI } from './queues.js';
+import { GeosAPI } from './geos.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -468,15 +478,21 @@ export class GoldLapel {
         // the scoped conn across sibling GoldLapel instances in the same process.
         this._connScope = new AsyncLocalStorage();
 
-        // Nested namespaces — see documents.js and streams.js. These are the
-        // canonical schema-to-core sub-API instances. Each holds a back-
-        // reference to this client for shared state (license, dashboard
-        // token, http session, conn, DDL pattern cache). Other namespaces
-        // (cache, search, queues, counters, hashes, zsets, geo, auth, …)
-        // stay flat for now; they migrate to nested form one-at-a-time as
-        // their own schema-to-core phase fires.
+        // Nested namespaces — canonical schema-to-core sub-API instances.
+        // Each holds a back-reference to this client for shared state
+        // (license, dashboard token, http session, conn, DDL pattern cache).
+        //
+        // As of Phase 5 the Redis-compat helper families (counter / zset /
+        // hash / queue / geo) are nested too, alongside streams (Phase 1+2)
+        // and documents (Phase 4). Search / cache / auth remain flat —
+        // they'll migrate when their own schema-to-core phase fires.
         this.documents = new DocumentsAPI(this);
         this.streams = new StreamsAPI(this);
+        this.counters = new CountersAPI(this);
+        this.zsets = new ZsetsAPI(this);
+        this.hashes = new HashesAPI(this);
+        this.queues = new QueuesAPI(this);
+        this.geos = new GeosAPI(this);
     }
 
     // Builds the argv passed to the proxy binary. Pure — no side effects —
@@ -695,8 +711,14 @@ export class GoldLapel {
     // overrides the default connection for that call. If absent, the
     // connection is resolved from the `using()` scope or the internal default.
 
-    // Document store: gl.documents.<verb>(...). See documents.js.
-    // Streams:        gl.streams.<verb>(...).   See streams.js.
+    // Document store:      gl.documents.<verb>(...).  See documents.js.
+    // Streams:              gl.streams.<verb>(...).    See streams.js.
+    // Phase 5 Redis-compat: gl.counters / gl.zsets / gl.hashes /
+    //                       gl.queues / gl.geos.       See {counters,zsets,
+    //                       hashes,queues,geos}.js.
+    //
+    // The legacy flat helpers (incr, hset, zadd, enqueue, geoadd, …) are
+    // gone — Phase 5 is a hard cut, no aliases. Use the namespaces above.
 
     // Search
     async search(...args) { return _call(this, search, args); }
@@ -717,34 +739,9 @@ export class GoldLapel {
     async analyze(...args) { return _call(this, analyze, args); }
     async explainScore(...args) { return _call(this, explainScore, args); }
 
-    // Pub/Sub & Queues
+    // Pub/Sub
     async publish(...args) { return _call(this, publish, args); }
     async subscribe(...args) { return _call(this, subscribe, args); }
-    async enqueue(...args) { return _call(this, enqueue, args); }
-    async dequeue(...args) { return _call(this, dequeue, args); }
-
-    // Counters
-    async incr(...args) { return _call(this, incr, args); }
-    async getCounter(...args) { return _call(this, getCounter, args); }
-
-    // Hash maps
-    async hset(...args) { return _call(this, hset, args); }
-    async hget(...args) { return _call(this, hget, args); }
-    async hgetall(...args) { return _call(this, hgetall, args); }
-    async hdel(...args) { return _call(this, hdel, args); }
-
-    // Sorted sets
-    async zadd(...args) { return _call(this, zadd, args); }
-    async zincrby(...args) { return _call(this, zincrby, args); }
-    async zrange(...args) { return _call(this, zrange, args); }
-    async zrank(...args) { return _call(this, zrank, args); }
-    async zscore(...args) { return _call(this, zscore, args); }
-    async zrem(...args) { return _call(this, zrem, args); }
-
-    // Geo
-    async geoadd(...args) { return _call(this, geoadd, args); }
-    async georadius(...args) { return _call(this, georadius, args); }
-    async geodist(...args) { return _call(this, geodist, args); }
 
     // Misc
     async countDistinct(...args) { return _call(this, countDistinct, args); }
@@ -850,14 +847,21 @@ export { wrap } from './wrap.js';
 export { NativeCache } from './cache.js';
 export { DocumentsAPI } from './documents.js';
 export { StreamsAPI } from './streams.js';
+export { CountersAPI } from './counters.js';
+export { ZsetsAPI } from './zsets.js';
+export { HashesAPI } from './hashes.js';
+export { QueuesAPI } from './queues.js';
+export { GeosAPI } from './geos.js';
 export {
-    publish, subscribe, enqueue, dequeue,
-    incr, getCounter,
-    zadd, zincrby, zrange, zrank, zscore, zrem,
-    geoadd, georadius, geodist,
-    hset, hget, hgetall, hdel,
+    publish, subscribe,
     countDistinct,
     script,
+    counterIncr, counterDecr, counterSet, counterGet, counterDelete, counterCountKeys,
+    zsetAdd, zsetIncrBy, zsetScore, zsetRank, zsetRange, zsetRangeByScore, zsetRemove, zsetCard,
+    hashSet, hashGet, hashGetAll, hashKeys, hashValues, hashExists, hashDelete, hashLen,
+    queueEnqueue, queueClaim, queueAck, queueAbandon, queueExtend, queuePeek,
+    queueCountReady, queueCountClaimed,
+    geoAdd, geoPos, geoDist, geoRadius, geoRadiusByMember, geoRemove, geoCount,
     streamAdd, streamCreateGroup, streamRead, streamAck, streamClaim,
     search, searchFuzzy, searchPhonetic, similar, suggest,
     facets, aggregate, createSearchConfig,
@@ -882,13 +886,16 @@ export default {
     GoldLapel, start, configKeys, _configToArgs, _logLevelToVerboseFlag,
     wrap, NativeCache,
     DocumentsAPI, StreamsAPI,
-    publish, subscribe, enqueue, dequeue,
-    incr, getCounter,
-    zadd, zincrby, zrange, zrank, zscore, zrem,
-    geoadd, georadius, geodist,
-    hset, hget, hgetall, hdel,
+    CountersAPI, ZsetsAPI, HashesAPI, QueuesAPI, GeosAPI,
+    publish, subscribe,
     countDistinct,
     script,
+    counterIncr, counterDecr, counterSet, counterGet, counterDelete, counterCountKeys,
+    zsetAdd, zsetIncrBy, zsetScore, zsetRank, zsetRange, zsetRangeByScore, zsetRemove, zsetCard,
+    hashSet, hashGet, hashGetAll, hashKeys, hashValues, hashExists, hashDelete, hashLen,
+    queueEnqueue, queueClaim, queueAck, queueAbandon, queueExtend, queuePeek,
+    queueCountReady, queueCountClaimed,
+    geoAdd, geoPos, geoDist, geoRadius, geoRadiusByMember, geoRemove, geoCount,
     streamAdd, streamCreateGroup, streamRead, streamAck, streamClaim,
     search, searchFuzzy, searchPhonetic, similar, suggest,
     facets, aggregate, createSearchConfig,
