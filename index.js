@@ -860,7 +860,7 @@ function _call(gl, fn, args) {
  * @param {number} [opts.dashboardPort]  Dashboard port. Defaults to `proxyPort + 1` (7933 when `proxyPort` is the 7932 default). `0` disables.
  * @param {number} [opts.invalidationPort]  Cache-invalidation port. Defaults to `proxyPort + 2`.
  * @param {'trace'|'debug'|'info'|'warn'|'error'} [opts.logLevel]  Binary log level.
- * @param {string} [opts.mode]  Operating mode (`waiter`, `bellhop`, etc).
+ * @param {string} [opts.mode]  Operating mode (`waiter`, `consideration`, etc).
  * @param {string} [opts.license]  Path to the license file.
  * @param {string} [opts.client]  Client identifier; sets `GOLDLAPEL_CLIENT` for telemetry tagging.
  * @param {string} [opts.configFile]  Path to a TOML config file for the Rust binary (`--config`).
