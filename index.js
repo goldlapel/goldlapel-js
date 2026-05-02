@@ -51,6 +51,23 @@ const DEFAULT_PROXY_PORT = 7932;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
 
+// Wrapper version, read from package.json. CI rewrites the version in
+// package.json from the git tag at publish time; local dev installs read
+// "0.0.0". Used to build the application_name marker on PG connections so
+// the proxy can classify wrapper-vs-raw traffic and gate L2 result cache.
+function _wrapperVersion() {
+    try {
+        const pkg = require(join(__dirname, 'package.json'));
+        return pkg.version || '0.0.0';
+    } catch {
+        return '0.0.0';
+    }
+}
+
+export function _applicationNameMarker() {
+    return `goldlapel:js:${_wrapperVersion()}`;
+}
+
 // Keys that are valid inside the structured `config` map. Top-level concepts
 // (proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
 // client, configFile) are exposed as their own options on GoldLapel's
@@ -213,6 +230,17 @@ export function _findBinary() {
     );
 }
 
+// Append `application_name=goldlapel:js:<version>` to `url` unless it already
+// has one (or PGAPPNAME is set in the env). The marker tells the proxy this
+// is wrapper traffic, so it can skip L2 result cache (the wrapper already has
+// its own L1). Idempotent and override-respecting.
+function _injectApplicationName(url) {
+    if (/[?&]application_name=/.test(url)) return url;
+    if (process.env.PGAPPNAME) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}application_name=${_applicationNameMarker()}`;
+}
+
 export function _makeProxyUrl(upstream, port) {
     // Build a proxy URL: replace host with localhost and set the proxy port.
     // Uses regex instead of URL class to avoid decoding percent-encoded characters
@@ -242,11 +270,12 @@ export function _makeProxyUrl(upstream, port) {
             hostPart = authority;
         }
 
-        // Replace host[:port] with localhost:proxyPort
-        return `${scheme}${userinfo}localhost:${port}${pathEtc}`;
+        // Replace host[:port] with localhost:proxyPort and tag as wrapper traffic
+        return _injectApplicationName(`${scheme}${userinfo}localhost:${port}${pathEtc}`);
     }
 
-    // bare host:port (only if not a URL — guard against splitting on scheme colons)
+    // bare host:port (only if not a URL — guard against splitting on scheme colons).
+    // Bare-host form skips the marker — atypical caller path.
     if (!upstream.includes('://') && upstream.includes(':')) {
         return `localhost:${port}`;
     }
