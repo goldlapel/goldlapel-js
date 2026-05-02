@@ -8,11 +8,27 @@ import os from 'os';
 import {
     GoldLapel,
     configKeys,
+    _applicationNameMarker,
     _findBinary,
     _makeProxyUrl,
     _waitForPort,
     _configToArgs,
 } from '../index.js';
+
+// The proxy URL gets `application_name=goldlapel:js:<version>` appended so
+// the proxy can classify wrapper-vs-raw traffic and skip L2 cache for
+// wrappers (they have their own L1). The suffix is computed from the
+// installed package.json — local dev installs see "0.0.0".
+const _APP_NAME_SUFFIX = `application_name=${_applicationNameMarker()}`;
+
+// Every test in this file runs without PGAPPNAME so the marker is applied
+// deterministically. (A developer with PGAPPNAME set in their shell would
+// otherwise see different URLs.)
+const _origPgappname = process.env.PGAPPNAME;
+delete process.env.PGAPPNAME;
+process.on('exit', () => {
+    if (_origPgappname !== undefined) process.env.PGAPPNAME = _origPgappname;
+});
 
 
 describe('findBinary', () => {
@@ -54,32 +70,33 @@ describe('makeProxyUrl', () => {
     it('replaces host and port in postgresql URL', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:pass@dbhost:5432/mydb', 7932),
-            'postgresql://user:pass@localhost:7932/mydb'
+            `postgresql://user:pass@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('replaces host and port in postgres URL', () => {
         assert.strictEqual(
             _makeProxyUrl('postgres://user:pass@remote.aws.com:5432/mydb', 7932),
-            'postgres://user:pass@localhost:7932/mydb'
+            `postgres://user:pass@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles pg URL without explicit port', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:pass@host.aws.com/mydb', 7932),
-            'postgresql://user:pass@localhost:7932/mydb'
+            `postgresql://user:pass@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles pg URL without port or path', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:pass@host.aws.com', 7932),
-            'postgresql://user:pass@localhost:7932'
+            `postgresql://user:pass@localhost:7932?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('replaces port in bare host:port', () => {
+        // Bare-host form skips the marker — atypical caller path.
         assert.strictEqual(_makeProxyUrl('dbhost:5432', 7932), 'localhost:7932');
     });
 
@@ -90,85 +107,126 @@ describe('makeProxyUrl', () => {
     it('preserves query params', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:pass@remote:5432/mydb?sslmode=require', 7932),
-            'postgresql://user:pass@localhost:7932/mydb?sslmode=require'
+            `postgresql://user:pass@localhost:7932/mydb?sslmode=require&${_APP_NAME_SUFFIX}`
         );
     });
 
     it('preserves percent-encoded characters in password', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:p%40ss@remote:5432/mydb', 7932),
-            'postgresql://user:p%40ss@localhost:7932/mydb'
+            `postgresql://user:p%40ss@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles URL without userinfo', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://dbhost:5432/mydb', 7932),
-            'postgresql://localhost:7932/mydb'
+            `postgresql://localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles URL without userinfo and without port', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://dbhost/mydb', 7932),
-            'postgresql://localhost:7932/mydb'
+            `postgresql://localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('keeps localhost when upstream is already localhost', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:pass@localhost:5432/mydb', 7932),
-            'postgresql://user:pass@localhost:7932/mydb'
+            `postgresql://user:pass@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles @ in password with port', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:p@ss@host:5432/mydb', 7932),
-            'postgresql://user:p@ss@localhost:7932/mydb'
+            `postgresql://user:p@ss@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles @ in password without port', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:p@ss@host/mydb', 7932),
-            'postgresql://user:p@ss@localhost:7932/mydb'
+            `postgresql://user:p@ss@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles @ in password with query params', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue', 7932),
-            'postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue'
+            `postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles password starting with digits without explicit port', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:1pass@host/mydb', 7932),
-            'postgresql://user:1pass@localhost:7932/mydb'
+            `postgresql://user:1pass@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles all-digit password without explicit port', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:5432@host/mydb', 7932),
-            'postgresql://user:5432@localhost:7932/mydb'
+            `postgresql://user:5432@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles password starting with digits with explicit port', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:9999@host:5432/mydb', 7932),
-            'postgresql://user:9999@localhost:7932/mydb'
+            `postgresql://user:9999@localhost:7932/mydb?${_APP_NAME_SUFFIX}`
         );
     });
 
     it('handles all-digit password without port or path', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:12345@host', 7932),
-            'postgresql://user:12345@localhost:7932'
+            `postgresql://user:12345@localhost:7932?${_APP_NAME_SUFFIX}`
         );
+    });
+});
+
+
+describe('applicationNameMarker', () => {
+    // L2-router architecture: the wrapper tags PG connections with
+    // `application_name=goldlapel:js:<version>` so the proxy can classify
+    // wrapper-vs-raw traffic and gate L2 result cache (wrapper has its
+    // own L1; raw clients don't).
+
+    it('marker has goldlapel:js:<version> shape', () => {
+        const m = _applicationNameMarker();
+        assert.match(m, /^goldlapel:js:.+$/);
+    });
+
+    it('appends marker when no existing query', () => {
+        const out = _makeProxyUrl('postgresql://localhost:5432/mydb', 7932);
+        assert.ok(out.includes(`?${_APP_NAME_SUFFIX}`), `expected suffix in ${out}`);
+    });
+
+    it('appends marker after existing query params', () => {
+        const out = _makeProxyUrl('postgresql://localhost:5432/mydb?sslmode=require', 7932);
+        assert.ok(out.includes('sslmode=require'));
+        assert.ok(out.includes(`&${_APP_NAME_SUFFIX}`));
+    });
+
+    it('respects user-set application_name in URL (does not override)', () => {
+        const out = _makeProxyUrl('postgresql://localhost:5432/mydb?application_name=my-app', 7932);
+        assert.ok(out.includes('application_name=my-app'));
+        assert.ok(!out.includes('goldlapel:js'));
+    });
+
+    it('respects PGAPPNAME env var (does not override)', () => {
+        process.env.PGAPPNAME = 'my-app';
+        try {
+            const out = _makeProxyUrl('postgresql://localhost:5432/mydb', 7932);
+            assert.ok(!out.includes('application_name='));
+            assert.ok(!out.includes('goldlapel:js'));
+        } finally {
+            delete process.env.PGAPPNAME;
+        }
     });
 });
 
