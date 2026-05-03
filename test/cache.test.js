@@ -1,16 +1,22 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'net';
-import { NativeCache, makeKey, detectWrite, extractTables, DDL_SENTINEL, TX_START, TX_END } from '../cache.js';
+import {
+    NativeCache, makeKey, detectWrite, extractTables,
+    DDL_SENTINEL, TX_START, TX_END,
+    EVICT_RATE_WINDOW, EVICT_RATE_HIGH, EVICT_RATE_LOW,
+} from '../cache.js';
 
 function makeCache(opts = {}) {
     NativeCache._reset();
     if (opts.maxEntries) process.env.GOLDLAPEL_NATIVE_CACHE_SIZE = String(opts.maxEntries);
     if (opts.enabled === false) process.env.GOLDLAPEL_NATIVE_CACHE = 'false';
+    if (opts.reportStats === false) process.env.GOLDLAPEL_REPORT_STATS = 'false';
     const cache = new NativeCache();
     if (opts.connected !== false) cache._invalidationConnected = true;
     delete process.env.GOLDLAPEL_NATIVE_CACHE_SIZE;
     delete process.env.GOLDLAPEL_NATIVE_CACHE;
+    delete process.env.GOLDLAPEL_REPORT_STATS;
     return cache;
 }
 
@@ -428,5 +434,394 @@ describe('concurrent put/get/invalidate', () => {
         conn.destroy();
         server.close();
         cache.stopInvalidation();
+    });
+});
+
+// ─── L1 telemetry: counters + snapshot ─────────────────────────────────────
+
+describe('evictions counter', () => {
+    it('starts at zero', () => {
+        const cache = makeCache({ maxEntries: 4 });
+        assert.equal(cache.statsEvictions, 0);
+    });
+
+    it('bumps on overflow', () => {
+        const cache = makeCache({ maxEntries: 4 });
+        for (let i = 0; i < 8; i++) {
+            cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+        }
+        // 8 puts, capacity 4 → 4 evictions.
+        assert.equal(cache.statsEvictions, 4);
+    });
+
+    it('no bump within capacity', () => {
+        const cache = makeCache({ maxEntries: 8 });
+        for (let i = 0; i < 4; i++) {
+            cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+        }
+        assert.equal(cache.statsEvictions, 0);
+    });
+});
+
+describe('snapshot shape', () => {
+    it('carries required fields', () => {
+        const cache = makeCache({ maxEntries: 64 });
+        cache.put('SELECT 1', null, [{ x: 1 }], []);
+        cache.get('SELECT 1', null);
+        cache.get('SELECT MISS', null);
+        const snap = cache._buildSnapshot();
+        assert.equal(snap.wrapper_id, cache._wrapperId);
+        assert.equal(snap.lang, 'javascript');
+        assert.ok('version' in snap);
+        assert.equal(snap.hits, 1);
+        assert.equal(snap.misses, 1);
+        assert.equal(snap.evictions, 0);
+        assert.equal(snap.invalidations, 0);
+        assert.equal(snap.current_size_entries, 1);
+        assert.equal(snap.capacity_entries, 64);
+    });
+
+    it('wrapper_id is a UUID v4', () => {
+        const cache = makeCache();
+        // RFC 4122 UUID v4 format: 8-4-4-4-12 hex with version nibble = 4
+        // and variant nibble in {8,9,a,b}.
+        const re = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+        assert.match(cache._wrapperId, re);
+    });
+
+    it('wrapper_id stable across snapshots', () => {
+        const cache = makeCache();
+        const a = cache._buildSnapshot().wrapper_id;
+        const b = cache._buildSnapshot().wrapper_id;
+        assert.equal(a, b);
+    });
+});
+
+// ─── L1 telemetry: emit pipeline (unit, no socket) ─────────────────────────
+
+describe('emit pipeline', () => {
+    it('process_request snapshot emits R: line', () => {
+        const cache = makeCache();
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        cache._processRequest('snapshot');
+        const rLines = emissions.filter(l => l.startsWith('R:'));
+        assert.equal(rLines.length, 1);
+        const payload = JSON.parse(rLines[0].slice(2));
+        assert.equal(payload.wrapper_id, cache._wrapperId);
+        assert.equal(payload.lang, 'javascript');
+        assert.ok(typeof payload.ts_ms === 'number');
+    });
+
+    it('process_request empty body treated as snapshot', () => {
+        const cache = makeCache();
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        cache._processRequest('');
+        const rLines = emissions.filter(l => l.startsWith('R:'));
+        assert.equal(rLines.length, 1);
+    });
+
+    it('process_request unknown body silently dropped', () => {
+        const cache = makeCache();
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        cache._processRequest('future_request_type');
+        const rLines = emissions.filter(l => l.startsWith('R:'));
+        assert.equal(rLines.length, 0);
+    });
+
+    it('process_signal routes ?:snapshot to response', () => {
+        const cache = makeCache();
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        cache._processSignal('?:snapshot');
+        assert.equal(emissions.filter(l => l.startsWith('R:')).length, 1);
+    });
+
+    it('emit_state_change adds state field', () => {
+        const cache = makeCache();
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        cache._emitStateChange('wrapper_connected');
+        const sLines = emissions.filter(l => l.startsWith('S:'));
+        assert.equal(sLines.length, 1);
+        const payload = JSON.parse(sLines[0].slice(2));
+        assert.equal(payload.state, 'wrapper_connected');
+        assert.equal(payload.wrapper_id, cache._wrapperId);
+    });
+
+    it('report_stats=false suppresses emissions', () => {
+        const cache = makeCache({ reportStats: false });
+        assert.equal(cache._reportStats, false);
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        cache._emitStateChange('wrapper_connected');
+        cache._emitResponse();
+        cache._processRequest('snapshot');
+        // _sendLine isn't even reached, but the spy here demonstrates
+        // the upstream emit functions short-circuit before calling it.
+        // _sendLine itself also short-circuits (covered separately).
+        assert.equal(emissions.length, 0);
+    });
+});
+
+// ─── L1 telemetry: eviction-rate state changes ─────────────────────────────
+
+describe('eviction-rate state change', () => {
+    it('cache_full fires when evictions dominate', () => {
+        // Capacity 4 — every put past the 4th evicts. Once we cross
+        // the warmup window the rate is ~99% and cache_full fires.
+        const cache = makeCache({ maxEntries: 4 });
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        for (let i = 0; i < EVICT_RATE_WINDOW + 10; i++) {
+            cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+        }
+        const fullLines = emissions.filter(l => l.includes('cache_full'));
+        assert.ok(fullLines.length >= 1, `expected at least one cache_full, got ${emissions.length} emissions`);
+    });
+
+    it('cache_full does not fire below window', () => {
+        // Warmup gate — fewer puts than the window means no signal yet.
+        const cache = makeCache({ maxEntries: 2 });
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        for (let i = 0; i < EVICT_RATE_WINDOW - 1; i++) {
+            cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+        }
+        assert.ok(!emissions.some(l => l.includes('cache_full')));
+    });
+
+    it('cache_full fires only once per high-rate run (latched)', () => {
+        // Once cache_full has fired, sustained-high doesn't re-emit.
+        // Hysteresis keeps the dashboard from drowning in repeats.
+        const cache = makeCache({ maxEntries: 4 });
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        // Big run to make sure we cross the window threshold and stay
+        // above HIGH for a long time.
+        for (let i = 0; i < EVICT_RATE_WINDOW * 3; i++) {
+            cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+        }
+        const fullLines = emissions.filter(l => l.includes('cache_full'));
+        assert.equal(fullLines.length, 1);
+    });
+
+    it('cache_recovered fires when rate drops back below LOW', () => {
+        // First saturate to flip the latch. Then put lots of duplicate
+        // keys (re-puts don't evict) to dilute the eviction rate below
+        // EVICT_RATE_LOW and trigger cache_recovered.
+        const cache = makeCache({ maxEntries: 4 });
+        const emissions = [];
+        cache._sendLine = (line) => emissions.push(line);
+        // Phase 1: distinct keys → high eviction rate → cache_full.
+        for (let i = 0; i < EVICT_RATE_WINDOW + 10; i++) {
+            cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+        }
+        assert.ok(emissions.some(l => l.includes('cache_full')));
+        // Phase 2: re-put existing keys (well, re-put the same SELECT
+        // 0..3 which are still in the cache after phase 1 saturation).
+        // Actually the cache is full of the latest 4 entries, so re-put
+        // those.
+        emissions.length = 0;
+        for (let i = 0; i < EVICT_RATE_WINDOW + 10; i++) {
+            // Pick keys that round-trip in the small capacity; cycling
+            // through a *small* set under capacity means no evictions.
+            const k = i % 4;
+            // Need keys that are currently in the cache — phase 1 left
+            // the LAST 4 puts in. Keep re-putting those exact keys.
+            const idx = (EVICT_RATE_WINDOW + 6 + k);
+            cache.put(`SELECT ${idx}`, null, [{ x: idx }], []);
+        }
+        // After enough no-eviction puts, the window is dominated by 0s.
+        assert.ok(emissions.some(l => l.includes('cache_recovered')),
+            `expected cache_recovered emission, got ${emissions.map(e => e.slice(0, 40))}`);
+    });
+});
+
+// ─── L1 telemetry: integration via real socket ─────────────────────────────
+
+function _spawnServer() {
+    return new Promise((resolve) => {
+        const server = createServer();
+        server.listen(0, '127.0.0.1', () => {
+            resolve({ server, port: server.address().port });
+        });
+    });
+}
+
+function _attachReader(conn) {
+    // Returns a `{ lines, waitFor, stop }` triple. `lines` is the live
+    // accumulator, `waitFor(predicate, timeout)` polls until the
+    // predicate is true (or rejects), `stop()` tears the reader down.
+    const lines = [];
+    let buf = '';
+    const onData = (chunk) => {
+        buf += chunk.toString('utf8');
+        let idx;
+        while ((idx = buf.indexOf('\n')) !== -1) {
+            lines.push(buf.slice(0, idx));
+            buf = buf.slice(idx + 1);
+        }
+    };
+    conn.on('data', onData);
+    const waitFor = (predicate, timeout = 2000) => new Promise((resolve, reject) => {
+        const deadline = Date.now() + timeout;
+        const tick = () => {
+            if (predicate(lines)) return resolve();
+            if (Date.now() >= deadline) {
+                return reject(new Error(`timeout; lines=${JSON.stringify(lines)}`));
+            }
+            setTimeout(tick, 20);
+        };
+        tick();
+    });
+    const stop = () => {
+        conn.off('data', onData);
+        try { conn.destroy(); } catch {}
+    };
+    return { lines, waitFor, stop };
+}
+
+describe('state-change emission via socket', () => {
+    it('wrapper_connected emitted on socket connect', async () => {
+        const cache = makeCache();
+        cache._invalidationConnected = false; // start unconnected
+        const { server, port } = await _spawnServer();
+        try {
+            cache.connectInvalidation(port);
+            const conn = await new Promise(resolve => server.once('connection', resolve));
+            const reader = _attachReader(conn);
+            try {
+                await reader.waitFor(lines => lines.some(l => l.startsWith('S:')));
+                const sLines = reader.lines.filter(l => l.startsWith('S:'));
+                assert.ok(sLines.length >= 1);
+                const payload = JSON.parse(sLines[0].slice(2));
+                assert.equal(payload.state, 'wrapper_connected');
+                assert.equal(payload.wrapper_id, cache._wrapperId);
+                assert.equal(payload.lang, 'javascript');
+            } finally {
+                reader.stop();
+            }
+        } finally {
+            cache.stopInvalidation();
+            server.close();
+        }
+    });
+
+    it('snapshot request returns R: response', async () => {
+        const cache = makeCache();
+        cache._invalidationConnected = false;
+        // Pre-warm some counters so the response is non-trivial.
+        const { server, port } = await _spawnServer();
+        try {
+            cache.connectInvalidation(port);
+            const conn = await new Promise(resolve => server.once('connection', resolve));
+            const reader = _attachReader(conn);
+            try {
+                // Wait for wrapper_connected so we know the socket is
+                // wired both ways.
+                await reader.waitFor(lines => lines.some(l => l.startsWith('S:')));
+                cache.put('SELECT 1', null, [{ x: 1 }], []);
+                cache.get('SELECT 1', null);
+                conn.write('?:snapshot\n');
+                await reader.waitFor(lines => lines.some(l => l.startsWith('R:')));
+                const rLines = reader.lines.filter(l => l.startsWith('R:'));
+                assert.ok(rLines.length >= 1);
+                const payload = JSON.parse(rLines[0].slice(2));
+                assert.equal(payload.wrapper_id, cache._wrapperId);
+                assert.equal(payload.hits, 1);
+                assert.equal(payload.current_size_entries, 1);
+                // R: payloads do NOT carry a state field — that's S:'s
+                // job. The proxy's parser uses prefix to discriminate.
+                assert.equal(payload.state, undefined);
+            } finally {
+                reader.stop();
+            }
+        } finally {
+            cache.stopInvalidation();
+            server.close();
+        }
+    });
+
+    it('cache_full emitted to socket after sustained eviction', async () => {
+        const cache = makeCache({ maxEntries: 4 });
+        cache._invalidationConnected = false;
+        const { server, port } = await _spawnServer();
+        try {
+            cache.connectInvalidation(port);
+            const conn = await new Promise(resolve => server.once('connection', resolve));
+            const reader = _attachReader(conn);
+            try {
+                await reader.waitFor(lines => lines.some(l => l.startsWith('S:')));
+                // Saturate the eviction window. Each put past capacity
+                // bumps the eviction sample to 1. After a full window
+                // of 1s we cross HIGH and emit cache_full.
+                for (let i = 0; i < EVICT_RATE_WINDOW + 10; i++) {
+                    cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+                }
+                await reader.waitFor(
+                    lines => lines.some(l => l.startsWith('S:') && l.includes('cache_full')),
+                    3000,
+                );
+                const fullLine = reader.lines.find(
+                    l => l.startsWith('S:') && l.includes('cache_full'),
+                );
+                const payload = JSON.parse(fullLine.slice(2));
+                assert.equal(payload.state, 'cache_full');
+                // First HIGH crossing happens as soon as the window
+                // fills with mostly-evicting puts. With capacity=4 and
+                // window=200 the first 4 puts don't evict, the next
+                // 196 do — so we expect ~196 evictions when the latch
+                // first flips. Lower bound is loose because the exact
+                // emit point can vary if the threshold check ever
+                // becomes async. Just assert "lots happened".
+                assert.ok(payload.evictions >= EVICT_RATE_WINDOW / 2,
+                    `expected meaningful eviction count, got ${payload.evictions}`);
+            } finally {
+                reader.stop();
+            }
+        } finally {
+            cache.stopInvalidation();
+            server.close();
+        }
+    });
+
+    it('report_stats=false suppresses S: and R: lines on socket', async () => {
+        const cache = makeCache({ reportStats: false });
+        cache._invalidationConnected = false;
+        assert.equal(cache._reportStats, false);
+        const { server, port } = await _spawnServer();
+        try {
+            cache.connectInvalidation(port);
+            const conn = await new Promise(resolve => server.once('connection', resolve));
+            const reader = _attachReader(conn);
+            try {
+                // Give it a beat, then probe with a snapshot request.
+                await new Promise(resolve => setTimeout(resolve, 100));
+                conn.write('?:snapshot\n');
+                await new Promise(resolve => setTimeout(resolve, 200));
+                const noisy = reader.lines.filter(
+                    l => l.startsWith('S:') || l.startsWith('R:'),
+                );
+                assert.deepEqual(noisy, []);
+            } finally {
+                reader.stop();
+            }
+        } finally {
+            cache.stopInvalidation();
+            server.close();
+        }
+    });
+
+    it('unknown proxy prefixes silently ignored', () => {
+        // Forward-compat: future proxies might extend the protocol.
+        // The wrapper must not crash on unknown prefixes.
+        const cache = makeCache();
+        // Should not throw.
+        cache._processSignal('Z:future-prefix');
+        cache._processSignal('$:bogus');
+        cache._processSignal('');
     });
 });

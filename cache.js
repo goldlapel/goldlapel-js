@@ -1,8 +1,43 @@
 import { createConnection } from 'net';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { platform } from 'os';
+import { randomUUID } from 'crypto';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
 const DDL_SENTINEL = '__ddl__';
+
+// --- L1 telemetry tuning ---
+//
+// Demand-driven model (2026-05-03 — port of the Python pattern, see
+// goldlapel-python/docs/wrapper-telemetry-pattern.md): the wrapper has
+// NO background timer. Cache counters increment on cache ops (free);
+// state-change events are emitted synchronously when a relevant counter
+// crosses a threshold; snapshot replies are sent only when the proxy
+// asks via `?:<request>` over the existing invalidation socket.
+//
+// Eviction-rate sliding window. cache_full fires when ≥ EVICT_RATE_HIGH
+// of the last EVICT_RATE_WINDOW cache writes (puts) caused an eviction;
+// cache_recovered fires when the rate falls back below EVICT_RATE_LOW.
+// Hysteresis (50% / 10%) avoids flapping at the boundary.
+const EVICT_RATE_WINDOW = 200;
+const EVICT_RATE_HIGH = 0.5; // 50% of recent puts evicted → cache_full
+const EVICT_RATE_LOW = 0.1;  // ≤ 10% → cache_recovered
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Wrapper version, read once at module init from package.json. Mirrors
+// the `application_name` marker logic in index.js but is duplicated
+// here so the cache module stays standalone (no circular import).
+function _readWrapperVersion() {
+    try {
+        const raw = readFileSync(join(__dirname, 'package.json'), 'utf8');
+        const pkg = JSON.parse(raw);
+        return pkg.version || 'unknown';
+    } catch {
+        return 'unknown';
+    }
+}
 
 const TX_START = /^\s*(BEGIN|START\s+TRANSACTION)\b/i;
 const TX_END = /^\s*(COMMIT|ROLLBACK|END)\b/i;
@@ -122,6 +157,10 @@ function extractTables(sql) {
 }
 
 let _instance = null;
+// Process-level guard so test-driven `_reset()` cycles don't accumulate
+// dozens of `exit`/`SIGINT`/`SIGTERM` listeners and trip Node's default
+// MaxListeners warning. We install the hooks exactly once per process.
+let _exitHooksInstalledGlobal = false;
 
 class NativeCache {
     constructor() {
@@ -139,6 +178,33 @@ class NativeCache {
         this.statsHits = 0;
         this.statsMisses = 0;
         this.statsInvalidations = 0;
+        // L1 telemetry (2026-05-03). Eviction counter — was missing
+        // before; bumped in `_evictOne`. Configurable opt-out: set
+        // GOLDLAPEL_REPORT_STATS=false to disable all snapshot replies
+        // and state-change emissions (cache continues to function;
+        // invalidation listener still runs, only telemetry output is
+        // suppressed).
+        this.statsEvictions = 0;
+        this._reportStats = (
+            (process.env.GOLDLAPEL_REPORT_STATS || 'true').toLowerCase() !== 'false'
+        );
+        // Stable wrapper identity for the lifetime of the process. Lets
+        // the proxy aggregate per wrapper across reconnects.
+        this._wrapperId = randomUUID();
+        this._wrapperLang = 'javascript';
+        this._wrapperVersion = _readWrapperVersion();
+        // Sliding window for eviction-rate state-change detection. A
+        // bounded ring buffer; updates are O(1) amortised. We keep a
+        // running sum (`_recentEvictionsSum`) updated on every record
+        // so the threshold check is O(1) — the hot path is each put.
+        // 1 = evicted on this put, 0 = inserted without eviction.
+        this._recentEvictions = [];
+        this._recentEvictionsIdx = 0;
+        this._recentEvictionsSum = 0;
+        // Latched state — only emit a state-change event when the state
+        // transitions. Without latching the wrapper would re-emit every
+        // put once the rate crossed the threshold.
+        this._stateCacheFull = false;
         _instance = this;
     }
 
@@ -167,10 +233,12 @@ class NativeCache {
         const key = makeKey(sql, values);
         if (key === null) return;
         const tables = extractTables(sql);
+        let evicted = 0;
         if (this._cache.has(key)) {
             this._cache.delete(key);
         } else if (this._cache.size >= this._maxEntries) {
             this._evictOne();
+            evicted = 1;
         }
         this._cache.set(key, { rows, fields, tables });
         for (const table of tables) {
@@ -181,6 +249,12 @@ class NativeCache {
             }
             keys.add(key);
         }
+        this._recordEviction(evicted);
+        // Eviction-rate threshold check. Emits `cache_full` /
+        // `cache_recovered` on transition; no-op otherwise. Cheap
+        // (constant-time sum over a bounded ring) so it's safe on the
+        // hot path.
+        this._maybeEmitEvictionRateStateChange();
     }
 
     invalidateTable(table) {
@@ -217,6 +291,7 @@ class NativeCache {
         if (this._socket) return;
         this._invalidationPort = port;
         this._reconnectAttempt = 0;
+        this._installExitHooks();
         this._tryConnect();
     }
 
@@ -226,6 +301,14 @@ class NativeCache {
             this._reconnectTimer = null;
         }
         if (this._socket) {
+            // Emit `wrapper_disconnected` BEFORE tearing down the socket
+            // so the proxy gets a clean farewell line. Best-effort: if
+            // the underlying FD is already torn down on the kernel side
+            // the write is a no-op (we swallow EPIPE in `_sendLine`).
+            // The at-exit hook is the same emit, but if the user calls
+            // `gl.stop()` explicitly we want the goodbye to happen now,
+            // not at process exit (the socket will already be gone).
+            try { this.emitWrapperDisconnected(); } catch {}
             this._socket.destroy();
             this._socket = null;
         }
@@ -250,6 +333,10 @@ class NativeCache {
             this._invalidationConnected = true;
             this._reconnectAttempt = 0;
             this._buf = '';
+            // Announce ourselves so the proxy can register the wrapper
+            // identity and its language/version. Stash the socket FIRST
+            // (above) so `_emitStateChange` finds it.
+            this._emitStateChange('wrapper_connected');
         });
 
         socket.on('data', (data) => {
@@ -277,6 +364,10 @@ class NativeCache {
     }
 
     _processSignal(line) {
+        // Backwards-compat: unknown prefixes are silently ignored. Older
+        // proxies sent only `I:` and `P:` (keepalive); newer proxies
+        // route additional request types via `?:`. Forward-compat: this
+        // dispatcher accepts any well-formed prefix and routes by type.
         if (line.startsWith('I:')) {
             const table = line.slice(2).trim();
             if (table === '*') {
@@ -284,8 +375,11 @@ class NativeCache {
             } else {
                 this.invalidateTable(table);
             }
+        } else if (line.startsWith('?:')) {
+            // Snapshot request from the proxy. Reply with R:<json>.
+            this._processRequest(line.slice(2));
         }
-        // P: keepalive — ignore
+        // P: keepalive — ignored. Anything else also ignored.
     }
 
     _evictOne() {
@@ -302,7 +396,170 @@ class NativeCache {
                 }
             }
         }
+        this.statsEvictions++;
     }
+
+    // ─── L1 telemetry: sliding window ──────────────────────────────────────
+
+    _recordEviction(evicted) {
+        // Bounded ring — once at capacity, overwrites oldest in O(1).
+        // Records the put() outcome (1 evicted, 0 inserted) and keeps
+        // the running window sum in sync so the threshold check stays
+        // O(1) on the hot path.
+        if (this._recentEvictions.length < EVICT_RATE_WINDOW) {
+            this._recentEvictions.push(evicted);
+            this._recentEvictionsSum += evicted;
+        } else {
+            const old = this._recentEvictions[this._recentEvictionsIdx];
+            this._recentEvictions[this._recentEvictionsIdx] = evicted;
+            this._recentEvictionsSum += evicted - old;
+            this._recentEvictionsIdx = (this._recentEvictionsIdx + 1) % EVICT_RATE_WINDOW;
+        }
+    }
+
+    // ─── L1 telemetry: snapshot + emit ─────────────────────────────────────
+
+    _buildSnapshot() {
+        // The proxy computes deltas across snapshots; we just expose the
+        // raw counters. Counter reads in JS are atomic (single-threaded),
+        // so no lock is needed to keep the snapshot internally
+        // consistent (no `await` between reads either).
+        return {
+            wrapper_id: this._wrapperId,
+            lang: this._wrapperLang,
+            version: this._wrapperVersion,
+            hits: this.statsHits,
+            misses: this.statsMisses,
+            evictions: this.statsEvictions,
+            invalidations: this.statsInvalidations,
+            current_size_entries: this._cache.size,
+            capacity_entries: this._maxEntries,
+        };
+    }
+
+    _sendLine(line) {
+        // Best-effort line write. Socket errors are swallowed: the
+        // 'close' / 'error' handlers will rebuild the connection. We
+        // never throw from the emit path because emissions happen on
+        // the cache hot path (put → cache_full) and synchronously from
+        // process exit hooks (wrapper_disconnected).
+        //
+        // Concurrency: Node is single-threaded for JS execution, so two
+        // emits cannot happen "at the same time" — each `socket.write()`
+        // call enqueues its bytes atomically into the socket's outgoing
+        // stream. No send-lock is needed (unlike the Python wrapper,
+        // where the recv thread and the calling thread can race).
+        if (!this._reportStats) return;
+        const sock = this._socket;
+        if (!sock || sock.destroyed) return;
+        const data = line.endsWith('\n') ? line : line + '\n';
+        try {
+            sock.write(data);
+        } catch {
+            // Connection dead — close handler will rebuild on next
+            // event-loop tick. Don't try to repair from here.
+        }
+    }
+
+    _emitStateChange(state) {
+        if (!this._reportStats) return;
+        const payload = this._buildSnapshot();
+        payload.state = state;
+        payload.ts_ms = Date.now();
+        let line;
+        try {
+            line = 'S:' + JSON.stringify(payload);
+        } catch {
+            return;
+        }
+        this._sendLine(line);
+    }
+
+    _emitResponse(snapshot) {
+        if (!this._reportStats) return;
+        const payload = snapshot ?? this._buildSnapshot();
+        if (payload.ts_ms === undefined) payload.ts_ms = Date.now();
+        let line;
+        try {
+            line = 'R:' + JSON.stringify(payload);
+        } catch {
+            return;
+        }
+        this._sendLine(line);
+    }
+
+    _maybeEmitEvictionRateStateChange() {
+        // Hysteresis-guarded: crossing HIGH emits cache_full, falling
+        // back below LOW emits cache_recovered, rates between the two
+        // leave the latched state unchanged (no flapping). Need a full
+        // window before reporting — a single eviction in 3 puts is
+        // noise, not signal.
+        const n = this._recentEvictions.length;
+        if (n < EVICT_RATE_WINDOW) return;
+        const rate = this._recentEvictionsSum / n;
+        let emit = null;
+        if (!this._stateCacheFull && rate >= EVICT_RATE_HIGH) {
+            this._stateCacheFull = true;
+            emit = 'cache_full';
+        } else if (this._stateCacheFull && rate <= EVICT_RATE_LOW) {
+            this._stateCacheFull = false;
+            emit = 'cache_recovered';
+        }
+        if (emit !== null) {
+            this._emitStateChange(emit);
+        }
+    }
+
+    _processRequest(raw) {
+        // Today the only request is `snapshot`. Future request types
+        // can extend this without breaking older proxies — they'd just
+        // ignore unknown R: replies, but only the proxy that sent ?:<x>
+        // expects a reply, so the contract is local to the request.
+        const body = raw ? raw.trim() : '';
+        if (body === '' || body === 'snapshot') {
+            this._emitResponse();
+        }
+    }
+
+    emitWrapperDisconnected() {
+        // Called from at-exit hooks before the process tears down.
+        // Best-effort; the socket may already be torn down (the proxy
+        // will time us out anyway in that case).
+        this._emitStateChange('wrapper_disconnected');
+    }
+
+    _installExitHooks() {
+        // Process-level guard — we only ever install one set of
+        // listeners per process. Test cycles that reset the singleton
+        // would otherwise accumulate one set per `new NativeCache()`
+        // and trip Node's MaxListeners warning around the 10th cycle.
+        if (_exitHooksInstalledGlobal) return;
+        _exitHooksInstalledGlobal = true;
+
+        // The hooks always re-resolve `_instance` so a reset between
+        // install and exit fires the *current* singleton's emit (or
+        // a no-op if nothing is wired right now).
+        const onExit = () => {
+            try { _instance && _instance.emitWrapperDisconnected(); } catch {}
+        };
+
+        // SIGINT / SIGTERM: run our emit, then let Node's default
+        // disposition exit the process. We only force-exit if no
+        // other handler is registered — otherwise we'd hijack the
+        // user's intentional signal handling.
+        const onSignal = (sig, code) => {
+            try { _instance && _instance.emitWrapperDisconnected(); } catch {}
+            if (process.listenerCount(sig) <= 1) {
+                process.exit(code);
+            }
+        };
+
+        process.on('exit', onExit);
+        process.on('SIGINT', () => onSignal('SIGINT', 130));
+        process.on('SIGTERM', () => onSignal('SIGTERM', 143));
+    }
+
+    // ─── Reconnect ─────────────────────────────────────────────────────────
 
     _scheduleReconnect() {
         if (this._reconnectTimer) return;
@@ -324,4 +581,8 @@ class NativeCache {
     }
 }
 
-export { NativeCache, makeKey, detectWrite, extractTables, DDL_SENTINEL, TX_START, TX_END };
+export {
+    NativeCache, makeKey, detectWrite, extractTables,
+    DDL_SENTINEL, TX_START, TX_END,
+    EVICT_RATE_WINDOW, EVICT_RATE_HIGH, EVICT_RATE_LOW,
+};
