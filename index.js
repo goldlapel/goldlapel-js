@@ -456,7 +456,7 @@ export class GoldLapel {
     constructor(upstream, {
         proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
         client, configFile, config, extraArgs, noConnect, silent,
-        mesh, meshTag,
+        mesh, meshTag, enableL2ForWrappers,
     } = {}) {
         this._upstream = upstream;
         this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
@@ -489,6 +489,13 @@ export class GoldLapel {
         // Mesh membership (startup intent — HQ enforces license).
         this._mesh = !!mesh;
         this._meshTag = meshTag ? String(meshTag) : null;
+        // Opt wrapper traffic into the proxy's L2 result cache. Default
+        // `false` matches the per-connection wrapper-skip shipped on the
+        // proxy: wrappers have their own L1, so re-caching at L2 is wasted
+        // memory for single-pod deployments. Fleet customers (multi-pod,
+        // frequent restarts, mesh) flip this on so L2 acts as a shared
+        // cache across processes.
+        this._enableL2ForWrappers = !!enableL2ForWrappers;
         // Validate structured-config keys eagerly so a test that constructs
         // without spawning still catches bad keys.
         const unknown = Object.keys(this._config).filter(k => !VALID_CONFIG_KEYS.has(k));
@@ -563,6 +570,9 @@ export class GoldLapel {
         }
         if (this._meshTag) {
             args.push('--mesh-tag', this._meshTag);
+        }
+        if (this._enableL2ForWrappers) {
+            args.push('--enable-l2-for-wrappers');
         }
         args.push(..._configToArgs(this._config));
         args.push(...this._extraArgs);
@@ -848,6 +858,7 @@ function _call(gl, fn, args) {
  * @param {boolean} [opts.silent]  Suppress the one-line startup banner (wrapper-only; never forwarded to the binary).
  * @param {boolean} [opts.mesh]  Opt into the mesh at startup. HQ enforces the license; denial is non-fatal — proxy runs without clustering.
  * @param {string}  [opts.meshTag]  Mesh tag — instances sharing a tag cluster together.
+ * @param {boolean} [opts.enableL2ForWrappers=false]  Opt wrapper traffic into the proxy's L2 result cache. Off by default — wrappers have their own L1 cache, so re-caching at L2 is wasted memory in single-pod setups. Turn on for fleet deployments (multi-pod, frequent restarts, mesh) where L2 acts as a shared cache across processes.
  * @returns {Promise<GoldLapel>}
  */
 export async function start(upstream, opts = {}) {
