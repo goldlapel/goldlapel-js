@@ -825,3 +825,107 @@ describe('state-change emission via socket', () => {
         cache._processSignal('');
     });
 });
+
+// ─── disableL1 — explicit L1 off without losing tuned cache size ───────────
+//
+// `disableL1: true` flips the cache into a no-op pass-through:
+//   * get() never returns an entry; the misses counter ticks (so the
+//     dashboard still sees real read traffic flowing through the wrapper)
+//   * put() is silently dropped — no eviction, no table-index update
+//   * snapshot adds `l1_disabled: true` so the proxy can render "L1 off"
+//     instead of misreading hits=0 as a cold cache
+// Default (omitted or `false`) preserves the existing fully-functional
+// behavior. The toggle is also late-bindable: re-instantiating with
+// `{ disabled: ... }` against the existing singleton flips the bit.
+
+describe('disableL1', () => {
+    it('default (disableL1 omitted) caches normally', () => {
+        const cache = makeCache();
+        assert.equal(cache._disabled, false);
+        cache.put('SELECT * FROM users', null, [{ id: 1 }], [{ name: 'id' }]);
+        const entry = cache.get('SELECT * FROM users', null);
+        assert.ok(entry);
+        assert.equal(cache.statsHits, 1);
+        assert.equal(cache.statsMisses, 0);
+    });
+
+    it('disabled: get returns null even after a put', () => {
+        NativeCache._reset();
+        const cache = new NativeCache({ disabled: true });
+        cache._invalidationConnected = true;
+        cache.put('SELECT * FROM users', null, [{ id: 1 }], [{ name: 'id' }]);
+        assert.equal(cache.get('SELECT * FROM users', null), null);
+    });
+
+    it('disabled: put is a silent no-op — cache stays empty', () => {
+        NativeCache._reset();
+        const cache = new NativeCache({ disabled: true });
+        cache._invalidationConnected = true;
+        cache.put('SELECT * FROM users', null, [{ id: 1 }], []);
+        cache.put('SELECT * FROM orders', null, [{ id: 2 }], []);
+        assert.equal(cache.size, 0);
+        assert.equal(cache._tableIndex.size, 0);
+    });
+
+    it('disabled: misses tick, hits stay 0, evictions stay 0', () => {
+        NativeCache._reset();
+        const cache = new NativeCache({ disabled: true });
+        cache._invalidationConnected = true;
+        // Pretend to populate, then read repeatedly. Every get is a miss.
+        for (let i = 0; i < 50; i++) {
+            cache.put(`SELECT ${i}`, null, [{ x: i }], []);
+        }
+        for (let i = 0; i < 50; i++) {
+            assert.equal(cache.get(`SELECT ${i}`, null), null);
+        }
+        assert.equal(cache.statsHits, 0);
+        assert.equal(cache.statsMisses, 50);
+        assert.equal(cache.statsEvictions, 0);
+    });
+
+    it('snapshot includes l1_disabled: true when disabled', () => {
+        NativeCache._reset();
+        const cache = new NativeCache({ disabled: true });
+        cache._invalidationConnected = true;
+        cache.get('SELECT 1', null); // bumps misses
+        const snap = cache._buildSnapshot();
+        assert.equal(snap.l1_disabled, true);
+        assert.equal(snap.misses, 1);
+        assert.equal(snap.hits, 0);
+    });
+
+    it('snapshot omits l1_disabled when enabled (default)', () => {
+        const cache = makeCache();
+        const snap = cache._buildSnapshot();
+        assert.equal(Object.prototype.hasOwnProperty.call(snap, 'l1_disabled'), false);
+    });
+
+    it('re-instantiating against the singleton flips the bit', () => {
+        // Models the wrap()-then-start() ordering: a wrap() call lazily
+        // creates the cache singleton, then start({ disableL1: true })
+        // applies the flag.
+        NativeCache._reset();
+        const a = new NativeCache(); // first construction, default
+        a._invalidationConnected = true;
+        assert.equal(a._disabled, false);
+
+        const b = new NativeCache({ disabled: true });
+        assert.strictEqual(a, b, 'same singleton instance');
+        assert.equal(a._disabled, true);
+
+        // And the flip is reversible.
+        const c = new NativeCache({ disabled: false });
+        assert.strictEqual(a, c);
+        assert.equal(a._disabled, false);
+    });
+
+    it('omitting disabled on re-entry leaves singleton state untouched', () => {
+        NativeCache._reset();
+        const a = new NativeCache({ disabled: true });
+        a._invalidationConnected = true;
+        // No `disabled` key in opts — must not reset to default false.
+        const b = new NativeCache({});
+        assert.strictEqual(a, b);
+        assert.equal(a._disabled, true);
+    });
+});

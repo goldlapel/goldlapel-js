@@ -163,12 +163,30 @@ let _instance = null;
 let _exitHooksInstalledGlobal = false;
 
 class NativeCache {
-    constructor() {
-        if (_instance) return _instance;
+    constructor(opts = {}) {
+        if (_instance) {
+            // Re-entry against the existing singleton. Only `disabled` is
+            // applicable here — other state (capacity, env-driven enable
+            // flag, sockets) is fixed at first construction. This lets
+            // `GoldLapel({ disableL1: true })` flip the bit on a cache
+            // that a `wrap()` call already lazily created.
+            if (opts && Object.prototype.hasOwnProperty.call(opts, 'disabled')) {
+                _instance._disabled = !!opts.disabled;
+            }
+            return _instance;
+        }
         this._cache = new Map();
         this._tableIndex = new Map();
         this._maxEntries = parseInt(process.env.GOLDLAPEL_NATIVE_CACHE_SIZE || '32768', 10);
         this._enabled = (process.env.GOLDLAPEL_NATIVE_CACHE || 'true').toLowerCase() !== 'false';
+        // Explicit L1 toggle — distinct from `_enabled` (which gates the
+        // whole module via env var). When `_disabled` is true the cache
+        // acts as a no-op pass-through: get() always misses (and bumps
+        // the misses counter so dashboards still see traffic), put() is
+        // a no-op, no eviction occurs. Invalidation socket still
+        // connects so telemetry continues to flow. Default false; flipped
+        // via `goldlapel.start(url, { disableL1: true })`.
+        this._disabled = !!opts.disabled;
         this._invalidationConnected = false;
         this._socket = null;
         this._reconnectTimer = null;
@@ -214,6 +232,14 @@ class NativeCache {
 
     get(sql, values) {
         if (!this._enabled || !this._invalidationConnected) return null;
+        // L1 disabled: every get is a miss. We still bump the miss
+        // counter so the dashboard sees real read traffic flowing
+        // through the wrapper; hits stay 0 (no entries are ever
+        // stored), evictions stay 0.
+        if (this._disabled) {
+            this.statsMisses++;
+            return null;
+        }
         const key = makeKey(sql, values);
         if (key === null) return null;
         const entry = this._cache.get(key);
@@ -230,6 +256,10 @@ class NativeCache {
 
     put(sql, values, rows, fields) {
         if (!this._enabled || !this._invalidationConnected) return;
+        // L1 disabled: drop the write silently. No eviction, no table
+        // index update — the cache stays empty for the lifetime of the
+        // process.
+        if (this._disabled) return;
         const key = makeKey(sql, values);
         if (key === null) return;
         const tables = extractTables(sql);
@@ -424,7 +454,7 @@ class NativeCache {
         // raw counters. Counter reads in JS are atomic (single-threaded),
         // so no lock is needed to keep the snapshot internally
         // consistent (no `await` between reads either).
-        return {
+        const snap = {
             wrapper_id: this._wrapperId,
             lang: this._wrapperLang,
             version: this._wrapperVersion,
@@ -435,6 +465,12 @@ class NativeCache {
             current_size_entries: this._cache.size,
             capacity_entries: this._maxEntries,
         };
+        // Surface the explicit-disable bit so the dashboard can render
+        // "L1 off" rather than misreading hits=0 as a cold cache. Only
+        // emit the field when truthy to keep the on-the-wire snapshot
+        // shape identical for the common (enabled) case.
+        if (this._disabled) snap.l1_disabled = true;
+        return snap;
     }
 
     _sendLine(line) {

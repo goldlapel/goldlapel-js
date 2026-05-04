@@ -456,7 +456,7 @@ export class GoldLapel {
     constructor(upstream, {
         proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
         client, configFile, config, extraArgs, noConnect, silent,
-        mesh, meshTag, enableL2ForWrappers,
+        mesh, meshTag, enableL2ForWrappers, disableL1,
     } = {}) {
         this._upstream = upstream;
         this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
@@ -496,6 +496,22 @@ export class GoldLapel {
         // frequent restarts, mesh) flip this on so L2 acts as a shared
         // cache across processes.
         this._enableL2ForWrappers = !!enableL2ForWrappers;
+        // Toggle the wrapper's in-process L1 cache off without losing the
+        // tuned `cacheSize`. When `true`, NativeCache acts as a no-op
+        // pass-through (get always misses, put is a no-op) — the
+        // invalidation socket still connects so telemetry continues to
+        // flow. The previous workaround was `cacheSize: 0`, which forced
+        // customers to discard their tuned size to flip the layer; the
+        // explicit option lets them keep the size and still toggle.
+        // Applied to the NativeCache singleton at construction time so a
+        // later `wrap(client)` call sees the right state immediately.
+        this._disableL1 = !!disableL1;
+        // Push `disabled` into the cache singleton now (creates the
+        // singleton if `wrap()` hasn't yet). This keeps the toggle
+        // effective regardless of whether the user calls wrap() before
+        // or after start(), and without forcing GL to mutate cache state
+        // later from spawn paths that aren't always exercised in tests.
+        new NativeCache({ disabled: this._disableL1 });
         // Validate structured-config keys eagerly so a test that constructs
         // without spawning still catches bad keys.
         const unknown = Object.keys(this._config).filter(k => !VALID_CONFIG_KEYS.has(k));
@@ -859,6 +875,7 @@ function _call(gl, fn, args) {
  * @param {boolean} [opts.mesh]  Opt into the mesh at startup. HQ enforces the license; denial is non-fatal — proxy runs without clustering.
  * @param {string}  [opts.meshTag]  Mesh tag — instances sharing a tag cluster together.
  * @param {boolean} [opts.enableL2ForWrappers=false]  Opt wrapper traffic into the proxy's L2 result cache. Off by default — wrappers have their own L1 cache, so re-caching at L2 is wasted memory in single-pod setups. Turn on for fleet deployments (multi-pod, frequent restarts, mesh) where L2 acts as a shared cache across processes.
+ * @param {boolean} [opts.disableL1=false]  Disable the wrapper's in-process L1 cache without losing the tuned `cacheSize`. When `true`, gets always miss and puts are no-ops; the invalidation socket still connects so telemetry continues to flow. Use to A/B the L1 layer (e.g. measure end-to-end latency with and without it) while keeping your size config intact.
  * @returns {Promise<GoldLapel>}
  */
 export async function start(upstream, opts = {}) {
