@@ -1,7 +1,33 @@
 import {
     NativeCache, detectWrite, DDL_SENTINEL, TX_START, TX_END,
-    ConnectionGucState,
+    ConnectionGucState, splitStatements,
 } from './cache.js';
+
+// Multi-statement Q-message write detection. Reuses splitStatements so
+// `SET app.user_id = '42'; INSERT INTO orders VALUES (1)` (a single Q
+// message) doesn't slip past detectWrite's first-token check. Returns:
+//   - DDL_SENTINEL  if any segment is DDL (caller invalidateAll's)
+//   - Set<string>   of table names if any segments are table-scoped writes
+//   - null          if no segment is a write
+// Single-statement bodies skip the splitter entirely (hot path).
+function detectWritesMulti(sql) {
+    if (typeof sql !== 'string' || sql.length === 0) return null;
+    // Fast path: no inner `;` → single-statement, original detectWrite.
+    const trimmed = sql.trimEnd().replace(/;+$/, '');
+    if (!trimmed.includes(';')) {
+        const t = detectWrite(sql);
+        if (t === null) return null;
+        if (t === DDL_SENTINEL) return DDL_SENTINEL;
+        return new Set([t]);
+    }
+    const tables = new Set();
+    for (const seg of splitStatements(sql)) {
+        const t = detectWrite(seg);
+        if (t === DDL_SENTINEL) return DDL_SENTINEL;
+        if (t !== null) tables.add(t);
+    }
+    return tables.size > 0 ? tables : null;
+}
 
 let _cache = null;
 
@@ -66,6 +92,23 @@ class CachedClient {
             this._gucState.observeSql(sql);
         }
 
+        // Multi-statement-aware write detection. Runs BEFORE transaction
+        // tracking so a single Q message like `BEGIN; INSERT INTO orders
+        // VALUES (1); COMMIT` still surfaces the INSERT for invalidation
+        // — TX_START's first-token check would otherwise swallow the
+        // whole body as a transaction-boundary marker and the INSERT
+        // would never invalidate the `orders` cache slot. Same gap fixed
+        // for `SET app.tenant = 'x'; INSERT INTO t ...` (SET hides the
+        // INSERT from detectWrite's single-token shape).
+        const writeTables = detectWritesMulti(sql);
+        if (writeTables !== null) {
+            if (writeTables === DDL_SENTINEL) {
+                this._cache.invalidateAll();
+            } else {
+                for (const t of writeTables) this._cache.invalidateTable(t);
+            }
+        }
+
         // Transaction tracking
         if (TX_START.test(sql)) {
             this._inTransaction = true;
@@ -76,14 +119,12 @@ class CachedClient {
             return this._real.query(textOrConfig, values);
         }
 
-        // Write detection + self-invalidation
-        const writeTable = detectWrite(sql);
-        if (writeTable) {
-            if (writeTable === DDL_SENTINEL) {
-                this._cache.invalidateAll();
-            } else {
-                this._cache.invalidateTable(writeTable);
-            }
+        // If this was a single-statement write, we've already invalidated
+        // and now just dispatch to the real client without going through
+        // the read path. Multi-statement bodies that contain writes
+        // alongside SELECTs are uncacheable (extractTables on the joined
+        // SQL would index against the wrong slot), so they also exit here.
+        if (writeTables !== null) {
             return this._real.query(textOrConfig, values);
         }
 

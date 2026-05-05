@@ -432,3 +432,86 @@ describe('edge cases', () => {
         assert.equal(cache.get('SELECT * FROM orders', null), null);
     });
 });
+
+// --- Multi-statement Q-message write detection ---
+//
+// `CachedClient.query("SET app.tenant = 'x'; INSERT INTO orders ...")` is
+// a single Q wire message containing two statements. Pre-fix, detectWrite
+// looked at the first token only — saw SET, returned null, and the
+// INSERT slipped past invalidation. The fix routes multi-statement
+// bodies through splitStatements + per-segment detectWrite, unioning
+// the invalidations. Same gap applied to `BEGIN; INSERT...; COMMIT`,
+// where TX_START's first-token match used to swallow the INSERT.
+
+describe('multi-statement write detection', () => {
+    it('SET prelude does not hide the INSERT — orders gets invalidated', async () => {
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        cache.put('SELECT * FROM orders', null, [{ id: 1 }], []);
+        const cached = new CachedClient(client, cache);
+        await cached.query("SET app.tenant = 'x'; INSERT INTO orders VALUES (2); SELECT 1");
+        // The cached SELECT must be evicted under the baseline (hash 0)
+        // slot; the SET shifted the hash for subsequent reads but the
+        // INSERT must still invalidate the prior baseline slot.
+        assert.equal(cache.get('SELECT * FROM orders', null), null);
+    });
+
+    it('BEGIN-prefixed multi-statement still invalidates inner INSERT', async () => {
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        cache.put('SELECT * FROM orders', null, [{ id: 1 }], []);
+        const cached = new CachedClient(client, cache);
+        // Pre-fix: TX_START matched BEGIN, returned early before
+        // detectWrite ran on any segment → orders cache slot survived
+        // the INSERT.
+        await cached.query('BEGIN; INSERT INTO orders VALUES (2); COMMIT');
+        assert.equal(cache.get('SELECT * FROM orders', null), null);
+    });
+
+    it('multi-statement DDL short-circuits to invalidateAll', async () => {
+        const client = mockClient({ rows: [], fields: null, rowCount: 0, command: 'CREATE' });
+        const cache = makeConnectedCache();
+        cache.put('SELECT * FROM orders', null, [{ id: 1 }], []);
+        cache.put('SELECT * FROM users', null, [{ id: 2 }], []);
+        const cached = new CachedClient(client, cache);
+        await cached.query('INSERT INTO orders VALUES (3); CREATE TABLE foo (id int)');
+        // DDL_SENTINEL → invalidateAll, both entries cleared.
+        assert.equal(cache.get('SELECT * FROM orders', null), null);
+        assert.equal(cache.get('SELECT * FROM users', null), null);
+    });
+
+    it('union of invalidations across multiple writes in one Q', async () => {
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        cache.put('SELECT * FROM orders', null, [{ id: 1 }], []);
+        cache.put('SELECT * FROM users', null, [{ id: 2 }], []);
+        cache.put('SELECT * FROM widgets', null, [{ id: 3 }], []);
+        const cached = new CachedClient(client, cache);
+        await cached.query(
+            'INSERT INTO orders VALUES (10); UPDATE users SET name = \'x\' WHERE id = 1'
+        );
+        assert.equal(cache.get('SELECT * FROM orders', null), null);
+        assert.equal(cache.get('SELECT * FROM users', null), null);
+        // Untouched table survives.
+        assert.notEqual(cache.get('SELECT * FROM widgets', null), null);
+    });
+
+    it('semicolon inside a string literal does NOT trigger spurious invalidation', async () => {
+        const client = mockClient({
+            rows: [{ id: 1 }], fields: [{ name: 'id' }], rowCount: 1, command: 'SELECT',
+        });
+        const cache = makeConnectedCache();
+        cache.put('SELECT * FROM orders', null, [{ id: 1 }], []);
+        const cached = new CachedClient(client, cache);
+        // The ; inside the literal must not split the body into bogus
+        // segments that detectWrite would misclassify as writes. Picked
+        // a literal that doesn't contain `INTO` (detectWrite's SELECT
+        // branch has a pre-existing whitespace-tokeniser blindspot for
+        // `INTO` inside string literals — out of scope for this fix).
+        await cached.query("SELECT 'foo;bar' FROM logs");
+        // orders cache slot survives — splitStatements respects quotes,
+        // and detectWrite on the single segment returns null (read).
+        assert.notEqual(cache.get('SELECT * FROM orders', null), null);
+    });
+});
+
