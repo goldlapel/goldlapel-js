@@ -826,20 +826,20 @@ describe('state-change emission via socket', () => {
     });
 });
 
-// ─── disableL1 — explicit L1 off without losing tuned cache size ───────────
+// ─── disableNativeCache — explicit native-cache off without losing size ───
 //
-// `disableL1: true` flips the cache into a no-op pass-through:
+// `disableNativeCache: true` flips the cache into a no-op pass-through:
 //   * get() never returns an entry; the misses counter ticks (so the
 //     dashboard still sees real read traffic flowing through the wrapper)
 //   * put() is silently dropped — no eviction, no table-index update
-//   * snapshot adds `l1_disabled: true` so the proxy can render "L1 off"
-//     instead of misreading hits=0 as a cold cache
+//   * snapshot adds `disabled: true` so the proxy can render "native cache
+//     off" instead of misreading hits=0 as a cold cache
 // Default (omitted or `false`) preserves the existing fully-functional
 // behavior. The toggle is also late-bindable: re-instantiating with
 // `{ disabled: ... }` against the existing singleton flips the bit.
 
-describe('disableL1', () => {
-    it('default (disableL1 omitted) caches normally', () => {
+describe('disableNativeCache', () => {
+    it('default (disableNativeCache omitted) caches normally', () => {
         const cache = makeCache();
         assert.equal(cache._disabled, false);
         cache.put('SELECT * FROM users', null, [{ id: 1 }], [{ name: 'id' }]);
@@ -883,26 +883,26 @@ describe('disableL1', () => {
         assert.equal(cache.statsEvictions, 0);
     });
 
-    it('snapshot includes l1_disabled: true when disabled', () => {
+    it('snapshot includes disabled: true when disabled', () => {
         NativeCache._reset();
         const cache = new NativeCache({ disabled: true });
         cache._invalidationConnected = true;
         cache.get('SELECT 1', null); // bumps misses
         const snap = cache._buildSnapshot();
-        assert.equal(snap.l1_disabled, true);
+        assert.equal(snap.disabled, true);
         assert.equal(snap.misses, 1);
         assert.equal(snap.hits, 0);
     });
 
-    it('snapshot omits l1_disabled when enabled (default)', () => {
+    it('snapshot omits disabled when enabled (default)', () => {
         const cache = makeCache();
         const snap = cache._buildSnapshot();
-        assert.equal(Object.prototype.hasOwnProperty.call(snap, 'l1_disabled'), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(snap, 'disabled'), false);
     });
 
     it('re-instantiating against the singleton flips the bit', () => {
         // Models the wrap()-then-start() ordering: a wrap() call lazily
-        // creates the cache singleton, then start({ disableL1: true })
+        // creates the cache singleton, then start({ disableNativeCache: true })
         // applies the flag.
         NativeCache._reset();
         const a = new NativeCache(); // first construction, default

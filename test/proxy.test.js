@@ -528,63 +528,64 @@ describe('mesh startup options', () => {
 });
 
 
-describe('enableL2ForWrappers startup option', () => {
+describe('enableProxyCacheForWrappers startup option', () => {
     // Top-level canonical-surface boolean: opts wrapper traffic into the
-    // proxy's L2 result cache. Default false — wrappers have their own L1
-    // and the proxy's per-connection wrapper-skip is the default. Translates
-    // to --enable-l2-for-wrappers; never valid inside `config`.
+    // proxy's proxy-cache layer. Default false — wrappers have their own
+    // native cache and the proxy's per-connection wrapper-skip is the
+    // default. Translates to --enable-proxy-cache-for-wrappers; never
+    // valid inside `config`.
 
     it('defaults to false', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._enableL2ForWrappers, false);
+        assert.strictEqual(gl._enableProxyCacheForWrappers, false);
     });
 
-    it('stores enableL2ForWrappers=true', () => {
+    it('stores enableProxyCacheForWrappers=true', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            enableL2ForWrappers: true,
+            enableProxyCacheForWrappers: true,
         });
-        assert.strictEqual(gl._enableL2ForWrappers, true);
+        assert.strictEqual(gl._enableProxyCacheForWrappers, true);
     });
 
     it('coerces truthy/falsy to boolean', () => {
-        const gl1 = new GoldLapel('postgresql://localhost:5432/mydb', { enableL2ForWrappers: 1 });
-        assert.strictEqual(gl1._enableL2ForWrappers, true);
-        const gl2 = new GoldLapel('postgresql://localhost:5432/mydb', { enableL2ForWrappers: 0 });
-        assert.strictEqual(gl2._enableL2ForWrappers, false);
-        const gl3 = new GoldLapel('postgresql://localhost:5432/mydb', { enableL2ForWrappers: undefined });
-        assert.strictEqual(gl3._enableL2ForWrappers, false);
+        const gl1 = new GoldLapel('postgresql://localhost:5432/mydb', { enableProxyCacheForWrappers: 1 });
+        assert.strictEqual(gl1._enableProxyCacheForWrappers, true);
+        const gl2 = new GoldLapel('postgresql://localhost:5432/mydb', { enableProxyCacheForWrappers: 0 });
+        assert.strictEqual(gl2._enableProxyCacheForWrappers, false);
+        const gl3 = new GoldLapel('postgresql://localhost:5432/mydb', { enableProxyCacheForWrappers: undefined });
+        assert.strictEqual(gl3._enableProxyCacheForWrappers, false);
     });
 
-    it('emits --enable-l2-for-wrappers when true', () => {
+    it('emits --enable-proxy-cache-for-wrappers when true', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            enableL2ForWrappers: true,
+            enableProxyCacheForWrappers: true,
         });
         const args = gl._buildSpawnArgs();
-        assert.ok(args.includes('--enable-l2-for-wrappers'),
-            `argv must contain --enable-l2-for-wrappers: ${args.join(' ')}`);
+        assert.ok(args.includes('--enable-proxy-cache-for-wrappers'),
+            `argv must contain --enable-proxy-cache-for-wrappers: ${args.join(' ')}`);
     });
 
-    it('omits --enable-l2-for-wrappers when false / unset', () => {
+    it('omits --enable-proxy-cache-for-wrappers when false / unset', () => {
         const glDefault = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.ok(!glDefault._buildSpawnArgs().includes('--enable-l2-for-wrappers'));
+        assert.ok(!glDefault._buildSpawnArgs().includes('--enable-proxy-cache-for-wrappers'));
         const glFalse = new GoldLapel('postgresql://localhost:5432/mydb', {
-            enableL2ForWrappers: false,
+            enableProxyCacheForWrappers: false,
         });
-        assert.ok(!glFalse._buildSpawnArgs().includes('--enable-l2-for-wrappers'));
+        assert.ok(!glFalse._buildSpawnArgs().includes('--enable-proxy-cache-for-wrappers'));
     });
 
-    it('rejects enableL2ForWrappers inside config map', () => {
+    it('rejects enableProxyCacheForWrappers inside config map', () => {
         assert.throws(
             () => new GoldLapel('postgresql://localhost:5432/mydb', {
-                config: { enableL2ForWrappers: true },
+                config: { enableProxyCacheForWrappers: true },
             }),
-            /Unknown config keys: enableL2ForWrappers/,
+            /Unknown config keys: enableProxyCacheForWrappers/,
         );
     });
 
-    it('enableL2ForWrappers is not a valid config key', () => {
+    it('enableProxyCacheForWrappers is not a valid config key', () => {
         const keys = configKeys();
-        assert.ok(!keys.has('enableL2ForWrappers'));
+        assert.ok(!keys.has('enableProxyCacheForWrappers'));
     });
 });
 

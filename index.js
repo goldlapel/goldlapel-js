@@ -76,15 +76,15 @@ export function _applicationNameMarker() {
 const VALID_CONFIG_KEYS = new Set([
     'minPatternCount', 'refreshIntervalSecs', 'patternTtlSecs',
     'maxTablesPerView', 'maxColumnsPerView', 'deepPaginationThreshold',
-    'reportIntervalSecs', 'resultCacheSize', 'batchCacheSize',
+    'reportIntervalSecs', 'proxyCacheSize', 'batchCacheSize',
     'batchCacheTtlSecs', 'poolSize', 'poolTimeoutSecs',
     'poolMode', 'mgmtIdleTimeout', 'fallback', 'readAfterWriteSecs',
     'n1Threshold', 'n1WindowMs', 'n1CrossThreshold',
     'tlsCert', 'tlsKey', 'tlsClientCa',
     'disableMatviews', 'disableConsolidation', 'disableBtreeIndexes',
     'disableTrigramIndexes', 'disableExpressionIndexes',
-    'disablePartialIndexes', 'disableRewrite', 'disablePreparedCache',
-    'disableResultCache', 'disablePool',
+    'disablePartialIndexes', 'disableRewrite', 'disableRewritePreparedCache',
+    'disableProxyCache', 'disablePool',
     'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
     'enableCoalescing', 'replica', 'excludeTables',
 ]);
@@ -92,8 +92,8 @@ const VALID_CONFIG_KEYS = new Set([
 const BOOLEAN_KEYS = new Set([
     'disableMatviews', 'disableConsolidation', 'disableBtreeIndexes',
     'disableTrigramIndexes', 'disableExpressionIndexes',
-    'disablePartialIndexes', 'disableRewrite', 'disablePreparedCache',
-    'disableResultCache', 'disablePool',
+    'disablePartialIndexes', 'disableRewrite', 'disableRewritePreparedCache',
+    'disableProxyCache', 'disablePool',
     'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
     'enableCoalescing',
 ]);
@@ -456,7 +456,7 @@ export class GoldLapel {
     constructor(upstream, {
         proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
         client, configFile, config, extraArgs, noConnect, silent,
-        mesh, meshTag, enableL2ForWrappers, disableL1,
+        mesh, meshTag, enableProxyCacheForWrappers, disableNativeCache,
     } = {}) {
         this._upstream = upstream;
         this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
@@ -489,15 +489,15 @@ export class GoldLapel {
         // Mesh membership (startup intent — HQ enforces license).
         this._mesh = !!mesh;
         this._meshTag = meshTag ? String(meshTag) : null;
-        // Opt wrapper traffic into the proxy's L2 result cache. Default
+        // Opt wrapper traffic into the proxy's proxy-cache layer. Default
         // `false` matches the per-connection wrapper-skip shipped on the
-        // proxy: wrappers have their own L1, so re-caching at L2 is wasted
-        // memory for single-pod deployments. Fleet customers (multi-pod,
-        // frequent restarts, mesh) flip this on so L2 acts as a shared
-        // cache across processes.
-        this._enableL2ForWrappers = !!enableL2ForWrappers;
-        // Toggle the wrapper's in-process L1 cache off without losing the
-        // tuned `cacheSize`. When `true`, NativeCache acts as a no-op
+        // proxy: wrappers have their own native cache, so re-caching at
+        // the proxy is wasted memory for single-pod deployments. Fleet
+        // customers (multi-pod, frequent restarts, mesh) flip this on so
+        // the proxy cache acts as a shared cache across processes.
+        this._enableProxyCacheForWrappers = !!enableProxyCacheForWrappers;
+        // Toggle the wrapper's in-process native cache off without losing
+        // the tuned `cacheSize`. When `true`, NativeCache acts as a no-op
         // pass-through (get always misses, put is a no-op) — the
         // invalidation socket still connects so telemetry continues to
         // flow. The previous workaround was `cacheSize: 0`, which forced
@@ -505,13 +505,13 @@ export class GoldLapel {
         // explicit option lets them keep the size and still toggle.
         // Applied to the NativeCache singleton at construction time so a
         // later `wrap(client)` call sees the right state immediately.
-        this._disableL1 = !!disableL1;
+        this._disableNativeCache = !!disableNativeCache;
         // Push `disabled` into the cache singleton now (creates the
         // singleton if `wrap()` hasn't yet). This keeps the toggle
         // effective regardless of whether the user calls wrap() before
         // or after start(), and without forcing GL to mutate cache state
         // later from spawn paths that aren't always exercised in tests.
-        new NativeCache({ disabled: this._disableL1 });
+        new NativeCache({ disabled: this._disableNativeCache });
         // Validate structured-config keys eagerly so a test that constructs
         // without spawning still catches bad keys.
         const unknown = Object.keys(this._config).filter(k => !VALID_CONFIG_KEYS.has(k));
@@ -587,8 +587,8 @@ export class GoldLapel {
         if (this._meshTag) {
             args.push('--mesh-tag', this._meshTag);
         }
-        if (this._enableL2ForWrappers) {
-            args.push('--enable-l2-for-wrappers');
+        if (this._enableProxyCacheForWrappers) {
+            args.push('--enable-proxy-cache-for-wrappers');
         }
         args.push(..._configToArgs(this._config));
         args.push(...this._extraArgs);
@@ -874,8 +874,8 @@ function _call(gl, fn, args) {
  * @param {boolean} [opts.silent]  Suppress the one-line startup banner (wrapper-only; never forwarded to the binary).
  * @param {boolean} [opts.mesh]  Opt into the mesh at startup. HQ enforces the license; denial is non-fatal — proxy runs without clustering.
  * @param {string}  [opts.meshTag]  Mesh tag — instances sharing a tag cluster together.
- * @param {boolean} [opts.enableL2ForWrappers=false]  Opt wrapper traffic into the proxy's L2 result cache. Off by default — wrappers have their own L1 cache, so re-caching at L2 is wasted memory in single-pod setups. Turn on for fleet deployments (multi-pod, frequent restarts, mesh) where L2 acts as a shared cache across processes.
- * @param {boolean} [opts.disableL1=false]  Disable the wrapper's in-process L1 cache without losing the tuned `cacheSize`. When `true`, gets always miss and puts are no-ops; the invalidation socket still connects so telemetry continues to flow. Use to A/B the L1 layer (e.g. measure end-to-end latency with and without it) while keeping your size config intact.
+ * @param {boolean} [opts.enableProxyCacheForWrappers=false]  Opt wrapper traffic into the proxy's proxy-cache layer. Off by default — wrappers have their own native cache, so re-caching at the proxy is wasted memory in single-pod setups. Turn on for fleet deployments (multi-pod, frequent restarts, mesh) where the proxy cache acts as a shared cache across processes.
+ * @param {boolean} [opts.disableNativeCache=false]  Disable the wrapper's in-process native cache without losing the tuned `cacheSize`. When `true`, gets always miss and puts are no-ops; the invalidation socket still connects so telemetry continues to flow. Use to A/B the native cache layer (e.g. measure end-to-end latency with and without it) while keeping your size config intact.
  * @returns {Promise<GoldLapel>}
  */
 export async function start(upstream, opts = {}) {

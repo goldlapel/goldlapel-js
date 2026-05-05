@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 
 const DDL_SENTINEL = '__ddl__';
 
-// --- L1 telemetry tuning ---
+// --- Native cache telemetry tuning ---
 //
 // Demand-driven model (2026-05-03 — port of the Python pattern, see
 // goldlapel-python/docs/wrapper-telemetry-pattern.md): the wrapper has
@@ -168,8 +168,8 @@ class NativeCache {
             // Re-entry against the existing singleton. Only `disabled` is
             // applicable here — other state (capacity, env-driven enable
             // flag, sockets) is fixed at first construction. This lets
-            // `GoldLapel({ disableL1: true })` flip the bit on a cache
-            // that a `wrap()` call already lazily created.
+            // `GoldLapel({ disableNativeCache: true })` flip the bit on a
+            // cache that a `wrap()` call already lazily created.
             if (opts && Object.prototype.hasOwnProperty.call(opts, 'disabled')) {
                 _instance._disabled = !!opts.disabled;
             }
@@ -179,13 +179,13 @@ class NativeCache {
         this._tableIndex = new Map();
         this._maxEntries = parseInt(process.env.GOLDLAPEL_NATIVE_CACHE_SIZE || '32768', 10);
         this._enabled = (process.env.GOLDLAPEL_NATIVE_CACHE || 'true').toLowerCase() !== 'false';
-        // Explicit L1 toggle — distinct from `_enabled` (which gates the
-        // whole module via env var). When `_disabled` is true the cache
-        // acts as a no-op pass-through: get() always misses (and bumps
-        // the misses counter so dashboards still see traffic), put() is
-        // a no-op, no eviction occurs. Invalidation socket still
+        // Explicit native-cache toggle — distinct from `_enabled` (which
+        // gates the whole module via env var). When `_disabled` is true
+        // the cache acts as a no-op pass-through: get() always misses
+        // (and bumps the misses counter so dashboards still see traffic),
+        // put() is a no-op, no eviction occurs. Invalidation socket still
         // connects so telemetry continues to flow. Default false; flipped
-        // via `goldlapel.start(url, { disableL1: true })`.
+        // via `goldlapel.start(url, { disableNativeCache: true })`.
         this._disabled = !!opts.disabled;
         this._invalidationConnected = false;
         this._socket = null;
@@ -196,7 +196,7 @@ class NativeCache {
         this.statsHits = 0;
         this.statsMisses = 0;
         this.statsInvalidations = 0;
-        // L1 telemetry (2026-05-03). Eviction counter — was missing
+        // Native cache telemetry (2026-05-03). Eviction counter — was missing
         // before; bumped in `_evictOne`. Configurable opt-out: set
         // GOLDLAPEL_REPORT_STATS=false to disable all snapshot replies
         // and state-change emissions (cache continues to function;
@@ -232,8 +232,8 @@ class NativeCache {
 
     get(sql, values) {
         if (!this._enabled || !this._invalidationConnected) return null;
-        // L1 disabled: every get is a miss. We still bump the miss
-        // counter so the dashboard sees real read traffic flowing
+        // Native cache disabled: every get is a miss. We still bump the
+        // miss counter so the dashboard sees real read traffic flowing
         // through the wrapper; hits stay 0 (no entries are ever
         // stored), evictions stay 0.
         if (this._disabled) {
@@ -256,9 +256,9 @@ class NativeCache {
 
     put(sql, values, rows, fields) {
         if (!this._enabled || !this._invalidationConnected) return;
-        // L1 disabled: drop the write silently. No eviction, no table
-        // index update — the cache stays empty for the lifetime of the
-        // process.
+        // Native cache disabled: drop the write silently. No eviction,
+        // no table index update — the cache stays empty for the
+        // lifetime of the process.
         if (this._disabled) return;
         const key = makeKey(sql, values);
         if (key === null) return;
@@ -429,7 +429,7 @@ class NativeCache {
         this.statsEvictions++;
     }
 
-    // ─── L1 telemetry: sliding window ──────────────────────────────────────
+    // ─── Native cache telemetry: sliding window ───────────────────────────
 
     _recordEviction(evicted) {
         // Bounded ring — once at capacity, overwrites oldest in O(1).
@@ -447,7 +447,7 @@ class NativeCache {
         }
     }
 
-    // ─── L1 telemetry: snapshot + emit ─────────────────────────────────────
+    // ─── Native cache telemetry: snapshot + emit ──────────────────────────
 
     _buildSnapshot() {
         // The proxy computes deltas across snapshots; we just expose the
@@ -466,10 +466,11 @@ class NativeCache {
             capacity_entries: this._maxEntries,
         };
         // Surface the explicit-disable bit so the dashboard can render
-        // "L1 off" rather than misreading hits=0 as a cold cache. Only
-        // emit the field when truthy to keep the on-the-wire snapshot
-        // shape identical for the common (enabled) case.
-        if (this._disabled) snap.l1_disabled = true;
+        // "native cache off" rather than misreading hits=0 as a cold
+        // cache. Only emit the field when truthy to keep the
+        // on-the-wire snapshot shape identical for the common (enabled)
+        // case.
+        if (this._disabled) snap.disabled = true;
         return snap;
     }
 

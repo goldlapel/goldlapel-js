@@ -489,43 +489,43 @@ describe('silent option', () => {
     });
 });
 
-// ─── disableL1 option ──────────────────────────────────────────────────────
+// ─── disableNativeCache option ─────────────────────────────────────────────
 //
-// `disableL1: true` flips the wrapper's L1 cache off without touching the
-// tuned `cacheSize`. Previously the only way to disable L1 was
-// `cacheSize: 0`, which conflated capacity with on/off. The explicit option
-// lets customers A/B the L1 layer (compare end-to-end latency with and
-// without it) while keeping their size config intact. Wrapper-only — never
-// forwarded to the Rust binary as a CLI flag.
+// `disableNativeCache: true` flips the wrapper's native cache off without
+// touching the tuned `cacheSize`. Previously the only way to disable the
+// native cache was `cacheSize: 0`, which conflated capacity with on/off. The
+// explicit option lets customers A/B the native cache layer (compare
+// end-to-end latency with and without it) while keeping their size config
+// intact. Wrapper-only — never forwarded to the Rust binary as a CLI flag.
 
-describe('disableL1 option', () => {
+describe('disableNativeCache option', () => {
     it('stored on the instance as a boolean', () => {
         NativeCache._reset();
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableL1: true });
-        assert.strictEqual(gl._disableL1, true);
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: true });
+        assert.strictEqual(gl._disableNativeCache, true);
     });
 
     it('default is false', () => {
         NativeCache._reset();
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._disableL1, false);
+        assert.strictEqual(gl._disableNativeCache, false);
     });
 
     it('coerces truthy/falsy values to booleans', () => {
         NativeCache._reset();
-        const gl1 = new GoldLapel('postgresql://localhost:5432/mydb', { disableL1: 1 });
-        assert.strictEqual(gl1._disableL1, true);
+        const gl1 = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: 1 });
+        assert.strictEqual(gl1._disableNativeCache, true);
         NativeCache._reset();
-        const gl2 = new GoldLapel('postgresql://localhost:5432/mydb', { disableL1: 0 });
-        assert.strictEqual(gl2._disableL1, false);
+        const gl2 = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: 0 });
+        assert.strictEqual(gl2._disableNativeCache, false);
         NativeCache._reset();
-        const gl3 = new GoldLapel('postgresql://localhost:5432/mydb', { disableL1: undefined });
-        assert.strictEqual(gl3._disableL1, false);
+        const gl3 = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: undefined });
+        assert.strictEqual(gl3._disableNativeCache, false);
     });
 
     it('flips the NativeCache singleton _disabled bit on construction', () => {
         NativeCache._reset();
-        new GoldLapel('postgresql://localhost:5432/mydb', { disableL1: true });
+        new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: true });
         // Re-grab the singleton without overriding (`disabled` not in opts)
         // and check the bit landed on the cache.
         const cache = new NativeCache();
@@ -540,25 +540,26 @@ describe('disableL1 option', () => {
     });
 
     it('is not forwarded to the binary argv', () => {
-        // disableL1 is a wrapper-only knob (the proxy doesn't have a
-        // matching --disable-l1 flag — the L1 lives entirely in the
-        // wrapper process). Verify nothing leaks into the argv.
+        // disableNativeCache is a wrapper-only knob (the proxy doesn't
+        // have a matching --disable-native-cache flag — the native cache
+        // lives entirely in the wrapper process). Verify nothing leaks
+        // into the argv.
         NativeCache._reset();
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableL1: true });
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: true });
         const args = gl._buildSpawnArgs();
-        assert.ok(!args.includes('--disable-l1'),
-            `argv must not contain --disable-l1: ${args.join(' ')}`);
-        assert.ok(!args.some(a => /--?disable-?l1/i.test(a)),
-            `argv must not contain any disable-l1 flag: ${args.join(' ')}`);
+        assert.ok(!args.includes('--disable-native-cache'),
+            `argv must not contain --disable-native-cache: ${args.join(' ')}`);
+        assert.ok(!args.some(a => /--?disable-?native-?cache/i.test(a)),
+            `argv must not contain any disable-native-cache flag: ${args.join(' ')}`);
     });
 
-    it('disableL1 in config object is rejected at construction (wrapper-only key)', () => {
+    it('disableNativeCache in config object is rejected at construction (wrapper-only key)', () => {
         NativeCache._reset();
         assert.throws(
             () => new GoldLapel('postgresql://localhost:5432/mydb', {
-                config: { disableL1: true },
+                config: { disableNativeCache: true },
             }),
-            /Unknown config keys: disableL1/,
+            /Unknown config keys: disableNativeCache/,
         );
     });
 });
