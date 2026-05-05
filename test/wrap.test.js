@@ -563,3 +563,129 @@ describe('session-state command responses are not cached', () => {
         assert.deepEqual(entry.rows, []);
     });
 });
+
+// --- Multi-statement transaction-flag bookkeeping ---
+//
+// `CachedClient.query("BEGIN; INSERT INTO t VALUES (1); COMMIT")` is a
+// single Q wire message that opens AND closes a transaction server-side.
+// Pre-fix, the wrapper's first-token TX_START match flipped
+// `_inTransaction=true` and never saw the trailing COMMIT, so subsequent
+// reads bypassed the cache forever (or until a fresh BEGIN/COMMIT cycle
+// reset state). The fix walks every segment via splitStatements and
+// applies the boundary that segment carries, so the wrapper's final tx
+// flag matches what the server actually did.
+
+describe('multi-statement tx-flag bookkeeping', () => {
+    it('BEGIN; INSERT; COMMIT ends with _inTransaction=false', async () => {
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN; INSERT INTO t VALUES (1); COMMIT');
+        // Server ran the COMMIT — wrapper must agree.
+        assert.equal(cached._inTransaction, false);
+    });
+
+    it('cache works after BEGIN; ...; COMMIT (regression: tx flag was sticky)', async () => {
+        // The user-visible symptom of the bug: every read after the
+        // mixed body bypassed the cache because _inTransaction was stuck
+        // true. After the fix, a cached SELECT served from the prior
+        // baseline state must hit on the next read.
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        cache.put('SELECT * FROM users', null, [{ id: 1 }], [{ name: 'id' }]);
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN; INSERT INTO orders VALUES (1); COMMIT');
+        // orders was invalidated; users survived. Now a SELECT users
+        // must hit cache (would miss pre-fix because _inTransaction
+        // would be stuck true).
+        client._calls.length = 0;
+        const result = await cached.query('SELECT * FROM users');
+        assert.equal(client._calls.length, 0, 'cache must be re-enabled post-COMMIT');
+        assert.deepEqual(result.rows, [{ id: 1 }]);
+    });
+
+    it('BEGIN; INSERT (no COMMIT) ends with _inTransaction=true', async () => {
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN; INSERT INTO t VALUES (1)');
+        // Server opened a tx and ran the INSERT inside it; tx is still
+        // open at the end of the Q message. Wrapper must agree.
+        assert.equal(cached._inTransaction, true);
+    });
+
+    it('INSERT; COMMIT (random COMMIT, no prior BEGIN) ends with _inTransaction=false', async () => {
+        // Stray COMMIT outside a tx is a Postgres warning ("there is no
+        // transaction in progress") but does not open one — server
+        // remains out of tx. Wrapper must match.
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        // Set state to in-tx first, so we can verify COMMIT closes it.
+        cached._inTransaction = true;
+        await cached.query('INSERT INTO t VALUES (1); COMMIT');
+        assert.equal(cached._inTransaction, false);
+    });
+
+    it('SAVEPOINT a; INSERT; RELEASE a — tx flag unchanged (savepoint is not a boundary)', async () => {
+        // SAVEPOINT and RELEASE are intra-transaction operators; they
+        // don't open or close a top-level tx. Match the existing
+        // single-statement TX_START / TX_END regexes (which exclude
+        // SAVEPOINT / RELEASE) so wrapper state stays in sync with the
+        // server's top-level tx state.
+        const client = mockClient({ rows: [], fields: null, rowCount: 1, command: 'INSERT' });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        // Pre-condition: wrapper is in a tx (e.g., from a prior BEGIN).
+        cached._inTransaction = true;
+        await cached.query('SAVEPOINT a; INSERT INTO t VALUES (1); RELEASE a');
+        // Still in tx — savepoint/release inside an existing tx don't
+        // change the top-level boundary.
+        assert.equal(cached._inTransaction, true);
+
+        // And from out-of-tx, savepoint/release also don't open one
+        // (server would error; wrapper just stays out).
+        cached._inTransaction = false;
+        await cached.query('SAVEPOINT a; INSERT INTO t VALUES (1); RELEASE a');
+        assert.equal(cached._inTransaction, false);
+    });
+
+    it('plain SELECT 1 — no tx-flag change', async () => {
+        const client = mockClient({
+            rows: [{ '?column?': 1 }], fields: [{ name: '?column?' }], rowCount: 1, command: 'SELECT',
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        cached._inTransaction = false;
+        await cached.query('SELECT 1');
+        assert.equal(cached._inTransaction, false);
+
+        cached._inTransaction = true;
+        await cached.query('SELECT 1');
+        assert.equal(cached._inTransaction, true);
+    });
+
+    it('BEGIN; SELECT 1; ROLLBACK ends with _inTransaction=false', async () => {
+        // Cousin of BEGIN/COMMIT — ROLLBACK closes the tx too.
+        const client = mockClient({
+            rows: [{ '?column?': 1 }], fields: [{ name: '?column?' }], rowCount: 1, command: 'SELECT',
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN; SELECT 1; ROLLBACK');
+        assert.equal(cached._inTransaction, false);
+    });
+
+    it('COMMIT; BEGIN (close-then-reopen) ends with _inTransaction=true', async () => {
+        // Last boundary in execution order wins. This guards against a
+        // first-segment-only or final-segment-only implementation: only
+        // a per-segment walk produces the right result for arbitrary
+        // boundary sequences.
+        const client = mockClient({ rows: [], fields: null, rowCount: 0, command: 'COMMIT' });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        cached._inTransaction = true;
+        await cached.query('COMMIT; BEGIN');
+        assert.equal(cached._inTransaction, true);
+    });
+});

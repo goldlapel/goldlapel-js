@@ -40,6 +40,54 @@ function detectWritesMulti(sql) {
     return tables.size > 0 ? tables : null;
 }
 
+// Multi-statement-aware transaction-boundary classification. A single Q
+// message like `BEGIN; INSERT INTO t VALUES (1); COMMIT` opens AND closes
+// a transaction server-side, but the pre-fix first-token check
+// (`TX_START.test(sql)`) only saw `BEGIN` and left the wrapper stuck
+// thinking it was still in a tx — so subsequent reads bypassed the cache
+// forever (or until a fresh BEGIN/COMMIT cycle reset state). The fix
+// walks every segment and applies the boundary that segment carries, so
+// the wrapper's final tx flag matches what the server actually did.
+//
+// Returns:
+//   - true   if the body contains at least one tx-boundary segment
+//            (caller bypasses the cache read path; the body is dispatched
+//            to the real client and tx state has been updated in place)
+//   - false  if no segment is a tx boundary (caller proceeds normally)
+//
+// Single-statement bodies (no inner `;`) skip the splitter — the existing
+// TX_START / TX_END regex check is sufficient and the hot path is hot.
+function applyTxBoundaries(sql, client) {
+    if (typeof sql !== 'string' || sql.length === 0) return false;
+    // Fast path: no inner `;` → single-statement, original first-token check.
+    const trimmed = sql.trimEnd().replace(/;+$/, '');
+    if (!trimmed.includes(';')) {
+        if (TX_START.test(sql)) {
+            client._inTransaction = true;
+            return true;
+        }
+        if (TX_END.test(sql)) {
+            client._inTransaction = false;
+            return true;
+        }
+        return false;
+    }
+    // Multi-statement body: walk segments, update tx state per-segment.
+    // Final state reflects the last tx-boundary segment in execution
+    // order, mirroring how the server processes the Q message.
+    let touched = false;
+    for (const seg of splitStatements(sql)) {
+        if (TX_START.test(seg)) {
+            client._inTransaction = true;
+            touched = true;
+        } else if (TX_END.test(seg)) {
+            client._inTransaction = false;
+            touched = true;
+        }
+    }
+    return touched;
+}
+
 let _cache = null;
 
 function _detectInvalidationPort() {
@@ -120,13 +168,14 @@ class CachedClient {
             }
         }
 
-        // Transaction tracking
-        if (TX_START.test(sql)) {
-            this._inTransaction = true;
-            return this._real.query(textOrConfig, values);
-        }
-        if (TX_END.test(sql)) {
-            this._inTransaction = false;
+        // Transaction tracking. Walks every segment in multi-statement
+        // bodies so a Q like `BEGIN; INSERT INTO t VALUES (1); COMMIT`
+        // ends with `_inTransaction=false` — matching the server, which
+        // ran the COMMIT. Pre-fix, only the leading BEGIN was seen and
+        // the wrapper stayed stuck thinking a tx was open, bypassing the
+        // cache for every subsequent read until the next BEGIN/COMMIT
+        // pair reset state. Single-statement bodies skip the splitter.
+        if (applyTxBoundaries(sql, this)) {
             return this._real.query(textOrConfig, values);
         }
 
