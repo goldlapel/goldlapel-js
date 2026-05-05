@@ -44,6 +44,301 @@ const TX_END = /^\s*(COMMIT|ROLLBACK|END)\b/i;
 
 const TABLE_PATTERN = /\b(?:FROM|JOIN)\s+(?:ONLY\s+)?(?:(\w+)\.)?(\w+)/gi;
 
+// ─── Unsafe-GUC state hash (Option Y, mirrored from proxy guc_state.rs) ────
+//
+// Custom-GUC-driven RLS — `SET app.user_id = '42'; SELECT * FROM accounts`
+// where the policy reads `current_setting('app.user_id')` — is a real cache
+// leak when keying purely by SQL+params: user A's cached rows get served to
+// user B. The proxy fixed this in `src/guc_state.rs` (commit 3e02359) by
+// folding a per-connection unsafe-GUC state hash into every cache /
+// coalescing key. The wrapper's native cache has the same vulnerability,
+// so we mirror the same fix here on a per-CachedClient basis.
+//
+// `SET LOCAL` is intentionally ignored: the wrapper's read path bypasses
+// the cache entirely while `_inTransaction` is true, so transaction-scoped
+// settings can never leak into a cacheable response.
+
+const UNSAFE_GUC_SHORT_LIST = new Set([
+    'search_path',
+    'role',
+    'session_authorization',
+    'default_transaction_isolation',
+    'default_transaction_read_only',
+    'transaction_isolation',
+    'row_security',
+]);
+
+// FNV-1a 32-bit. Cheap, stable, no deps. We don't need cryptographic
+// strength — the hash is folded into a cache key alongside the SQL text,
+// not used as a secret. 32 bits is plenty of headroom for the small
+// per-connection key space (rarely more than a handful of unsafe GUCs).
+function _fnv1a32(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        // 32-bit FNV prime multiply, kept in 32-bit unsigned via `Math.imul`
+        // and the `>>> 0` mask at the end.
+        h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+}
+
+// Classify a GUC name as state-affecting (true) or harmless (false).
+// Unsafe if it's in the short hardcoded list OR contains a `.` (namespaced
+// — the canonical custom-RLS pattern: `app.*`, `myapp.*`, `tenant.*`).
+// Comparison is case-insensitive.
+function isUnsafeGuc(name) {
+    if (typeof name !== 'string' || name.length === 0) return false;
+    const lower = name.toLowerCase();
+    if (lower.includes('.')) return true;
+    return UNSAFE_GUC_SHORT_LIST.has(lower);
+}
+
+// Strip a single layer of matching surrounding `'...'` or `"..."` quotes.
+function _stripValueQuotes(value) {
+    const v = value.trim();
+    if (v.length >= 2) {
+        const first = v[0];
+        const last = v[v.length - 1];
+        if ((first === "'" && last === "'") || (first === '"' && last === '"')) {
+            return v.slice(1, -1);
+        }
+    }
+    return v;
+}
+
+// Lowercase the GUC name and strip surrounding double quotes (PG treats
+// `"app.user_id"` and `app.user_id` as the same configuration parameter).
+function _normalizeGucName(token) {
+    const trimmed = token.replace(/^"+|"+$/g, '');
+    if (trimmed.length === 0) return null;
+    return trimmed.toLowerCase();
+}
+
+// Split a SQL string on top-level `;` characters, respecting `'...'` and
+// `"..."` string literals (including PG's doubled-quote `''` / `""`
+// escape). No comment / dollar-quote support — this is the lightest
+// possible splitter, just enough to handle multi-statement bodies like
+// `SET app.user_id = '42'; SELECT 1`.
+function splitStatements(sql) {
+    if (typeof sql !== 'string' || sql.length === 0) return [];
+    const out = [];
+    let start = 0;
+    let quote = null;
+    let i = 0;
+    while (i < sql.length) {
+        const c = sql[i];
+        if (quote !== null) {
+            if (c === quote) {
+                if (i + 1 < sql.length && sql[i + 1] === quote) {
+                    i += 2;
+                    continue;
+                }
+                quote = null;
+            }
+        } else {
+            if (c === "'" || c === '"') {
+                quote = c;
+            } else if (c === ';') {
+                const segment = sql.slice(start, i).trim();
+                if (segment.length > 0) out.push(segment);
+                start = i + 1;
+            }
+        }
+        i++;
+    }
+    const tail = sql.slice(start).trim();
+    if (tail.length > 0) out.push(tail);
+    return out;
+}
+
+// Parse a single `SET ...` / `RESET ...` statement. Returns one of:
+//   { kind: 'set',       name, value }
+//   { kind: 'set_local', name, value }
+//   { kind: 'reset',     name }
+//   { kind: 'reset_all' }
+// or null for anything else. Callers use the kind tag to drive
+// `ConnectionGucState.apply()`.
+//
+// Recognised shapes (case-insensitive, trailing `;` tolerated):
+//   SET name = value         SET name TO value
+//   SET SESSION name = ...   SET SESSION name TO ...
+//   SET LOCAL name = ...     SET LOCAL name TO ...
+//   RESET name               RESET ALL
+// Everything else (e.g. `SET TIME ZONE ...`, plain queries) returns null.
+function parseSetCommand(sql) {
+    if (typeof sql !== 'string') return null;
+    let s = sql.trim();
+    if (s.endsWith(';')) s = s.slice(0, -1).trimEnd();
+    if (s.length === 0) return null;
+
+    const tokens = s.split(/\s+/);
+    if (tokens.length === 0) return null;
+    const head = tokens[0];
+
+    // RESET name  /  RESET ALL
+    if (head.toUpperCase() === 'RESET') {
+        if (tokens.length < 2) return null;
+        const target = tokens[1];
+        // RESET takes exactly one arg.
+        if (tokens.length > 2) return null;
+        if (target.toUpperCase() === 'ALL') {
+            return { kind: 'reset_all' };
+        }
+        const name = _normalizeGucName(target);
+        if (!name) return null;
+        return { kind: 'reset', name };
+    }
+
+    if (head.toUpperCase() !== 'SET') return null;
+
+    // Optional LOCAL / SESSION modifier.
+    let idx = 1;
+    if (idx >= tokens.length) return null;
+    let isLocal = false;
+    const modifier = tokens[idx].toUpperCase();
+    if (modifier === 'LOCAL') {
+        isLocal = true;
+        idx++;
+    } else if (modifier === 'SESSION') {
+        // Default behavior — same as bare SET.
+        idx++;
+    }
+
+    if (idx >= tokens.length) return null;
+    let nameToken = tokens[idx];
+    idx++;
+
+    // The name token may have an `=` glued onto it, e.g. `SET app.user='42'`.
+    let gluedValue = null;
+    const eqIdx = nameToken.indexOf('=');
+    if (eqIdx !== -1) {
+        gluedValue = nameToken.slice(eqIdx + 1);
+        nameToken = nameToken.slice(0, eqIdx);
+        if (gluedValue.length === 0) gluedValue = null;
+    }
+
+    const name = _normalizeGucName(nameToken);
+    if (!name) return null;
+
+    let valueStr;
+    if (gluedValue !== null) {
+        // SET name=value rest...
+        const rest = tokens.slice(idx).join(' ');
+        valueStr = rest.length > 0 ? `${gluedValue} ${rest}` : gluedValue;
+    } else {
+        if (idx >= tokens.length) return null;
+        const sep = tokens[idx];
+        idx++;
+        if (!(sep === '=' || sep.toUpperCase() === 'TO')) return null;
+        valueStr = tokens.slice(idx).join(' ');
+    }
+
+    const value = _stripValueQuotes(valueStr.trim());
+    if (value.length === 0 && valueStr.trim().length === 0) return null;
+
+    return { kind: isLocal ? 'set_local' : 'set', name, value };
+}
+
+// Per-connection unsafe-GUC state. Backed by a Map keyed by lowercased GUC
+// name (insertion order is normalised at hash time, so two states with the
+// same {name → value} bindings hash the same regardless of SET order).
+//
+// `stateHash` returns 0 for empty/baseline state — a fresh connection's
+// hash matches "no GUCs set" cache slots, which is exactly the correct
+// behavior (cache hits across connections that never SET any unsafe GUC).
+class ConnectionGucState {
+    constructor() {
+        this._values = new Map();
+        this._hash = 0;
+    }
+
+    stateHash() {
+        return this._hash;
+    }
+
+    // Apply a parsed SET / RESET command. No-op for SetLocal (transient —
+    // wrapper bypasses cache while `_inTransaction` anyway) and for safe
+    // GUC names. Returns true iff the hash changed.
+    apply(cmd) {
+        if (!cmd) return false;
+        const before = this._hash;
+        switch (cmd.kind) {
+            case 'set':
+                if (isUnsafeGuc(cmd.name)) {
+                    this._values.set(cmd.name, cmd.value);
+                    this._recomputeHash();
+                }
+                break;
+            case 'set_local':
+                // Intentionally ignored. SET LOCAL only applies inside a
+                // transaction and the wrapper's cache is bypassed in that
+                // window, so it never influences a cacheable response.
+                break;
+            case 'reset':
+                if (isUnsafeGuc(cmd.name) && this._values.delete(cmd.name)) {
+                    this._recomputeHash();
+                }
+                break;
+            case 'reset_all':
+                if (this._values.size > 0) {
+                    this._values.clear();
+                    this._recomputeHash();
+                }
+                break;
+            default:
+                break;
+        }
+        return this._hash !== before;
+    }
+
+    // Convenience: parse a SQL string and apply every recognised SET /
+    // RESET it contains. Multi-statement bodies (e.g. a single Q wire
+    // message containing `SET app.user_id = '42'; SELECT 1`) are split on
+    // top-level `;` so callers don't have to. Returns true iff the hash
+    // changed.
+    observeSql(sql) {
+        if (typeof sql !== 'string' || sql.length === 0) return false;
+        const before = this._hash;
+        // Fast path — most queries are single-statement bodies. Avoid the
+        // splitter's allocation when there's no inner `;`.
+        const trimmed = sql.trimEnd().replace(/;+$/, '');
+        if (!trimmed.includes(';')) {
+            const cmd = parseSetCommand(sql);
+            if (cmd) this.apply(cmd);
+        } else {
+            for (const stmt of splitStatements(sql)) {
+                const cmd = parseSetCommand(stmt);
+                if (cmd) this.apply(cmd);
+            }
+        }
+        return this._hash !== before;
+    }
+
+    _recomputeHash() {
+        if (this._values.size === 0) {
+            this._hash = 0;
+            return;
+        }
+        // Sort by name so insertion order doesn't affect the hash. Mirrors
+        // the proxy's `BTreeMap` ordering — two states with identical
+        // bindings hash identically regardless of SET order on the wire.
+        const keys = Array.from(this._values.keys()).sort();
+        // Build a single canonical buffer string. \x1f (ASCII unit
+        // separator) and \x1e (record separator) keep value boundaries
+        // unambiguous so `name=foo, value=bar:` and `name=foo:bar, value=`
+        // can never collide.
+        let buf = '';
+        for (const k of keys) {
+            buf += k;
+            buf += '\x1f';
+            buf += this._values.get(k);
+            buf += '\x1e';
+        }
+        this._hash = _fnv1a32(buf);
+    }
+}
+
 const SQL_KEYWORDS = new Set([
     'select', 'from', 'where', 'and', 'or', 'not', 'in', 'exists',
     'between', 'like', 'is', 'null', 'true', 'false', 'as', 'on',
@@ -52,9 +347,16 @@ const SQL_KEYWORDS = new Set([
     'except', 'all', 'distinct', 'lateral', 'values',
 ]);
 
-function makeKey(sql, values) {
+function makeKey(sql, values, stateHash = 0) {
     try {
-        return sql + '\0' + JSON.stringify(values ?? null);
+        // State hash is folded in as a hex prefix so two connections with
+        // different unsafe-GUC state never collide on the same cache slot.
+        // `0` (the empty-state hash) renders as `"0"` and is the default
+        // for callers that don't care about GUC tracking — preserves the
+        // pre-state-hash key shape's distinguishability across SQL+values
+        // and keeps backwards compatibility with existing callers.
+        const hashHex = (stateHash >>> 0).toString(16);
+        return hashHex + '\0' + sql + '\0' + JSON.stringify(values ?? null);
     } catch {
         return null;
     }
@@ -230,7 +532,7 @@ class NativeCache {
     get enabled() { return this._enabled; }
     get size() { return this._cache.size; }
 
-    get(sql, values) {
+    get(sql, values, stateHash = 0) {
         if (!this._enabled || !this._invalidationConnected) return null;
         // Native cache disabled: every get is a miss. We still bump the
         // miss counter so the dashboard sees real read traffic flowing
@@ -240,7 +542,7 @@ class NativeCache {
             this.statsMisses++;
             return null;
         }
-        const key = makeKey(sql, values);
+        const key = makeKey(sql, values, stateHash);
         if (key === null) return null;
         const entry = this._cache.get(key);
         if (entry !== undefined) {
@@ -254,13 +556,13 @@ class NativeCache {
         return null;
     }
 
-    put(sql, values, rows, fields) {
+    put(sql, values, rows, fields, stateHash = 0) {
         if (!this._enabled || !this._invalidationConnected) return;
         // Native cache disabled: drop the write silently. No eviction,
         // no table index update — the cache stays empty for the
         // lifetime of the process.
         if (this._disabled) return;
-        const key = makeKey(sql, values);
+        const key = makeKey(sql, values, stateHash);
         if (key === null) return;
         const tables = extractTables(sql);
         let evicted = 0;
@@ -622,4 +924,8 @@ export {
     NativeCache, makeKey, detectWrite, extractTables,
     DDL_SENTINEL, TX_START, TX_END,
     EVICT_RATE_WINDOW, EVICT_RATE_HIGH, EVICT_RATE_LOW,
+    // Per-connection unsafe-GUC state-hash machinery (Option Y mirror of
+    // proxy's src/guc_state.rs). Used by wrap.js's CachedClient to fold
+    // a state hash into the cache key on every query.
+    isUnsafeGuc, parseSetCommand, splitStatements, ConnectionGucState,
 };

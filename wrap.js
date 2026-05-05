@@ -1,4 +1,7 @@
-import { NativeCache, detectWrite, DDL_SENTINEL, TX_START, TX_END } from './cache.js';
+import {
+    NativeCache, detectWrite, DDL_SENTINEL, TX_START, TX_END,
+    ConnectionGucState,
+} from './cache.js';
 
 let _cache = null;
 
@@ -35,6 +38,13 @@ class CachedClient {
         this._real = realClient;
         this._cache = cache;
         this._inTransaction = false;
+        // Per-connection unsafe-GUC state hash. Mirrors the proxy's
+        // per-connection `ConnectionGucState` (commit 3e02359). Folded
+        // into the native cache key on every read/write so two
+        // CachedClients with different unsafe-GUC state never collide on
+        // a shared singleton cache (the wrapper has one cache singleton
+        // per process; CachedClient is per-conn).
+        this._gucState = new ConnectionGucState();
     }
 
     async query(textOrConfig, values) {
@@ -45,6 +55,15 @@ class CachedClient {
         } else {
             sql = textOrConfig;
             params = values;
+        }
+
+        // GUC state observation. Runs on every query before any
+        // transaction / write / read branching: a `SET app.user_id =
+        // '42'` shifts the hash, so the very next SELECT must key
+        // against the new hash. Cheap on the hot path — fast-path
+        // single-statement queries skip the splitter entirely.
+        if (typeof sql === 'string' && sql.length > 0) {
+            this._gucState.observeSql(sql);
         }
 
         // Transaction tracking
@@ -73,8 +92,11 @@ class CachedClient {
             return this._real.query(textOrConfig, values);
         }
 
-        // Read path: check L1 cache
-        const entry = this._cache.get(sql, params);
+        // Read path: check native cache, gated on the per-connection
+        // unsafe-GUC state hash so user A's RLS-scoped rows can never
+        // be served to user B from a shared cache slot.
+        const stateHash = this._gucState.stateHash();
+        const entry = this._cache.get(sql, params, stateHash);
         if (entry !== null) {
             return {
                 rows: entry.rows,
@@ -87,9 +109,11 @@ class CachedClient {
         // Cache miss: execute for real
         const result = await this._real.query(textOrConfig, values);
 
-        // Cache the result if it has rows
+        // Cache the result if it has rows. Same state hash gating as the
+        // get() above — the entry is keyed to the connection state at the
+        // time of the response.
         if (result.rows && result.fields) {
-            this._cache.put(sql, params, result.rows, result.fields);
+            this._cache.put(sql, params, result.rows, result.fields, stateHash);
         }
 
         return result;

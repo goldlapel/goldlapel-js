@@ -5,6 +5,7 @@ import {
     NativeCache, makeKey, detectWrite, extractTables,
     DDL_SENTINEL, TX_START, TX_END,
     EVICT_RATE_WINDOW, EVICT_RATE_HIGH, EVICT_RATE_LOW,
+    isUnsafeGuc, parseSetCommand, splitStatements, ConnectionGucState,
 } from '../cache.js';
 
 function makeCache(opts = {}) {
@@ -25,16 +26,20 @@ afterEach(() => NativeCache._reset());
 // --- makeKey ---
 
 describe('makeKey', () => {
+    // Cache key shape (post-Option-Y, 2026-05-04):
+    //   `<state-hash-hex>\0<sql>\0<json-encoded-values>`
+    // The hex prefix is `0` for the default empty-state baseline so two
+    // CachedClients that never SET an unsafe GUC still share cache slots.
     it('null values', () => {
-        assert.equal(makeKey('SELECT 1', null), 'SELECT 1\0null');
+        assert.equal(makeKey('SELECT 1', null), '0\0SELECT 1\0null');
     });
 
     it('array values', () => {
-        assert.equal(makeKey('SELECT $1', [42]), 'SELECT $1\0[42]');
+        assert.equal(makeKey('SELECT $1', [42]), '0\0SELECT $1\0[42]');
     });
 
     it('undefined values treated as null', () => {
-        assert.equal(makeKey('SELECT 1', undefined), 'SELECT 1\0null');
+        assert.equal(makeKey('SELECT 1', undefined), '0\0SELECT 1\0null');
     });
 
     it('different params produce different keys', () => {
@@ -927,5 +932,403 @@ describe('disableNativeCache', () => {
         const b = new NativeCache({});
         assert.strictEqual(a, b);
         assert.equal(a._disabled, true);
+    });
+});
+
+// ─── Unsafe-GUC classifier (Option Y wrapper-side) ─────────────────────────
+//
+// Mirrors `is_unsafe_guc` in proxy `src/guc_state.rs`. A GUC is unsafe if
+// it's in the short hardcoded list (search_path, role, …) OR contains a
+// `.` (namespaced — `app.*`, `myapp.*`). Comparison is case-insensitive.
+
+describe('isUnsafeGuc', () => {
+    it('short-list members are unsafe', () => {
+        assert.ok(isUnsafeGuc('search_path'));
+        assert.ok(isUnsafeGuc('role'));
+        assert.ok(isUnsafeGuc('session_authorization'));
+        assert.ok(isUnsafeGuc('default_transaction_isolation'));
+        assert.ok(isUnsafeGuc('default_transaction_read_only'));
+        assert.ok(isUnsafeGuc('transaction_isolation'));
+        assert.ok(isUnsafeGuc('row_security'));
+    });
+
+    it('classification is case-insensitive', () => {
+        assert.ok(isUnsafeGuc('ROLE'));
+        assert.ok(isUnsafeGuc('Search_Path'));
+        assert.ok(isUnsafeGuc('SEARCH_PATH'));
+    });
+
+    it('namespaced GUCs are unsafe', () => {
+        assert.ok(isUnsafeGuc('app.user_id'));
+        assert.ok(isUnsafeGuc('myapp.tenant'));
+        assert.ok(isUnsafeGuc('rls.account'));
+        assert.ok(isUnsafeGuc('a.b.c'));
+        assert.ok(isUnsafeGuc('APP.USER'));
+    });
+
+    it('safe GUCs are safe', () => {
+        assert.ok(!isUnsafeGuc('timezone'));
+        assert.ok(!isUnsafeGuc('application_name'));
+        assert.ok(!isUnsafeGuc('statement_timeout'));
+        assert.ok(!isUnsafeGuc('work_mem'));
+        assert.ok(!isUnsafeGuc('client_encoding'));
+        assert.ok(!isUnsafeGuc('DateStyle'));
+    });
+
+    it('non-strings and empty strings are safe (defensive)', () => {
+        assert.ok(!isUnsafeGuc(''));
+        assert.ok(!isUnsafeGuc(null));
+        assert.ok(!isUnsafeGuc(undefined));
+        assert.ok(!isUnsafeGuc(42));
+    });
+});
+
+// ─── parseSetCommand: shape coverage ──────────────────────────────────────
+
+describe('parseSetCommand', () => {
+    it('SET name = value (quoted)', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET foo = 'bar'"),
+            { kind: 'set', name: 'foo', value: 'bar' },
+        );
+    });
+
+    it('SET name TO value (quoted)', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET foo TO 'bar'"),
+            { kind: 'set', name: 'foo', value: 'bar' },
+        );
+    });
+
+    it('SET name = unquoted-value', () => {
+        assert.deepStrictEqual(
+            parseSetCommand('SET foo = 42'),
+            { kind: 'set', name: 'foo', value: '42' },
+        );
+    });
+
+    it('SET SESSION modifier strips to plain set', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET SESSION foo = 'bar'"),
+            { kind: 'set', name: 'foo', value: 'bar' },
+        );
+    });
+
+    it('SET LOCAL modifier yields set_local kind', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET LOCAL foo = 'bar'"),
+            { kind: 'set_local', name: 'foo', value: 'bar' },
+        );
+    });
+
+    it('RESET name', () => {
+        assert.deepStrictEqual(
+            parseSetCommand('RESET foo'),
+            { kind: 'reset', name: 'foo' },
+        );
+    });
+
+    it('RESET ALL', () => {
+        assert.deepStrictEqual(parseSetCommand('RESET ALL'), { kind: 'reset_all' });
+    });
+
+    it('case insensitive on keywords', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("set foo = 'bar'"),
+            { kind: 'set', name: 'foo', value: 'bar' },
+        );
+        assert.deepStrictEqual(
+            parseSetCommand("Set Local foo To 'bar'"),
+            { kind: 'set_local', name: 'foo', value: 'bar' },
+        );
+        assert.deepStrictEqual(parseSetCommand('reset all'), { kind: 'reset_all' });
+    });
+
+    it('lowercases the GUC name', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET App.User_ID = '42'"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('tolerates a single trailing semicolon', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET foo = 'bar';"),
+            { kind: 'set', name: 'foo', value: 'bar' },
+        );
+        assert.deepStrictEqual(
+            parseSetCommand('RESET foo ;'),
+            { kind: 'reset', name: 'foo' },
+        );
+    });
+
+    it("SET name='value' with no spaces (glued =)", () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET app.user_id='42'"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('strips surrounding double quotes from name', () => {
+        assert.deepStrictEqual(
+            parseSetCommand('SET "App.User" = 42'),
+            { kind: 'set', name: 'app.user', value: '42' },
+        );
+    });
+
+    it('strips surrounding single quotes from value', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SET foo = 'multi word value'"),
+            { kind: 'set', name: 'foo', value: 'multi word value' },
+        );
+    });
+
+    it('non-SET / non-RESET returns null', () => {
+        assert.strictEqual(parseSetCommand('SELECT 1'), null);
+        assert.strictEqual(parseSetCommand('INSERT INTO t VALUES (1)'), null);
+        assert.strictEqual(parseSetCommand('BEGIN'), null);
+        assert.strictEqual(parseSetCommand(''), null);
+        assert.strictEqual(parseSetCommand('   '), null);
+    });
+
+    it('RESET with extra junk is rejected', () => {
+        assert.strictEqual(parseSetCommand('RESET foo bar'), null);
+    });
+
+    it('non-string input returns null', () => {
+        assert.strictEqual(parseSetCommand(null), null);
+        assert.strictEqual(parseSetCommand(undefined), null);
+        assert.strictEqual(parseSetCommand(42), null);
+    });
+});
+
+// ─── splitStatements: respects string literals ────────────────────────────
+
+describe('splitStatements', () => {
+    it('single statement returns a one-element list', () => {
+        assert.deepStrictEqual(splitStatements('SELECT 1'), ['SELECT 1']);
+    });
+
+    it('top-level semicolon splits', () => {
+        assert.deepStrictEqual(
+            splitStatements("SET app.user_id = '42'; SELECT 1"),
+            ["SET app.user_id = '42'", 'SELECT 1'],
+        );
+    });
+
+    it('semicolon inside a single-quoted string is not a split', () => {
+        assert.deepStrictEqual(
+            splitStatements("SELECT ';' FROM t; SELECT 2"),
+            ["SELECT ';' FROM t", 'SELECT 2'],
+        );
+    });
+
+    it('semicolon inside a double-quoted identifier is not a split', () => {
+        assert.deepStrictEqual(
+            splitStatements('SELECT "a;b" FROM t; SELECT 2'),
+            ['SELECT "a;b" FROM t', 'SELECT 2'],
+        );
+    });
+
+    it("doubled-quote escape is honored ('' inside '...')", () => {
+        // The '' inside the string literal must NOT close the literal.
+        // The trailing ; is therefore inside the string and not a split.
+        assert.deepStrictEqual(
+            splitStatements("SELECT 'it''s ;' FROM t"),
+            ["SELECT 'it''s ;' FROM t"],
+        );
+    });
+
+    it('empty / whitespace-only segments are dropped', () => {
+        assert.deepStrictEqual(splitStatements(';;;'), []);
+        assert.deepStrictEqual(splitStatements('SELECT 1;;'), ['SELECT 1']);
+    });
+
+    it('non-string / empty input', () => {
+        assert.deepStrictEqual(splitStatements(''), []);
+        assert.deepStrictEqual(splitStatements(null), []);
+        assert.deepStrictEqual(splitStatements(undefined), []);
+    });
+});
+
+// ─── ConnectionGucState ───────────────────────────────────────────────────
+//
+// Per-connection state machine. Hash is 0 at baseline, recomputed on every
+// mutation that touches an unsafe GUC. SET LOCAL is a no-op (cache is
+// bypassed mid-transaction anyway). Multi-statement bodies are honored
+// via observeSql. Insertion order must not affect the hash (BTreeMap-style
+// canonicalisation).
+
+describe('ConnectionGucState', () => {
+    it('starts at hash 0', () => {
+        const s = new ConnectionGucState();
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('SET unsafe GUC changes the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        assert.notStrictEqual(s.stateHash(), 0);
+    });
+
+    it('SET safe GUC does NOT change the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET timezone = 'UTC'");
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('SET LOCAL on an unsafe GUC is a no-op for the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET LOCAL app.user_id = '42'");
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('different unsafe GUC values produce different hashes', () => {
+        const a = new ConnectionGucState();
+        a.observeSql("SET app.user_id = '42'");
+        const b = new ConnectionGucState();
+        b.observeSql("SET app.user_id = '99'");
+        assert.notStrictEqual(a.stateHash(), b.stateHash());
+    });
+
+    it('insertion order does not affect the hash', () => {
+        const a = new ConnectionGucState();
+        a.observeSql("SET app.user_id = '42'");
+        a.observeSql("SET app.tenant = 'acme'");
+        const b = new ConnectionGucState();
+        b.observeSql("SET app.tenant = 'acme'");
+        b.observeSql("SET app.user_id = '42'");
+        assert.strictEqual(a.stateHash(), b.stateHash());
+    });
+
+    it('RESET name reverts the hash to baseline (0)', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const after = s.stateHash();
+        assert.notStrictEqual(after, 0);
+        s.observeSql('RESET app.user_id');
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('RESET ALL clears all unsafe state', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        s.observeSql("SET app.tenant = 'acme'");
+        assert.notStrictEqual(s.stateHash(), 0);
+        s.observeSql('RESET ALL');
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('multi-statement body in one observeSql call', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'; SELECT 1");
+        assert.notStrictEqual(s.stateHash(), 0);
+    });
+
+    it('apply() returns true on a hash-changing mutation, false otherwise', () => {
+        const s = new ConnectionGucState();
+        // Unsafe SET → changes hash
+        assert.ok(s.apply({ kind: 'set', name: 'app.user_id', value: '42' }));
+        // Safe SET → no change
+        assert.ok(!s.apply({ kind: 'set', name: 'timezone', value: 'UTC' }));
+        // SET LOCAL → never changes hash
+        assert.ok(!s.apply({ kind: 'set_local', name: 'app.user_id', value: '99' }));
+        // Re-RESET an absent name → no change
+        assert.ok(!s.apply({ kind: 'reset', name: 'nope' }));
+    });
+
+    it('observeSql handles non-SET SQL without mutating state', () => {
+        const s = new ConnectionGucState();
+        s.observeSql('SELECT * FROM users');
+        s.observeSql('INSERT INTO orders VALUES (1)');
+        assert.strictEqual(s.stateHash(), 0);
+    });
+});
+
+// ─── Cache key state-hash gating ──────────────────────────────────────────
+//
+// makeKey folds the state hash into the cache key so two CachedClients
+// with different unsafe-GUC state never collide on a shared singleton
+// cache slot. Default 0 (no state) preserves the pre-state-hash key
+// shape's distinguishability across SQL+values.
+
+describe('makeKey state-hash inclusion', () => {
+    it('default state-hash 0 is consistent with explicit 0', () => {
+        assert.strictEqual(
+            makeKey('SELECT 1', null),
+            makeKey('SELECT 1', null, 0),
+        );
+    });
+
+    it('different state hashes produce different keys for the same SQL', () => {
+        const k1 = makeKey('SELECT * FROM users', null, 0);
+        const k2 = makeKey('SELECT * FROM users', null, 0xdeadbeef);
+        assert.notEqual(k1, k2);
+    });
+
+    it('same state hash + same SQL = same key', () => {
+        assert.strictEqual(
+            makeKey('SELECT 1', [1], 0xdeadbeef),
+            makeKey('SELECT 1', [1], 0xdeadbeef),
+        );
+    });
+});
+
+describe('cache get/put state-hash gating', () => {
+    it('put under hashA does not satisfy get under hashB', () => {
+        const cache = makeCache();
+        cache.put('SELECT * FROM accounts', null, [{ id: 'A' }], [], 0xaaaaaaaa);
+        // Same SQL/values, different state hash → must miss.
+        assert.equal(
+            cache.get('SELECT * FROM accounts', null, 0xbbbbbbbb),
+            null,
+        );
+        // Same hash → hits.
+        assert.deepStrictEqual(
+            cache.get('SELECT * FROM accounts', null, 0xaaaaaaaa).rows,
+            [{ id: 'A' }],
+        );
+    });
+
+    it('two separate CachedClient-style states are isolated under one cache', () => {
+        // Models the actual deployment: one shared NativeCache singleton,
+        // two CachedClient instances each with their own ConnectionGucState.
+        const cache = makeCache();
+        const a = new ConnectionGucState();
+        a.observeSql("SET app.user_id = 'A'");
+        const b = new ConnectionGucState();
+        b.observeSql("SET app.user_id = 'B'");
+        // User A populates.
+        cache.put('SELECT * FROM accounts', null, [{ id: 'rows-A' }], [], a.stateHash());
+        // User B must NOT see user A's rows.
+        assert.equal(cache.get('SELECT * FROM accounts', null, b.stateHash()), null);
+        // User A's own get hits.
+        assert.deepStrictEqual(
+            cache.get('SELECT * FROM accounts', null, a.stateHash()).rows,
+            [{ id: 'rows-A' }],
+        );
+    });
+
+    it('zero-arg get() (legacy callers) keys against state hash 0', () => {
+        // Backwards compatibility: existing tests and callers that don't
+        // know about state hashes get default 0, which matches
+        // empty-state ConnectionGucState. Pre-state-hash behavior intact.
+        const cache = makeCache();
+        cache.put('SELECT 1', null, [{ x: 1 }], []); // implicit hash 0
+        assert.deepStrictEqual(cache.get('SELECT 1', null).rows, [{ x: 1 }]);
+        assert.deepStrictEqual(cache.get('SELECT 1', null, 0).rows, [{ x: 1 }]);
+    });
+
+    it('invalidation by table works across state-hash buckets', () => {
+        // Each CachedClient has its own state hash; an INSERT routed to
+        // the cache via invalidateTable must drop entries regardless of
+        // which user populated them. extractTables is keyed by SQL text
+        // alone, so the table index spans hashes naturally.
+        const cache = makeCache();
+        cache.put('SELECT * FROM orders', null, [{ id: 1 }], [], 0xaaaaaaaa);
+        cache.put('SELECT * FROM orders', null, [{ id: 2 }], [], 0xbbbbbbbb);
+        cache.invalidateTable('orders');
+        assert.equal(cache.get('SELECT * FROM orders', null, 0xaaaaaaaa), null);
+        assert.equal(cache.get('SELECT * FROM orders', null, 0xbbbbbbbb), null);
     });
 });

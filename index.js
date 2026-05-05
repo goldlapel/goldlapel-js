@@ -70,7 +70,9 @@ export function _applicationNameMarker() {
 
 // Keys that are valid inside the structured `config` map. Top-level concepts
 // (proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
-// client, configFile) are exposed as their own options on GoldLapel's
+// client, configFile, plus the four headline disable flags —
+// disableMatviews, disableProxyCache, disableSqloptimize,
+// disableAutoIndexes) are exposed as their own options on GoldLapel's
 // constructor and are NOT accepted here — passing them through `config`
 // raises at argv build time.
 const VALID_CONFIG_KEYS = new Set([
@@ -81,19 +83,19 @@ const VALID_CONFIG_KEYS = new Set([
     'poolMode', 'mgmtIdleTimeout', 'fallback', 'readAfterWriteSecs',
     'n1Threshold', 'n1WindowMs', 'n1CrossThreshold',
     'tlsCert', 'tlsKey', 'tlsClientCa',
-    'disableMatviews', 'disableConsolidation', 'disableBtreeIndexes',
+    'disableConsolidation', 'disableBtreeIndexes',
     'disableTrigramIndexes', 'disableExpressionIndexes',
     'disablePartialIndexes', 'disableRewrite', 'disableRewritePreparedCache',
-    'disableProxyCache', 'disablePool',
+    'disablePool',
     'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
     'enableCoalescing', 'replica', 'excludeTables',
 ]);
 
 const BOOLEAN_KEYS = new Set([
-    'disableMatviews', 'disableConsolidation', 'disableBtreeIndexes',
+    'disableConsolidation', 'disableBtreeIndexes',
     'disableTrigramIndexes', 'disableExpressionIndexes',
     'disablePartialIndexes', 'disableRewrite', 'disableRewritePreparedCache',
-    'disableProxyCache', 'disablePool',
+    'disablePool',
     'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
     'enableCoalescing',
 ]);
@@ -456,7 +458,13 @@ export class GoldLapel {
     constructor(upstream, {
         proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
         client, configFile, config, extraArgs, noConnect, silent,
-        mesh, meshTag, enableProxyCacheForWrappers, disableNativeCache,
+        mesh, meshTag, disableNativeCache,
+        // Headline strategy disables — promoted out of `config` to
+        // first-class top-level options. Each maps 1:1 to a proxy CLI
+        // flag (`--disable-matviews`, `--disable-proxy-cache`,
+        // `--disable-sqloptimize`, `--disable-auto-indexes`). Atomic
+        // break — passing them inside `config` is rejected.
+        disableMatviews, disableProxyCache, disableSqloptimize, disableAutoIndexes,
     } = {}) {
         this._upstream = upstream;
         this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
@@ -489,13 +497,15 @@ export class GoldLapel {
         // Mesh membership (startup intent — HQ enforces license).
         this._mesh = !!mesh;
         this._meshTag = meshTag ? String(meshTag) : null;
-        // Opt wrapper traffic into the proxy's proxy-cache layer. Default
-        // `false` matches the per-connection wrapper-skip shipped on the
-        // proxy: wrappers have their own native cache, so re-caching at
-        // the proxy is wasted memory for single-pod deployments. Fleet
-        // customers (multi-pod, frequent restarts, mesh) flip this on so
-        // the proxy cache acts as a shared cache across processes.
-        this._enableProxyCacheForWrappers = !!enableProxyCacheForWrappers;
+        // Headline strategy disables. Each is a first-class top-level
+        // option that maps 1:1 to a proxy CLI flag (Model B pivot —
+        // wrappers no longer opt traffic into the proxy's result cache;
+        // the proxy decides per-connection based on the application_name
+        // marker). Default false; emitted as `--disable-X` when true.
+        this._disableMatviews = !!disableMatviews;
+        this._disableProxyCache = !!disableProxyCache;
+        this._disableSqloptimize = !!disableSqloptimize;
+        this._disableAutoIndexes = !!disableAutoIndexes;
         // Toggle the wrapper's in-process native cache off without losing
         // the tuned `cacheSize`. When `true`, NativeCache acts as a no-op
         // pass-through (get always misses, put is a no-op) — the
@@ -587,8 +597,20 @@ export class GoldLapel {
         if (this._meshTag) {
             args.push('--mesh-tag', this._meshTag);
         }
-        if (this._enableProxyCacheForWrappers) {
-            args.push('--enable-proxy-cache-for-wrappers');
+        // Headline strategy disables — emitted as their own top-level CLI
+        // flags. Suppressed when the user hasn't set them so the Rust
+        // binary applies its own defaults.
+        if (this._disableMatviews) {
+            args.push('--disable-matviews');
+        }
+        if (this._disableProxyCache) {
+            args.push('--disable-proxy-cache');
+        }
+        if (this._disableSqloptimize) {
+            args.push('--disable-sqloptimize');
+        }
+        if (this._disableAutoIndexes) {
+            args.push('--disable-auto-indexes');
         }
         args.push(..._configToArgs(this._config));
         args.push(...this._extraArgs);
@@ -874,7 +896,10 @@ function _call(gl, fn, args) {
  * @param {boolean} [opts.silent]  Suppress the one-line startup banner (wrapper-only; never forwarded to the binary).
  * @param {boolean} [opts.mesh]  Opt into the mesh at startup. HQ enforces the license; denial is non-fatal — proxy runs without clustering.
  * @param {string}  [opts.meshTag]  Mesh tag — instances sharing a tag cluster together.
- * @param {boolean} [opts.enableProxyCacheForWrappers=false]  Opt wrapper traffic into the proxy's proxy-cache layer. Off by default — wrappers have their own native cache, so re-caching at the proxy is wasted memory in single-pod setups. Turn on for fleet deployments (multi-pod, frequent restarts, mesh) where the proxy cache acts as a shared cache across processes.
+ * @param {boolean} [opts.disableMatviews=false]  Disable matview optimization on the proxy (`--disable-matviews`). Headline kill switch for the matview strategy.
+ * @param {boolean} [opts.disableProxyCache=false]  Disable the proxy's result cache entirely (`--disable-proxy-cache`). Highest-precedence kill switch — overrides finer-grained cache toggles.
+ * @param {boolean} [opts.disableSqloptimize=false]  Disable the SQL rewrite / optimization pipeline on the proxy (`--disable-sqloptimize`). Per-kind disables in `config` still apply on top.
+ * @param {boolean} [opts.disableAutoIndexes=false]  Disable automatic index recommendations / creation on the proxy (`--disable-auto-indexes`).
  * @param {boolean} [opts.disableNativeCache=false]  Disable the wrapper's in-process native cache without losing the tuned `cacheSize`. When `true`, gets always miss and puts are no-ops; the invalidation socket still connects so telemetry continues to flow. Use to A/B the native cache layer (e.g. measure end-to-end latency with and without it) while keeping your size config intact.
  * @returns {Promise<GoldLapel>}
  */

@@ -366,12 +366,16 @@ describe('configToArgs', () => {
     });
 
     it('includes flag for boolean true', () => {
-        const args = _configToArgs({ disableMatviews: true });
-        assert.deepStrictEqual(args, ['--disable-matviews']);
+        // disableConsolidation is still a config-map boolean key.
+        // (disableMatviews / disableProxyCache / disableSqloptimize /
+        // disableAutoIndexes were promoted to top-level options and no
+        // longer appear in VALID_CONFIG_KEYS.)
+        const args = _configToArgs({ disableConsolidation: true });
+        assert.deepStrictEqual(args, ['--disable-consolidation']);
     });
 
     it('omits flag for boolean false', () => {
-        const args = _configToArgs({ disableMatviews: false });
+        const args = _configToArgs({ disableConsolidation: false });
         assert.deepStrictEqual(args, []);
     });
 
@@ -528,53 +532,220 @@ describe('mesh startup options', () => {
 });
 
 
-describe('enableProxyCacheForWrappers startup option', () => {
-    // Top-level canonical-surface boolean: opts wrapper traffic into the
-    // proxy's proxy-cache layer. Default false — wrappers have their own
-    // native cache and the proxy's per-connection wrapper-skip is the
-    // default. Translates to --enable-proxy-cache-for-wrappers; never
-    // valid inside `config`.
+// ─── Headline strategy disables — promoted top-level options ──────────────
+//
+// Model B pivot (2026-05-04): the wrapper no longer carries
+// `enableProxyCacheForWrappers` at all; the proxy decides cache routing
+// per-connection from the `application_name` marker. In its place, four
+// headline strategy disables are promoted out of the `config` map to
+// first-class top-level options on `start()` / `new GoldLapel(...)`. Each
+// maps 1:1 to a proxy CLI flag and is rejected inside `config` (atomic
+// break — no aliases).
 
+describe('disableMatviews startup option', () => {
     it('defaults to false', () => {
         const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._enableProxyCacheForWrappers, false);
+        assert.strictEqual(gl._disableMatviews, false);
     });
 
-    it('stores enableProxyCacheForWrappers=true', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            enableProxyCacheForWrappers: true,
-        });
-        assert.strictEqual(gl._enableProxyCacheForWrappers, true);
+    it('stores disableMatviews=true', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: true });
+        assert.strictEqual(gl._disableMatviews, true);
     });
 
     it('coerces truthy/falsy to boolean', () => {
-        const gl1 = new GoldLapel('postgresql://localhost:5432/mydb', { enableProxyCacheForWrappers: 1 });
-        assert.strictEqual(gl1._enableProxyCacheForWrappers, true);
-        const gl2 = new GoldLapel('postgresql://localhost:5432/mydb', { enableProxyCacheForWrappers: 0 });
-        assert.strictEqual(gl2._enableProxyCacheForWrappers, false);
-        const gl3 = new GoldLapel('postgresql://localhost:5432/mydb', { enableProxyCacheForWrappers: undefined });
-        assert.strictEqual(gl3._enableProxyCacheForWrappers, false);
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: 1 })._disableMatviews,
+            true,
+        );
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: 0 })._disableMatviews,
+            false,
+        );
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: undefined })._disableMatviews,
+            false,
+        );
     });
 
-    it('emits --enable-proxy-cache-for-wrappers when true', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            enableProxyCacheForWrappers: true,
-        });
+    it('emits --disable-matviews when true', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: true });
         const args = gl._buildSpawnArgs();
-        assert.ok(args.includes('--enable-proxy-cache-for-wrappers'),
-            `argv must contain --enable-proxy-cache-for-wrappers: ${args.join(' ')}`);
+        assert.ok(args.includes('--disable-matviews'),
+            `argv must contain --disable-matviews: ${args.join(' ')}`);
     });
 
-    it('omits --enable-proxy-cache-for-wrappers when false / unset', () => {
+    it('omits --disable-matviews when false / unset', () => {
         const glDefault = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.ok(!glDefault._buildSpawnArgs().includes('--enable-proxy-cache-for-wrappers'));
-        const glFalse = new GoldLapel('postgresql://localhost:5432/mydb', {
-            enableProxyCacheForWrappers: false,
-        });
-        assert.ok(!glFalse._buildSpawnArgs().includes('--enable-proxy-cache-for-wrappers'));
+        assert.ok(!glDefault._buildSpawnArgs().includes('--disable-matviews'));
+        const glFalse = new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: false });
+        assert.ok(!glFalse._buildSpawnArgs().includes('--disable-matviews'));
     });
 
-    it('rejects enableProxyCacheForWrappers inside config map', () => {
+    it('rejects disableMatviews inside config map', () => {
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                config: { disableMatviews: true },
+            }),
+            /Unknown config keys: disableMatviews/,
+        );
+    });
+
+    it('disableMatviews is not a valid config key', () => {
+        const keys = configKeys();
+        assert.ok(!keys.has('disableMatviews'));
+    });
+});
+
+describe('disableProxyCache startup option', () => {
+    it('defaults to false', () => {
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb')._disableProxyCache,
+            false,
+        );
+    });
+
+    it('emits --disable-proxy-cache when true', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableProxyCache: true });
+        const args = gl._buildSpawnArgs();
+        assert.ok(args.includes('--disable-proxy-cache'),
+            `argv must contain --disable-proxy-cache: ${args.join(' ')}`);
+    });
+
+    it('omits --disable-proxy-cache when false / unset', () => {
+        assert.ok(!new GoldLapel('postgresql://localhost:5432/mydb')._buildSpawnArgs()
+            .includes('--disable-proxy-cache'));
+        assert.ok(!new GoldLapel('postgresql://localhost:5432/mydb', { disableProxyCache: false })
+            ._buildSpawnArgs().includes('--disable-proxy-cache'));
+    });
+
+    it('coerces truthy/falsy to boolean', () => {
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableProxyCache: 1 })._disableProxyCache,
+            true,
+        );
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableProxyCache: 0 })._disableProxyCache,
+            false,
+        );
+    });
+
+    it('rejects disableProxyCache inside config map', () => {
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                config: { disableProxyCache: true },
+            }),
+            /Unknown config keys: disableProxyCache/,
+        );
+    });
+
+    it('disableProxyCache is not a valid config key', () => {
+        assert.ok(!configKeys().has('disableProxyCache'));
+    });
+});
+
+describe('disableSqloptimize startup option', () => {
+    it('defaults to false', () => {
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb')._disableSqloptimize,
+            false,
+        );
+    });
+
+    it('emits --disable-sqloptimize when true', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableSqloptimize: true });
+        const args = gl._buildSpawnArgs();
+        assert.ok(args.includes('--disable-sqloptimize'),
+            `argv must contain --disable-sqloptimize: ${args.join(' ')}`);
+    });
+
+    it('omits --disable-sqloptimize when false / unset', () => {
+        assert.ok(!new GoldLapel('postgresql://localhost:5432/mydb')._buildSpawnArgs()
+            .includes('--disable-sqloptimize'));
+        assert.ok(!new GoldLapel('postgresql://localhost:5432/mydb', { disableSqloptimize: false })
+            ._buildSpawnArgs().includes('--disable-sqloptimize'));
+    });
+
+    it('coerces truthy/falsy to boolean', () => {
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableSqloptimize: 1 })._disableSqloptimize,
+            true,
+        );
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableSqloptimize: 0 })._disableSqloptimize,
+            false,
+        );
+    });
+
+    it('rejects disableSqloptimize inside config map', () => {
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                config: { disableSqloptimize: true },
+            }),
+            /Unknown config keys: disableSqloptimize/,
+        );
+    });
+
+    it('disableSqloptimize is not a valid config key', () => {
+        assert.ok(!configKeys().has('disableSqloptimize'));
+    });
+});
+
+describe('disableAutoIndexes startup option', () => {
+    it('defaults to false', () => {
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb')._disableAutoIndexes,
+            false,
+        );
+    });
+
+    it('emits --disable-auto-indexes when true', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableAutoIndexes: true });
+        const args = gl._buildSpawnArgs();
+        assert.ok(args.includes('--disable-auto-indexes'),
+            `argv must contain --disable-auto-indexes: ${args.join(' ')}`);
+    });
+
+    it('omits --disable-auto-indexes when false / unset', () => {
+        assert.ok(!new GoldLapel('postgresql://localhost:5432/mydb')._buildSpawnArgs()
+            .includes('--disable-auto-indexes'));
+        assert.ok(!new GoldLapel('postgresql://localhost:5432/mydb', { disableAutoIndexes: false })
+            ._buildSpawnArgs().includes('--disable-auto-indexes'));
+    });
+
+    it('coerces truthy/falsy to boolean', () => {
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableAutoIndexes: 1 })._disableAutoIndexes,
+            true,
+        );
+        assert.strictEqual(
+            new GoldLapel('postgresql://localhost:5432/mydb', { disableAutoIndexes: 0 })._disableAutoIndexes,
+            false,
+        );
+    });
+
+    it('rejects disableAutoIndexes inside config map', () => {
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', {
+                config: { disableAutoIndexes: true },
+            }),
+            /Unknown config keys: disableAutoIndexes/,
+        );
+    });
+
+    it('disableAutoIndexes is not a valid config key', () => {
+        assert.ok(!configKeys().has('disableAutoIndexes'));
+    });
+});
+
+describe('Model B pivot — enableProxyCacheForWrappers fully removed', () => {
+    // Atomic break (Model B, 2026-05-04): the proxy decides cache routing
+    // per-connection from the `application_name` marker. The wrapper no
+    // longer carries any opt-in for proxy result caching — even passing
+    // the old key as a top-level option is silently ignored (it isn't
+    // recognised by the constructor) and inside `config` it raises.
+
+    it('passing the removed key inside config is rejected', () => {
         assert.throws(
             () => new GoldLapel('postgresql://localhost:5432/mydb', {
                 config: { enableProxyCacheForWrappers: true },
@@ -583,9 +754,18 @@ describe('enableProxyCacheForWrappers startup option', () => {
         );
     });
 
-    it('enableProxyCacheForWrappers is not a valid config key', () => {
-        const keys = configKeys();
-        assert.ok(!keys.has('enableProxyCacheForWrappers'));
+    it('argv never contains --enable-proxy-cache-for-wrappers', () => {
+        // Even with the (no-op) top-level key passed, the spawn args must
+        // not surface the flag to the proxy binary.
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            enableProxyCacheForWrappers: true,
+        });
+        assert.ok(!gl._buildSpawnArgs().includes('--enable-proxy-cache-for-wrappers'));
+    });
+
+    it('instance has no _enableProxyCacheForWrappers field', () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.strictEqual(gl._enableProxyCacheForWrappers, undefined);
     });
 });
 
@@ -596,12 +776,17 @@ describe('configKeys', () => {
         assert.ok(keys instanceof Set);
         // Tuning knobs still live in the structured config map.
         assert.ok(keys.has('poolSize'));
-        assert.ok(keys.has('disableMatviews'));
+        assert.ok(keys.has('disableConsolidation'));
         // Top-level concepts must NOT appear — passing them via config is a
-        // user error.
+        // user error. The four headline disables (Model B pivot, 2026-05-04)
+        // were promoted out of `config` to first-class options.
         assert.ok(!keys.has('mode'));
         assert.ok(!keys.has('logLevel'));
         assert.ok(!keys.has('dashboardPort'));
+        assert.ok(!keys.has('disableMatviews'));
+        assert.ok(!keys.has('disableProxyCache'));
+        assert.ok(!keys.has('disableSqloptimize'));
+        assert.ok(!keys.has('disableAutoIndexes'));
     });
 
     it('returns a new Set each call (not the internal reference)', () => {
