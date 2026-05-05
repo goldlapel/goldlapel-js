@@ -362,6 +362,49 @@ describe('GUC state-hash gating', () => {
         // baseline (hash 0) is empty — the read should miss.
         assert.notEqual(cached._gucState.stateHash(), 0);
     });
+
+    it('multi-statement Q with embedded SET shifts subsequent-read hash', async () => {
+        // Real-world pattern: a single client.query() submits
+        // `SET app.user_id = '42'; SELECT * FROM accounts` as one Q
+        // message. observeSql's multi-statement path must apply the SET
+        // so the next standalone SELECT keys against the new hash and
+        // doesn't share a cache slot with the baseline-empty state.
+        const client = mockClient({
+            rows: [{ id: 'A' }], fields: [{ name: 'id' }],
+            rowCount: 1, command: 'SELECT',
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+
+        // Pre-populate a baseline (hash 0) cache entry — would be a leak
+        // if the multi-statement SET didn't shift the hash.
+        cache.put('SELECT * FROM accounts', null, [{ id: 'BASELINE' }], []);
+
+        await cached.query("SET app.user_id = '42'; SELECT * FROM accounts");
+        assert.notEqual(cached._gucState.stateHash(), 0);
+
+        // Subsequent standalone SELECT on this same connection: must MISS
+        // the baseline entry (different hash) and call _real.query.
+        const r = await cached.query('SELECT * FROM accounts');
+        assert.deepStrictEqual(r.rows, [{ id: 'A' }],
+            'must NOT serve baseline-cached row under a shifted state hash');
+    });
+
+    it('SET-looking text inside a SELECT string literal does NOT shift hash', async () => {
+        // End-to-end safety: a SELECT containing the substring
+        // `SET app.user_id = ...` inside a string literal must not
+        // perturb the per-connection state. Fast-path single-statement
+        // detection + parseSetCommand reading the first token ('SELECT')
+        // → null parse → no apply.
+        const client = mockClient({
+            rows: [], fields: [], rowCount: 0, command: 'SELECT',
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+
+        await cached.query("SELECT 'SET app.user_id = pwn' FROM logs");
+        assert.strictEqual(cached._gucState.stateHash(), 0);
+    });
 });
 
 // --- Edge cases ---

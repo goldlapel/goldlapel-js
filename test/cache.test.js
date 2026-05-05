@@ -1100,6 +1100,40 @@ describe('parseSetCommand', () => {
         assert.strictEqual(parseSetCommand(undefined), null);
         assert.strictEqual(parseSetCommand(42), null);
     });
+
+    // Parity with proxy/src/guc_state.rs `parse_rejects_set_time_zone_two_word_form`:
+    // the legacy `SET TIME ZONE 'UTC'` form is harmless (timezone is safe)
+    // and the unusual two-word GUC name doesn't fit the parser shape. Returning
+    // null is correct — it tells callers "this isn't a trackable SET" so the
+    // state hash isn't perturbed.
+    it("legacy 'SET TIME ZONE' two-word form returns null", () => {
+        assert.strictEqual(parseSetCommand("SET TIME ZONE 'UTC'"), null);
+    });
+
+    // Parity with proxy `parse_rejects_set_without_value`. SET / RESET must
+    // be rejected when the value (or name in the case of RESET) is absent —
+    // we never want to fold a partial token into the state.
+    it('SET name = (no value) returns null', () => {
+        assert.strictEqual(parseSetCommand('SET foo ='), null);
+    });
+    it('SET name TO (no value) returns null', () => {
+        assert.strictEqual(parseSetCommand('SET foo TO'), null);
+    });
+    it('SET name (no separator, no value) returns null', () => {
+        assert.strictEqual(parseSetCommand('SET foo'), null);
+    });
+    it('bare semicolon returns null', () => {
+        assert.strictEqual(parseSetCommand(';'), null);
+    });
+
+    // Parity with proxy `parse_double_quoted_value` — PG-canonical use of `"`
+    // around a value (rare but legal). Stripped just like single quotes.
+    it('strips surrounding double quotes from value', () => {
+        assert.deepStrictEqual(
+            parseSetCommand('SET foo = "bar"'),
+            { kind: 'set', name: 'foo', value: 'bar' },
+        );
+    });
 });
 
 // ─── splitStatements: respects string literals ────────────────────────────
@@ -1241,6 +1275,65 @@ describe('ConnectionGucState', () => {
         const s = new ConnectionGucState();
         s.observeSql('SELECT * FROM users');
         s.observeSql('INSERT INTO orders VALUES (1)');
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    // Parity with proxy `reset_safe_guc_is_noop` — a RESET on a safe GUC
+    // (not in the unsafe shortlist, no `.`) must not perturb the hash, even
+    // if there's already unsafe state present.
+    it('RESET <safe-guc> is a no-op for the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const after = s.stateHash();
+        s.observeSql('RESET timezone');
+        assert.strictEqual(s.stateHash(), after);
+    });
+
+    // Parity with proxy `overwrite_unsafe_value_changes_hash` — re-SETting
+    // an already-set unsafe GUC to a different value must move the hash.
+    it('overwriting an unsafe GUC value changes the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const h1 = s.stateHash();
+        s.observeSql("SET app.user_id = '43'");
+        const h2 = s.stateHash();
+        assert.notStrictEqual(h1, h2);
+    });
+
+    // RESET on a never-SET unsafe key must leave the hash unchanged. Without
+    // this guard apply()'s `delete` would still recompute the hash on a
+    // baseline-empty Map — wasted work, but more importantly it would still
+    // be 0. This pins the cheap-no-op behavior.
+    it('RESET on a never-SET unsafe key is a no-op', () => {
+        const s = new ConnectionGucState();
+        const ok = s.observeSql('RESET app.never_set');
+        assert.strictEqual(ok, false);
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    // Parity with proxy `observe_multi_statement_with_quoted_semicolon`:
+    // a `;` inside a single-quoted SET value must not split the statement
+    // — the SET command should still apply with the full value.
+    it('multi-statement with quoted semicolon still applies the SET', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.tenant = 'has;semicolon'; SELECT 1");
+        // The hash moved because an unsafe GUC was set.
+        assert.notStrictEqual(s.stateHash(), 0);
+        // And the full value (semicolon included) is what got hashed —
+        // verify by comparing against a fresh state set to the same value
+        // as a single statement.
+        const t = new ConnectionGucState();
+        t.observeSql("SET app.tenant = 'has;semicolon'");
+        assert.strictEqual(s.stateHash(), t.stateHash());
+    });
+
+    // SET-looking text that's actually inside a SELECT's string literal must
+    // NOT shift the state hash. The fast path's split detection sees no
+    // top-level `;`; parseSetCommand reads the first token (`SELECT`) and
+    // bails. End-to-end safety check.
+    it("'SET ...'-shaped text inside a string literal does not shift the hash", () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SELECT 'SET app.user_id = pwn' FROM logs");
         assert.strictEqual(s.stateHash(), 0);
     });
 });
