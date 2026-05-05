@@ -73,6 +73,30 @@ describe('detectWrite', () => {
     it('empty returns null', () => assert.equal(detectWrite(''), null));
     it('whitespace returns null', () => assert.equal(detectWrite('   '), null));
     it('COPY with columns', () => assert.equal(detectWrite("COPY orders(id, name) FROM '/tmp/data.csv'"), 'orders'));
+
+    // Regression: SELECT with `INTO` inside a string literal must not be
+    // classified as SELECT-INTO DDL. The pre-fix tokenizer split on
+    // whitespace only, so a literal like `'INSERT INTO orders'` smuggled
+    // the bare word INTO into the scan and tripped the DDL sentinel,
+    // forcing a full cache invalidation on a plain read.
+    it('SELECT with INTO in single-quoted literal is not DDL', () => {
+        assert.equal(detectWrite("SELECT 'INSERT INTO orders;' FROM audit_log"), null);
+    });
+    it('SELECT with INTO in double-quoted identifier is not DDL', () => {
+        assert.equal(detectWrite('SELECT * FROM "into_table"'), null);
+    });
+    it('SELECT with INTO in LIKE-pattern literal is not DDL', () => {
+        assert.equal(detectWrite("SELECT message FROM logs WHERE message LIKE '%INTO%'"), null);
+    });
+    it('SELECT with INTO inside doubled-quote escape is not DDL', () => {
+        assert.equal(detectWrite("SELECT 'It''s INTO trouble' FROM notes"), null);
+    });
+    it('real SELECT INTO new_table is still DDL (regression guard)', () => {
+        assert.equal(detectWrite('SELECT * INTO new_table FROM source'), DDL_SENTINEL);
+    });
+    it('real SELECT INTO TEMP table is still DDL', () => {
+        assert.equal(detectWrite('SELECT id INTO TEMP scratch FROM source'), DDL_SENTINEL);
+    });
 });
 
 // --- extractTables ---

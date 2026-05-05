@@ -115,6 +115,43 @@ function _normalizeGucName(token) {
     return trimmed.toLowerCase();
 }
 
+// Replace the contents of `'...'` and `"..."` string literals with spaces,
+// preserving overall length so positions line up with the original. PG's
+// doubled-quote `''` / `""` escapes are handled the same way as in
+// splitStatements. Used by detectWrite's SELECT branch so that bare words
+// like `INTO` inside a literal (e.g. `SELECT 'INSERT INTO orders' FROM
+// audit_log`) don't trip the SELECT-INTO DDL classifier.
+function stripStringLiterals(sql) {
+    if (typeof sql !== 'string' || sql.length === 0) return sql;
+    const out = sql.split('');
+    let quote = null;
+    let i = 0;
+    while (i < sql.length) {
+        const c = sql[i];
+        if (quote !== null) {
+            if (c === quote) {
+                if (i + 1 < sql.length && sql[i + 1] === quote) {
+                    // Doubled-quote escape: blank both, stay inside literal.
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    continue;
+                }
+                // Closing quote: leave the delimiter, drop the literal body.
+                quote = null;
+            } else {
+                out[i] = ' ';
+            }
+        } else {
+            if (c === "'" || c === '"') {
+                quote = c;
+            }
+        }
+        i++;
+    }
+    return out.join('');
+}
+
 // Split a SQL string on top-level `;` characters, respecting `'...'` and
 // `"..."` string literals (including PG's doubled-quote `''` / `""`
 // escape). No comment / dollar-quote support — this is the lightest
@@ -390,10 +427,15 @@ function detectWrite(sql) {
         if (tokens.length < 3 || tokens[1].toUpperCase() !== 'INTO') return null;
         return bareTable(tokens[2]);
     } else if (first === 'SELECT') {
+        // Re-tokenize from a literal-stripped form so that bare words like
+        // `INTO` or `FROM` inside `'...'` / `"..."` don't trigger the
+        // SELECT-INTO DDL classifier (e.g. `SELECT 'INSERT INTO orders'
+        // FROM audit_log`, `SELECT * FROM "into_table"`).
+        const scanTokens = stripStringLiterals(trimmed).split(/\s+/);
         let sawInto = false;
         let intoTarget = null;
-        for (let i = 1; i < tokens.length; i++) {
-            const upper = tokens[i].toUpperCase();
+        for (let i = 1; i < scanTokens.length; i++) {
+            const upper = scanTokens[i].toUpperCase();
             if (upper === 'INTO' && !sawInto) {
                 sawInto = true;
                 continue;
@@ -402,7 +444,7 @@ function detectWrite(sql) {
                 if (upper === 'TEMPORARY' || upper === 'TEMP' || upper === 'UNLOGGED') {
                     continue;
                 }
-                intoTarget = tokens[i];
+                intoTarget = scanTokens[i];
                 continue;
             }
             if (sawInto && intoTarget !== null && upper === 'FROM') {
