@@ -515,3 +515,51 @@ describe('multi-statement write detection', () => {
     });
 });
 
+// --- Session-state command responses must not be cached ---
+//
+// `[] && []` is truthy in JS, so the pre-fix `if (result.rows &&
+// result.fields)` gate let `SET foo='bar'` responses (which return
+// `{rows: [], fields: [], command: 'SET'}`) into the cache. Functionally
+// harmless (empty rows can never serve data) but bloats the cache with
+// no-row entries and triggers needless eviction pressure.
+
+describe('session-state command responses are not cached', () => {
+    const NON_CACHEABLE = ['SET', 'RESET', 'LISTEN', 'UNLISTEN', 'NOTIFY',
+        'BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT'];
+
+    for (const command of NON_CACHEABLE) {
+        it(`${command} response is not put in the cache`, async () => {
+            const client = mockClient({
+                rows: [], fields: [], rowCount: null, command,
+            });
+            const cache = makeConnectedCache();
+            const cached = new CachedClient(client, cache);
+            // Invent a fake SQL string so transaction tracking and
+            // detectWrite don't swallow it before the read path. We're
+            // testing the cache-put gate, which only applies after a
+            // miss + real-client dispatch.
+            const sql = `__test_${command}__`;
+            await cached.query(sql);
+            // No entry under the test SQL.
+            assert.equal(cache.get(sql, null), null);
+            // Cache stayed empty — no SET/etc response slipped in.
+            assert.equal(cache.size, 0);
+        });
+    }
+
+    it('empty-result SELECT IS still cached (zero rows is a valid hit)', async () => {
+        // Negative control for the gate above: we narrowed the no-cache
+        // rule to specific command strings (not "any zero-row reply"),
+        // so a real SELECT with zero rows must still cache so the next
+        // identical query is a hit. The proxy does the same.
+        const client = mockClient({
+            rows: [], fields: [{ name: 'id' }], rowCount: 0, command: 'SELECT',
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('SELECT * FROM orders WHERE id = -1');
+        const entry = cache.get('SELECT * FROM orders WHERE id = -1', undefined);
+        assert.ok(entry, 'empty-result SELECT must still cache');
+        assert.deepEqual(entry.rows, []);
+    });
+});

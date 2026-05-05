@@ -3,6 +3,17 @@ import {
     ConnectionGucState, splitStatements,
 } from './cache.js';
 
+// Postgres response `command` strings that signal a session-state /
+// control-flow command rather than a cacheable read. Caching their
+// `{rows: [], fields: []}` reply bloats the cache with no-row entries
+// that never serve real data and triggers needless eviction pressure.
+// Truthy-array check (`result.rows && result.fields`) misses this in JS
+// because `[] && []` is truthy.
+const NON_CACHEABLE_COMMANDS = new Set([
+    'SET', 'RESET', 'LISTEN', 'UNLISTEN', 'NOTIFY',
+    'BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT',
+]);
+
 // Multi-statement Q-message write detection. Reuses splitStatements so
 // `SET app.user_id = '42'; INSERT INTO orders VALUES (1)` (a single Q
 // message) doesn't slip past detectWrite's first-token check. Returns:
@@ -150,10 +161,21 @@ class CachedClient {
         // Cache miss: execute for real
         const result = await this._real.query(textOrConfig, values);
 
-        // Cache the result if it has rows. Same state hash gating as the
-        // get() above — the entry is keyed to the connection state at the
-        // time of the response.
-        if (result.rows && result.fields) {
+        // Cache the result only if it's a real read response. Same state
+        // hash gating as the get() above — the entry is keyed to the
+        // connection state at the time of the response.
+        //
+        // Skip session-state command replies. `SET foo = 'bar'` returns
+        // `{rows: [], fields: [], command: 'SET'}` — `[] && []` is truthy
+        // in JS so the old check let these through, bloating the cache
+        // with no-row entries that never serve real data and triggering
+        // needless eviction pressure on session-heavy workloads.
+        // Empty-result SELECTs (zero rows from `WHERE id = -1`) are
+        // intentionally still cached — the proxy does the same.
+        if (
+            result.rows && result.fields
+            && !NON_CACHEABLE_COMMANDS.has(result.command)
+        ) {
             this._cache.put(sql, params, result.rows, result.fields, stateHash);
         }
 
