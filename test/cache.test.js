@@ -6,6 +6,7 @@ import {
     DDL_SENTINEL, TX_START, TX_END,
     EVICT_RATE_WINDOW, EVICT_RATE_HIGH, EVICT_RATE_LOW,
     isUnsafeGuc, parseSetCommand, splitStatements, ConnectionGucState,
+    KNOWN_SAFE_GUCS,
 } from '../cache.js';
 
 function makeCache(opts = {}) {
@@ -1447,5 +1448,356 @@ describe('cache get/put state-hash gating', () => {
         cache.invalidateTable('orders');
         assert.equal(cache.get('SELECT * FROM orders', null, 0xaaaaaaaa), null);
         assert.equal(cache.get('SELECT * FROM orders', null, 0xbbbbbbbb), null);
+    });
+});
+
+// ─── DISCARD parsing (RLS hardening 2026-05-05) ───────────────────────────
+//
+// `DISCARD ALL` resets the entire session including custom GUCs — must
+// clear the unsafe-GUC state map. `DISCARD PLANS / SEQUENCES / TEMP /
+// TEMPORARY` don't touch GUC state and are no-ops for the hash. The
+// parser tags them with explicit `kind`s so future prepared-statement
+// caches can hook the same parse without reshaping it.
+
+describe('parseSetCommand DISCARD', () => {
+    it('DISCARD ALL', () => {
+        assert.deepStrictEqual(parseSetCommand('DISCARD ALL'), { kind: 'discard_all' });
+    });
+    it('DISCARD PLANS', () => {
+        assert.deepStrictEqual(parseSetCommand('DISCARD PLANS'), { kind: 'discard_plans' });
+    });
+    it('DISCARD SEQUENCES', () => {
+        assert.deepStrictEqual(parseSetCommand('DISCARD SEQUENCES'), { kind: 'discard_other' });
+    });
+    it('DISCARD TEMP', () => {
+        assert.deepStrictEqual(parseSetCommand('DISCARD TEMP'), { kind: 'discard_other' });
+    });
+    it('DISCARD TEMPORARY', () => {
+        assert.deepStrictEqual(parseSetCommand('DISCARD TEMPORARY'), { kind: 'discard_other' });
+    });
+    it('case-insensitive (lowercase)', () => {
+        assert.deepStrictEqual(parseSetCommand('discard all'), { kind: 'discard_all' });
+        assert.deepStrictEqual(parseSetCommand('discard plans'), { kind: 'discard_plans' });
+    });
+    it('mixed case', () => {
+        assert.deepStrictEqual(parseSetCommand('Discard All'), { kind: 'discard_all' });
+    });
+    it('DISCARD with trailing semicolon', () => {
+        assert.deepStrictEqual(parseSetCommand('DISCARD ALL;'), { kind: 'discard_all' });
+    });
+    it('DISCARD with no arg returns null', () => {
+        assert.strictEqual(parseSetCommand('DISCARD'), null);
+    });
+    it('DISCARD with garbage returns null', () => {
+        assert.strictEqual(parseSetCommand('DISCARD UNKNOWN'), null);
+    });
+    it('DISCARD with too many args returns null', () => {
+        assert.strictEqual(parseSetCommand('DISCARD ALL EXTRA'), null);
+    });
+});
+
+describe('ConnectionGucState DISCARD', () => {
+    it('DISCARD ALL clears unsafe-GUC state', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        s.observeSql("SET app.tenant = 'acme'");
+        assert.notStrictEqual(s.stateHash(), 0);
+        s.observeSql('DISCARD ALL');
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('DISCARD PLANS does NOT clear unsafe-GUC state', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const before = s.stateHash();
+        s.observeSql('DISCARD PLANS');
+        assert.strictEqual(s.stateHash(), before);
+    });
+
+    it('DISCARD SEQUENCES is a no-op for the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const before = s.stateHash();
+        s.observeSql('DISCARD SEQUENCES');
+        assert.strictEqual(s.stateHash(), before);
+    });
+
+    it('DISCARD TEMP is a no-op for the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const before = s.stateHash();
+        s.observeSql('DISCARD TEMP');
+        assert.strictEqual(s.stateHash(), before);
+    });
+
+    it('DISCARD TEMPORARY is a no-op for the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const before = s.stateHash();
+        s.observeSql('DISCARD TEMPORARY');
+        assert.strictEqual(s.stateHash(), before);
+    });
+
+    it('DISCARD ALL on empty state is a no-op', () => {
+        const s = new ConnectionGucState();
+        assert.strictEqual(s.observeSql('DISCARD ALL'), false);
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('DISCARD ALL in multi-statement body still applies', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        assert.notStrictEqual(s.stateHash(), 0);
+        // Real client pattern: pool reset followed by re-init.
+        s.observeSql("DISCARD ALL; SET app.user_id = '99'");
+        // After the multi-statement body: user_id is set (to '99'), so the
+        // hash is non-zero, but it must equal the hash for setting just
+        // user_id='99' on a fresh state — DISCARD ALL must have wiped
+        // anything that was there before.
+        const t = new ConnectionGucState();
+        t.observeSql("SET app.user_id = '99'");
+        assert.strictEqual(s.stateHash(), t.stateHash());
+    });
+});
+
+// ─── SELECT set_config(...) function-form parsing ─────────────────────────
+//
+// Supabase's canonical RLS pattern. Functionally equivalent to SET; the
+// third arg is is_local (mirrors SET LOCAL). Recognised at the statement
+// level — `SELECT set_config(...)` and `SELECT pg_catalog.set_config(...)`
+// both update the per-connection state hash inline.
+
+describe('parseSetCommand set_config()', () => {
+    it('basic 3-arg form (is_local=false)', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT set_config('app.user_id', '42', false)"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('is_local=true → set_local', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT set_config('app.user_id', '42', true)"),
+            { kind: 'set_local', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('pg_catalog-qualified form', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT pg_catalog.set_config('app.user_id', '42', false)"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('case-insensitive function name and SELECT', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("select SET_CONFIG('app.user_id', '42', FALSE)"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('whitespace tolerance around args', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT set_config ( 'app.user_id' , '42' , false )"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('PG boolean spellings: t/f', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT set_config('app.x', '1', t)").kind, 'set_local',
+        );
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT set_config('app.x', '1', f)").kind, 'set',
+        );
+    });
+
+    it('PG boolean spellings: yes/no, on/off, 1/0', () => {
+        assert.strictEqual(parseSetCommand("SELECT set_config('a.b', '1', yes)").kind, 'set_local');
+        assert.strictEqual(parseSetCommand("SELECT set_config('a.b', '1', no)").kind, 'set');
+        assert.strictEqual(parseSetCommand("SELECT set_config('a.b', '1', on)").kind, 'set_local');
+        assert.strictEqual(parseSetCommand("SELECT set_config('a.b', '1', off)").kind, 'set');
+        assert.strictEqual(parseSetCommand("SELECT set_config('a.b', '1', 1)").kind, 'set_local');
+        assert.strictEqual(parseSetCommand("SELECT set_config('a.b', '1', 0)").kind, 'set');
+    });
+
+    it('trailing semicolon tolerated', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT set_config('app.user_id', '42', false);"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('lowercases the GUC name', () => {
+        assert.deepStrictEqual(
+            parseSetCommand("SELECT set_config('App.User_ID', '42', false)"),
+            { kind: 'set', name: 'app.user_id', value: '42' },
+        );
+    });
+
+    it('rejects bare-expression name (no string literal)', () => {
+        // `set_config(my_var, '42', false)` — we can't trust an
+        // expression as the name without evaluating it. Skip tracking.
+        assert.strictEqual(
+            parseSetCommand("SELECT set_config(my_var, '42', false)"),
+            null,
+        );
+    });
+
+    it('rejects ambiguous is_local value', () => {
+        assert.strictEqual(
+            parseSetCommand("SELECT set_config('app.x', '1', maybe)"),
+            null,
+        );
+    });
+
+    it('rejects wrong arity', () => {
+        assert.strictEqual(parseSetCommand("SELECT set_config('a', '1')"), null);
+        assert.strictEqual(parseSetCommand("SELECT set_config('a', '1', false, 'extra')"), null);
+        assert.strictEqual(parseSetCommand("SELECT set_config()"), null);
+    });
+
+    it('rejects set_config embedded inside a larger expression', () => {
+        // `SELECT set_config(...) || ' suffix'` — only top-level
+        // invocations are tracked.
+        assert.strictEqual(
+            parseSetCommand("SELECT set_config('app.x', '1', false) || ' tail'"),
+            null,
+        );
+        // `SELECT (SELECT set_config(...))` — nested SELECT, not top-level.
+        assert.strictEqual(
+            parseSetCommand("SELECT 1 + 1 FROM dual"),
+            null,
+        );
+    });
+
+    it('rejects set_config followed by FROM', () => {
+        assert.strictEqual(
+            parseSetCommand("SELECT set_config('app.x', '1', false) FROM dual"),
+            null,
+        );
+    });
+
+    it('non-set_config SELECT returns null', () => {
+        assert.strictEqual(parseSetCommand('SELECT 1'), null);
+        assert.strictEqual(parseSetCommand('SELECT * FROM users'), null);
+        assert.strictEqual(parseSetCommand("SELECT 'set_config' FROM logs"), null);
+    });
+});
+
+describe('ConnectionGucState set_config()', () => {
+    it('SELECT set_config on unsafe GUC moves the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SELECT set_config('app.user_id', '42', false)");
+        assert.notStrictEqual(s.stateHash(), 0);
+    });
+
+    it('SELECT set_config matches SET counterpart', () => {
+        const a = new ConnectionGucState();
+        a.observeSql("SET app.user_id = '42'");
+        const b = new ConnectionGucState();
+        b.observeSql("SELECT set_config('app.user_id', '42', false)");
+        assert.strictEqual(a.stateHash(), b.stateHash());
+    });
+
+    it('SELECT pg_catalog.set_config matches SET counterpart', () => {
+        const a = new ConnectionGucState();
+        a.observeSql("SET app.user_id = '42'");
+        const b = new ConnectionGucState();
+        b.observeSql("SELECT pg_catalog.set_config('app.user_id', '42', false)");
+        assert.strictEqual(a.stateHash(), b.stateHash());
+    });
+
+    it('SELECT set_config(..., true) is a no-op for the hash (is_local=true)', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SELECT set_config('app.user_id', '42', true)");
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('SELECT set_config on safe GUC does not move the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SELECT set_config('timezone', 'UTC', false)");
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('multi-statement: set_config then SELECT', () => {
+        const s = new ConnectionGucState();
+        s.observeSql(
+            "SELECT set_config('app.user_id', '42', false); SELECT 1"
+        );
+        assert.notStrictEqual(s.stateHash(), 0);
+    });
+
+    it('set_config with `;` inside the value literal does not split', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SELECT set_config('app.tenant', 'a;b', false)");
+        const t = new ConnectionGucState();
+        t.observeSql("SET app.tenant = 'a;b'");
+        assert.strictEqual(s.stateHash(), t.stateHash());
+    });
+});
+
+// ─── Classifier: explicit known-safe list ─────────────────────────────────
+//
+// Locale / formatting GUCs are explicitly classified as safe. They affect
+// text rendering only — never which rows the user can see — and so can be
+// freely SET without fragmenting the cache.
+
+describe('isUnsafeGuc known-safe list', () => {
+    it('DateStyle / IntervalStyle / TimeZone are safe', () => {
+        assert.ok(!isUnsafeGuc('DateStyle'));
+        assert.ok(!isUnsafeGuc('IntervalStyle'));
+        assert.ok(!isUnsafeGuc('TimeZone'));
+    });
+
+    it('bytea_output is safe', () => {
+        assert.ok(!isUnsafeGuc('bytea_output'));
+    });
+
+    it('lc_messages / lc_monetary / lc_numeric / lc_time are safe', () => {
+        assert.ok(!isUnsafeGuc('lc_messages'));
+        assert.ok(!isUnsafeGuc('lc_monetary'));
+        assert.ok(!isUnsafeGuc('lc_numeric'));
+        assert.ok(!isUnsafeGuc('lc_time'));
+    });
+
+    it('classification is case-insensitive (DATESTYLE, datestyle, DateStyle)', () => {
+        assert.ok(!isUnsafeGuc('DATESTYLE'));
+        assert.ok(!isUnsafeGuc('datestyle'));
+        assert.ok(!isUnsafeGuc('DateStyle'));
+        assert.ok(!isUnsafeGuc('TIMEZONE'));
+        assert.ok(!isUnsafeGuc('Timezone'));
+    });
+
+    it('SET DateStyle does not move the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET DateStyle = 'ISO, MDY'");
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('SET TimeZone does not move the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET TimeZone = 'UTC'");
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('SET lc_messages does not move the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET lc_messages = 'en_US.UTF-8'");
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('KNOWN_SAFE_GUCS export is iterable / inspectable', () => {
+        // Export contract — downstream tooling (e.g. dashboards that
+        // surface "tracked GUCs" diagnostics) reads this list directly.
+        assert.ok(KNOWN_SAFE_GUCS instanceof Set);
+        assert.ok(KNOWN_SAFE_GUCS.has('datestyle'));
+        assert.ok(KNOWN_SAFE_GUCS.has('intervalstyle'));
+        assert.ok(KNOWN_SAFE_GUCS.has('timezone'));
+        assert.ok(KNOWN_SAFE_GUCS.has('bytea_output'));
+        assert.ok(KNOWN_SAFE_GUCS.has('lc_messages'));
+        assert.ok(KNOWN_SAFE_GUCS.has('lc_monetary'));
+        assert.ok(KNOWN_SAFE_GUCS.has('lc_numeric'));
+        assert.ok(KNOWN_SAFE_GUCS.has('lc_time'));
     });
 });

@@ -68,6 +68,27 @@ const UNSAFE_GUC_SHORT_LIST = new Set([
     'row_security',
 ]);
 
+// GUC names that are well-known safe — formatting / locale knobs that
+// affect text rendering of values without changing which rows the user
+// can see. Folded into the classifier as an explicit allowlist so the
+// classification is documented (rather than relying on "happens not to
+// be in the unsafe list and contains no `.`"). Comparison is
+// case-insensitive — PG itself preserves the conventional casing
+// (`DateStyle`, `IntervalStyle`, `TimeZone`) but accepts any case.
+//
+// These never enter `_values`, never participate in the state hash, and
+// therefore can be set freely without fragmenting the cache.
+const KNOWN_SAFE_GUCS = new Set([
+    'datestyle',
+    'intervalstyle',
+    'timezone',
+    'bytea_output',
+    'lc_messages',
+    'lc_monetary',
+    'lc_numeric',
+    'lc_time',
+]);
+
 // FNV-1a 32-bit. Cheap, stable, no deps. We don't need cryptographic
 // strength — the hash is folded into a cache key alongside the SQL text,
 // not used as a secret. 32 bits is plenty of headroom for the small
@@ -84,14 +105,28 @@ function _fnv1a32(str) {
 }
 
 // Classify a GUC name as state-affecting (true) or harmless (false).
-// Unsafe if it's in the short hardcoded list OR contains a `.` (namespaced
-// — the canonical custom-RLS pattern: `app.*`, `myapp.*`, `tenant.*`).
-// Comparison is case-insensitive.
+//
+// Order of checks (each is case-insensitive):
+//   1. Known-safe explicit list — formatting / locale knobs that affect
+//      text rendering only, never row visibility.
+//   2. Unsafe shortlist — security-affecting session state (search_path,
+//      role, session_authorization, transaction-isolation knobs,
+//      row_security).
+//   3. Namespaced GUCs (anything containing `.` — `app.*`, `myapp.*`,
+//      `rls.*`) — the canonical custom-RLS pattern.
+//   4. Default: safe (unrecognised GUC, treated as harmless — formatting
+//      / planner cost knobs, statement_timeout, application_name, etc.).
+//
+// The known-safe list runs first so a future shortlist edit that
+// accidentally adds e.g. `timezone` doesn't silently start fragmenting
+// the cache on every `SET TIME ZONE` call.
 function isUnsafeGuc(name) {
     if (typeof name !== 'string' || name.length === 0) return false;
     const lower = name.toLowerCase();
+    if (KNOWN_SAFE_GUCS.has(lower)) return false;
+    if (UNSAFE_GUC_SHORT_LIST.has(lower)) return true;
     if (lower.includes('.')) return true;
-    return UNSAFE_GUC_SHORT_LIST.has(lower);
+    return false;
 }
 
 // Strip a single layer of matching surrounding `'...'` or `"..."` quotes.
@@ -113,6 +148,163 @@ function _normalizeGucName(token) {
     const trimmed = token.replace(/^"+|"+$/g, '');
     if (trimmed.length === 0) return null;
     return trimmed.toLowerCase();
+}
+
+// Recognise `SELECT [pg_catalog.]set_config(setting_name, new_value,
+// is_local)` and return a SetCommand-shaped object so the state machine
+// can apply it the same way as a regular `SET ...`. Returns `null` for
+// anything else (including `set_config(...)` calls embedded in larger
+// SELECTs — only top-level invocations are tracked, mirroring the
+// proxy-side conservatism).
+//
+// Argument splitter walks the inside of the outermost `(...)`, respects
+// `'...'` / `"..."` literals (including PG's doubled-quote `''` / `""`
+// escape), and tolerates whitespace / case variations:
+//
+//   SELECT set_config('app.user_id', '42', false)
+//   SELECT pg_catalog.set_config('app.user_id', '42', FALSE)
+//   SELECT SET_CONFIG ('app.user_id', '42', f)
+//
+// `is_local` accepts the standard PG boolean spellings: `true/false`,
+// `t/f`, `yes/no`, `on/off`, `1/0` (case-insensitive). Any other value
+// → null (we'd rather miss a tracking opportunity than misclassify).
+function _parseSetConfigCall(sql) {
+    if (typeof sql !== 'string') return null;
+    // Strip leading SELECT, optional `pg_catalog.` qualifier, and
+    // whitespace before the function name. Matched lazily so we can
+    // anchor against the literal `set_config(` opener.
+    const re = /^\s*SELECT\s+(?:pg_catalog\s*\.\s*)?set_config\s*\(/i;
+    const m = sql.match(re);
+    if (!m) return null;
+    const argStart = m[0].length;
+
+    // Walk forward to the matching `)`, respecting quoted literals and
+    // nested `(...)` groups (set_config takes scalars but a paranoid
+    // parser is cheap insurance against future syntax extensions).
+    let depth = 1;
+    let quote = null;
+    let i = argStart;
+    while (i < sql.length) {
+        const c = sql[i];
+        if (quote !== null) {
+            if (c === quote) {
+                if (i + 1 < sql.length && sql[i + 1] === quote) {
+                    i += 2;
+                    continue;
+                }
+                quote = null;
+            }
+        } else {
+            if (c === "'" || c === '"') {
+                quote = c;
+            } else if (c === '(') {
+                depth++;
+            } else if (c === ')') {
+                depth--;
+                if (depth === 0) break;
+            }
+        }
+        i++;
+    }
+    if (depth !== 0) return null;
+    const inner = sql.slice(argStart, i);
+
+    // After the closing `)`, only whitespace and an optional trailing `;`
+    // are allowed. Anything else (e.g. `set_config(...) FROM ...`,
+    // `set_config(...) || other`) is not a top-level invocation we should
+    // track.
+    const tail = sql.slice(i + 1).trim();
+    if (tail.length > 0 && tail !== ';') return null;
+
+    // Comma-split inner, respecting quoted literals. set_config is
+    // strictly 3-arg.
+    const args = _splitTopLevelCommas(inner);
+    if (args.length !== 3) return null;
+
+    const nameRaw = args[0].trim();
+    const valueRaw = args[1].trim();
+    const isLocalRaw = args[2].trim();
+
+    // The first arg is a string literal containing the GUC name; the
+    // wrapper requires it (PG also accepts an expression but tracking
+    // expressions accurately is out of scope — Option Y v1 limitation).
+    const nameStripped = _stripValueQuotes(nameRaw);
+    if (nameStripped.length === 0 || nameStripped === nameRaw) {
+        // The name MUST have been a string literal (stripping changed
+        // something). If the raw and stripped values are identical it
+        // was a bare expression — we can't trust it.
+        if (nameStripped !== nameRaw) {
+            // stripping did happen, ok
+        } else {
+            return null;
+        }
+    }
+    const name = _normalizeGucName(nameStripped);
+    if (!name) return null;
+
+    // Same logic for the value — accept either a string literal or a
+    // bare unquoted token (PG coerces non-text args to text via the
+    // function signature `set_config(text, text, bool)`, but most callers
+    // pass quoted strings). Don't allow expressions.
+    const value = _stripValueQuotes(valueRaw);
+
+    // is_local: PG boolean. Reject anything ambiguous — better to skip
+    // tracking than to misclassify and let a session-scoped change
+    // mascarade as transaction-local (or vice versa).
+    const isLocal = _parsePgBool(isLocalRaw);
+    if (isLocal === null) return null;
+
+    return isLocal
+        ? { kind: 'set_local', name, value }
+        : { kind: 'set', name, value };
+}
+
+// Split `inner` (the contents between an outer `(...)`) on top-level
+// commas, respecting `'...'` / `"..."` literals (including PG's
+// doubled-quote escape) and nested `(...)` groups.
+function _splitTopLevelCommas(inner) {
+    const out = [];
+    let start = 0;
+    let depth = 0;
+    let quote = null;
+    let i = 0;
+    while (i < inner.length) {
+        const c = inner[i];
+        if (quote !== null) {
+            if (c === quote) {
+                if (i + 1 < inner.length && inner[i + 1] === quote) {
+                    i += 2;
+                    continue;
+                }
+                quote = null;
+            }
+        } else {
+            if (c === "'" || c === '"') {
+                quote = c;
+            } else if (c === '(') {
+                depth++;
+            } else if (c === ')') {
+                if (depth > 0) depth--;
+            } else if (c === ',' && depth === 0) {
+                out.push(inner.slice(start, i));
+                start = i + 1;
+            }
+        }
+        i++;
+    }
+    out.push(inner.slice(start));
+    return out;
+}
+
+// Best-effort PG boolean parser. Returns `true`, `false`, or `null` for
+// anything ambiguous. Accepts the standard PG spellings (case-insensitive,
+// surrounding quotes tolerated): `true/false`, `t/f`, `yes/no`, `on/off`,
+// `1/0`.
+function _parsePgBool(raw) {
+    const v = _stripValueQuotes(raw.trim()).toLowerCase();
+    if (v === 'true' || v === 't' || v === 'yes' || v === 'on' || v === '1') return true;
+    if (v === 'false' || v === 'f' || v === 'no' || v === 'off' || v === '0') return false;
+    return null;
 }
 
 // Replace the contents of `'...'` and `"..."` string literals with spaces,
@@ -189,11 +381,16 @@ function splitStatements(sql) {
     return out;
 }
 
-// Parse a single `SET ...` / `RESET ...` statement. Returns one of:
-//   { kind: 'set',       name, value }
-//   { kind: 'set_local', name, value }
-//   { kind: 'reset',     name }
+// Parse a single `SET ...` / `RESET ...` / `DISCARD ...` statement, OR a
+// `SELECT [pg_catalog.]set_config(name, value, is_local)` function-form
+// invocation. Returns one of:
+//   { kind: 'set',         name, value }
+//   { kind: 'set_local',   name, value }
+//   { kind: 'reset',       name }
 //   { kind: 'reset_all' }
+//   { kind: 'discard_all' }
+//   { kind: 'discard_plans' }
+//   { kind: 'discard_other' }            // SEQUENCES / TEMP / TEMPORARY — no-op
 // or null for anything else. Callers use the kind tag to drive
 // `ConnectionGucState.apply()`.
 //
@@ -202,6 +399,10 @@ function splitStatements(sql) {
 //   SET SESSION name = ...   SET SESSION name TO ...
 //   SET LOCAL name = ...     SET LOCAL name TO ...
 //   RESET name               RESET ALL
+//   DISCARD ALL              DISCARD PLANS
+//   DISCARD SEQUENCES        DISCARD TEMP / TEMPORARY
+//   SELECT set_config('name', 'value', is_local)
+//   SELECT pg_catalog.set_config('name', 'value', is_local)
 // Everything else (e.g. `SET TIME ZONE ...`, plain queries) returns null.
 function parseSetCommand(sql) {
     if (typeof sql !== 'string') return null;
@@ -212,9 +413,10 @@ function parseSetCommand(sql) {
     const tokens = s.split(/\s+/);
     if (tokens.length === 0) return null;
     const head = tokens[0];
+    const headUpper = head.toUpperCase();
 
     // RESET name  /  RESET ALL
-    if (head.toUpperCase() === 'RESET') {
+    if (headUpper === 'RESET') {
         if (tokens.length < 2) return null;
         const target = tokens[1];
         // RESET takes exactly one arg.
@@ -227,7 +429,48 @@ function parseSetCommand(sql) {
         return { kind: 'reset', name };
     }
 
-    if (head.toUpperCase() !== 'SET') return null;
+    // DISCARD ALL / PLANS / SEQUENCES / TEMP / TEMPORARY.
+    //
+    // PG `DISCARD ALL` resets ALL session state — including custom GUCs like
+    // `app.user_id`. Equivalent to `RESET ALL` for our purposes (we only
+    // track unsafe-GUC values), so we map it to clearing the state map.
+    // `DISCARD PLANS` clears the prepared-statement plan cache; we don't
+    // maintain one, so it's a no-op for state but we tag it so callers can
+    // wire prepared-statement caches in the future without touching this
+    // parser. `DISCARD SEQUENCES / TEMP / TEMPORARY` are storage-side and
+    // don't affect GUC state — emit a `discard_other` sentinel that
+    // ConnectionGucState.apply() ignores.
+    if (headUpper === 'DISCARD') {
+        if (tokens.length < 2 || tokens.length > 2) return null;
+        const targetUpper = tokens[1].toUpperCase();
+        if (targetUpper === 'ALL') return { kind: 'discard_all' };
+        if (targetUpper === 'PLANS') return { kind: 'discard_plans' };
+        if (
+            targetUpper === 'SEQUENCES'
+            || targetUpper === 'TEMP'
+            || targetUpper === 'TEMPORARY'
+        ) {
+            return { kind: 'discard_other' };
+        }
+        return null;
+    }
+
+    // SELECT [pg_catalog.]set_config(name, value, is_local)
+    //
+    // Supabase's canonical RLS pattern. `set_config()` is the function-form
+    // equivalent of `SET name = value`; the third arg is `is_local` — when
+    // `true`, the change reverts at end-of-tx (mirrors `SET LOCAL`); when
+    // `false`, it's session-scoped (mirrors `SET`). Detected at the
+    // statement level so a single Q-message body like
+    // `SELECT set_config('app.user_id', '42', false)` updates the
+    // per-connection state hash before the wrapper looks up the cache key.
+    if (headUpper === 'SELECT') {
+        const cfg = _parseSetConfigCall(s);
+        if (cfg) return cfg;
+        return null;
+    }
+
+    if (headUpper !== 'SET') return null;
 
     // Optional LOCAL / SESSION modifier.
     let idx = 1;
@@ -294,9 +537,11 @@ class ConnectionGucState {
         return this._hash;
     }
 
-    // Apply a parsed SET / RESET command. No-op for SetLocal (transient —
-    // wrapper bypasses cache while `_inTransaction` anyway) and for safe
-    // GUC names. Returns true iff the hash changed.
+    // Apply a parsed SET / RESET / DISCARD command. No-op for SetLocal
+    // (transient — wrapper bypasses cache while `_inTransaction` anyway),
+    // for safe GUC names, and for DISCARD subcommands that don't affect
+    // GUC state (PLANS / SEQUENCES / TEMP / TEMPORARY). Returns true iff
+    // the hash changed.
     apply(cmd) {
         if (!cmd) return false;
         const before = this._hash;
@@ -318,10 +563,22 @@ class ConnectionGucState {
                 }
                 break;
             case 'reset_all':
+            case 'discard_all':
+                // DISCARD ALL clears every session-scoped setting,
+                // including custom unsafe GUCs. Treat as RESET ALL for
+                // hash purposes. (DISCARD ALL also drops temp tables,
+                // prepared plans, and listen channels — all out of scope
+                // for the GUC state hash.)
                 if (this._values.size > 0) {
                     this._values.clear();
                     this._recomputeHash();
                 }
+                break;
+            case 'discard_plans':
+            case 'discard_other':
+                // PLANS clears the prepared-statement plan cache; we
+                // don't maintain one. SEQUENCES / TEMP / TEMPORARY are
+                // storage-side. None of these touch GUC state.
                 break;
             default:
                 break;
@@ -970,4 +1227,5 @@ export {
     // proxy's src/guc_state.rs). Used by wrap.js's CachedClient to fold
     // a state hash into the cache key on every query.
     isUnsafeGuc, parseSetCommand, splitStatements, ConnectionGucState,
+    KNOWN_SAFE_GUCS, UNSAFE_GUC_SHORT_LIST,
 };
