@@ -1,6 +1,7 @@
 import {
     NativeCache, detectWrite, DDL_SENTINEL, TX_START, TX_END,
     ConnectionGucState, splitStatements,
+    isUnsafeGuc, parseSetCommand,
 } from './cache.js';
 
 // Postgres response `command` strings that signal a session-state /
@@ -95,6 +96,176 @@ function _detectInvalidationPort() {
     return 7934;
 }
 
+// Heuristic: is `obj` a pg-pool `Pool` instance? pg-pool's Pool has a
+// `connect()` method that returns a Promise<PoolClient>, plus a few
+// lifecycle methods (`end`, `query`). We sniff on the constructor name
+// (`Pool`) AND duck-type the surface — duplication keeps us safe against
+// minified bundles where `constructor.name` is mangled.
+//
+// Returns false for plain `Client` instances (they have a `connect()` that
+// also returns a Promise but no `totalCount` / `idleCount` accessors,
+// distinguishing them from pools).
+export function _isPgPool(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    const ctor = obj.constructor && obj.constructor.name;
+    if (ctor === 'Pool' || ctor === 'BoundPool') return true;
+    // Duck-type: pg-pool exposes connect(), end(), query() AND has the
+    // pool-specific telemetry properties. A plain Client doesn't expose
+    // `totalCount` or `idleCount` so this filter excludes it.
+    if (
+        typeof obj.connect === 'function'
+        && typeof obj.end === 'function'
+        && typeof obj.query === 'function'
+        && (
+            typeof obj.totalCount === 'number'
+            || typeof obj.idleCount === 'number'
+            || typeof obj.waitingCount === 'number'
+        )
+    ) {
+        return true;
+    }
+    return false;
+}
+
+// Wrap a pg-pool `Pool` so every client checked out via `pool.connect()`
+// has its `release()` augmented to issue `DISCARD ALL` before returning to
+// the pool. Without this, pg-pool reuses physical connections with their
+// previous session's GUC state intact — a different user picking up the
+// same client would inherit a stale `app.user_id` and the proxy/native
+// cache state-hash trick can't help (server-side state diverged from
+// what the wrapper observed on the wire).
+//
+// Return mode is "wrap, don't mutate": we return a Proxy over the pool
+// that intercepts `connect()`. The user's pool object is untouched (so
+// other code paths that hold a reference to the original Pool don't get
+// surprised by mutated methods). The Proxy passes through everything
+// else — `pool.query()`, `pool.end()`, telemetry properties, etc.
+//
+// Note: pg-pool's own `pool.query()` flow internally calls
+// `this.connect()`, picks up our hooked client, runs the query, and
+// then calls `client.release()` — which now issues DISCARD ALL. So the
+// fix covers BOTH user-driven `pool.connect()` and the auto-managed
+// `pool.query()` flow.
+function _wrapPoolForDiscard(pool) {
+    // Pre-bind a hooked connect that always returns DISCARD-on-release
+    // clients. Used both by the Proxy's `connect` get-trap AND by the
+    // `query` re-implementation below (so pool.query auto-flows go
+    // through the same hook).
+    const hookedConnect = async (...args) => {
+        const client = await pool.connect(...args);
+        _hookReleaseToDiscard(client);
+        return client;
+    };
+
+    return new Proxy(pool, {
+        get(target, prop, receiver) {
+            const val = Reflect.get(target, prop, receiver);
+            if (prop === 'connect' && typeof val === 'function') {
+                return hookedConnect;
+            }
+            if (prop === 'query' && typeof val === 'function') {
+                // pg-pool's pool.query internally calls `this.connect()`,
+                // but `this` there is the underlying Pool — NOT our
+                // Proxy — so the original (unhooked) connect runs. We
+                // re-implement query at the Proxy level so the auto-
+                // managed flow (connect → query → release) goes through
+                // our hooked connect, which guarantees DISCARD on
+                // release. Mirrors pg-pool's own query semantics:
+                //   - String overload: query(text, values?, callback?)
+                //   - Config overload: query(queryConfig, callback?)
+                //   - Returns a Promise; if the last arg is a callback,
+                //     calls it with (err, result) instead.
+                return async function _hookedPoolQuery(...args) {
+                    // Detect a trailing callback (pg-pool's query
+                    // signature). Pull it out so we can adapt the
+                    // Promise to the callback contract.
+                    let cb = null;
+                    if (args.length > 0 && typeof args[args.length - 1] === 'function') {
+                        cb = args.pop();
+                    }
+                    let client;
+                    try {
+                        client = await hookedConnect();
+                    } catch (err) {
+                        if (cb) { cb(err); return; }
+                        throw err;
+                    }
+                    let result;
+                    try {
+                        result = await client.query(...args);
+                    } catch (err) {
+                        // Release with err so pool destroys the client
+                        // (don't issue DISCARD on a broken client). The
+                        // hooked release respects truthy first arg.
+                        try { client.release(err); } catch {}
+                        if (cb) { cb(err); return; }
+                        throw err;
+                    }
+                    // Successful path: release without err triggers our
+                    // DISCARD ALL hook, then returns the client to the
+                    // pool. Don't await release errors — they don't
+                    // affect the user's result.
+                    try { client.release(); } catch {}
+                    if (cb) { cb(null, result); return; }
+                    return result;
+                };
+            }
+            // Most properties pass through. Methods are bound to the
+            // ORIGINAL pool so internal state (the queue of pending
+            // connects, the idle-client list, etc.) stays consistent.
+            return typeof val === 'function' ? val.bind(target) : val;
+        },
+    });
+}
+
+// In-place hook on a pg-pool `PoolClient`'s `release` method so the
+// release issues `DISCARD ALL` first. Mutates the per-checkout client
+// object (which is owned by the user for the duration of the checkout
+// — we're allowed to add behavior to it).
+//
+// The hook is idempotent: if the same client object is hooked twice
+// (e.g. wrap() called multiple times on the same Pool), the second
+// pass detects the marker and skips. This avoids re-wrapping the
+// already-wrapped release, which would issue DISCARD twice per
+// release.
+function _hookReleaseToDiscard(client) {
+    if (!client || typeof client.release !== 'function') return;
+    if (client.__goldlapelDiscardHooked) return;
+    client.__goldlapelDiscardHooked = true;
+    const origRelease = client.release.bind(client);
+    client.release = function _hookedRelease(...releaseArgs) {
+        // If the user passed `release(err)` or `release(true)` we honor
+        // it: the client is being destroyed anyway, no DISCARD needed
+        // (and it would error on a dying connection). pg-pool's
+        // contract: any truthy first arg triggers destroy.
+        if (releaseArgs.length > 0 && releaseArgs[0]) {
+            return origRelease(...releaseArgs);
+        }
+        // Best-effort DISCARD ALL. If the underlying connection is
+        // already broken (network error, server-initiated close), the
+        // query throws — destroy the client instead of returning it to
+        // the pool with potentially-stale GUC state. Errors are NOT
+        // re-thrown to the user (release shouldn't fail user code).
+        let p;
+        try {
+            p = client.query('DISCARD ALL');
+        } catch (err) {
+            // Synchronous throw (rare — pg's query is async, but a
+            // disposed client may throw on entry). Destroy and bail.
+            return origRelease(err);
+        }
+        if (p && typeof p.then === 'function') {
+            return p.then(
+                () => origRelease(...releaseArgs),
+                (err) => origRelease(err),
+            );
+        }
+        // Defensive: query returned a non-Promise (shouldn't happen with
+        // pg, but custom client implementations might). Just release.
+        return origRelease(...releaseArgs);
+    };
+}
+
 export function wrap(client, invalidationPort) {
     if (!_cache) {
         _cache = new NativeCache();
@@ -104,6 +275,15 @@ export function wrap(client, invalidationPort) {
     }
     if (!_cache._socket) {
         _cache.connectInvalidation(invalidationPort);
+    }
+    // pg-pool branch: return a Proxy that wraps `pool.connect()` so the
+    // returned PoolClients DISCARD on release. The wrapped pool's own
+    // surface (query, end, totalCount, ...) flows through untouched.
+    // Connection-state safety is handled at release-time, not in any
+    // CachedClient — the per-Pool object doesn't have a meaningful
+    // single GUC state.
+    if (_isPgPool(client)) {
+        return _wrapPoolForDiscard(client);
     }
     const cached = new CachedClient(client, _cache);
     return new Proxy(cached, {

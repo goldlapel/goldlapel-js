@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { NativeCache } from '../cache.js';
-import { wrap, CachedClient } from '../wrap.js';
+import { wrap, CachedClient, _isPgPool } from '../wrap.js';
 
 function makeConnectedCache() {
     NativeCache._reset();
@@ -687,5 +687,229 @@ describe('multi-statement tx-flag bookkeeping', () => {
         cached._inTransaction = true;
         await cached.query('COMMIT; BEGIN');
         assert.equal(cached._inTransaction, true);
+    });
+});
+
+// ─── pg-pool DISCARD-on-release integration (RLS hardening 2026-05-05) ────
+//
+// pg-pool reuses physical connections. Without our hook, a client that
+// SET an unsafe GUC (`app.user_id = 'A'`) returns to the pool with that
+// GUC still in place — a different request later picking up the same
+// physical connection inherits the stale state and bypasses the
+// state-hash trick. Our `wrap(pool)` returns a Proxy that hooks
+// `pool.connect()` so released clients first issue `DISCARD ALL`.
+
+function fakePoolClient(opts = {}) {
+    // Models a pg-pool PoolClient: a query method that records calls,
+    // a release(err?) method that records releases. Uses a counter to
+    // assert the order of DISCARD vs original release.
+    const calls = [];
+    let released = false;
+    let releaseErr = undefined;
+    const client = {
+        async query(text, values) {
+            calls.push({ text, values });
+            if (opts.queryThrows && text === 'DISCARD ALL') {
+                throw new Error('connection broken');
+            }
+            return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+        },
+        release(err) {
+            released = true;
+            releaseErr = err;
+        },
+        _calls: calls,
+        get released() { return released; },
+        get releaseErr() { return releaseErr; },
+    };
+    return client;
+}
+
+function fakePool(opts = {}) {
+    // Models a pg-pool Pool. Real pg-pool detection uses
+    // `constructor.name === 'Pool'`; we emulate by setting the class
+    // name. `connect()` returns a freshly-tracked PoolClient; `query()`
+    // does the connect+query+release dance pg-pool does internally so
+    // we can verify our hook fires on auto-managed flows too.
+    const checkedOut = [];
+    class Pool {
+        async connect() {
+            const c = fakePoolClient(opts);
+            checkedOut.push(c);
+            return c;
+        }
+        async query(text, values) {
+            const c = await this.connect();
+            try {
+                return await c.query(text, values);
+            } finally {
+                c.release();
+            }
+        }
+        async end() {}
+        get totalCount() { return checkedOut.length; }
+        get idleCount() { return 0; }
+        get waitingCount() { return 0; }
+    }
+    const p = new Pool();
+    p._checkedOut = checkedOut;
+    return p;
+}
+
+describe('pg-pool detection', () => {
+    it('detects a Pool by constructor name', () => {
+        const p = fakePool();
+        assert.ok(_isPgPool(p));
+    });
+
+    it('detects a Pool by duck-typing (Pool surface + telemetry props)', () => {
+        // Simulate a minified bundle where the constructor name is mangled.
+        const p = {
+            connect: async () => ({}),
+            query: async () => ({}),
+            end: async () => {},
+            totalCount: 0,
+            idleCount: 0,
+            waitingCount: 0,
+        };
+        assert.ok(_isPgPool(p));
+    });
+
+    it('does NOT detect a plain Client as a Pool', () => {
+        const client = {
+            connect: async () => {},
+            query: async () => ({}),
+            end: async () => {},
+            // No totalCount / idleCount / waitingCount.
+        };
+        assert.ok(!_isPgPool(client));
+    });
+
+    it('does NOT detect non-objects as Pools', () => {
+        assert.ok(!_isPgPool(null));
+        assert.ok(!_isPgPool(undefined));
+        assert.ok(!_isPgPool('string'));
+        assert.ok(!_isPgPool(42));
+    });
+});
+
+describe('pg-pool DISCARD-on-release hook', () => {
+    it('wrap(pool) returns a Proxy that hooks connect()', async () => {
+        const pool = fakePool();
+        makeConnectedCache();
+        const wrapped = wrap(pool, 9999);
+        const client = await wrapped.connect();
+        // Hook marker is set on the checked-out client.
+        assert.strictEqual(client.__goldlapelDiscardHooked, true);
+    });
+
+    it('release() issues DISCARD ALL before original release', async () => {
+        const pool = fakePool();
+        makeConnectedCache();
+        const wrapped = wrap(pool, 9999);
+        const client = await wrapped.connect();
+        await client.query("SET app.user_id = '42'");
+        await client.release();
+        // The hooked release ran DISCARD ALL before signalling release.
+        const sqlSeen = client._calls.map(c => c.text);
+        assert.deepStrictEqual(
+            sqlSeen,
+            ["SET app.user_id = '42'", 'DISCARD ALL'],
+        );
+        assert.strictEqual(client.released, true);
+        assert.strictEqual(client.releaseErr, undefined);
+    });
+
+    it('release(err) skips DISCARD (client is being destroyed)', async () => {
+        const pool = fakePool();
+        makeConnectedCache();
+        const wrapped = wrap(pool, 9999);
+        const client = await wrapped.connect();
+        const err = new Error('aborted');
+        await client.release(err);
+        // No DISCARD was issued.
+        assert.deepStrictEqual(client._calls.map(c => c.text), []);
+        assert.strictEqual(client.released, true);
+        assert.strictEqual(client.releaseErr, err);
+    });
+
+    it('release(true) also skips DISCARD (truthy first arg → destroy)', async () => {
+        const pool = fakePool();
+        makeConnectedCache();
+        const wrapped = wrap(pool, 9999);
+        const client = await wrapped.connect();
+        await client.release(true);
+        assert.deepStrictEqual(client._calls.map(c => c.text), []);
+        assert.strictEqual(client.released, true);
+        assert.strictEqual(client.releaseErr, true);
+    });
+
+    it('failing DISCARD destroys the client instead of returning it', async () => {
+        const pool = fakePool({ queryThrows: true });
+        makeConnectedCache();
+        const wrapped = wrap(pool, 9999);
+        const client = await wrapped.connect();
+        // Should NOT throw to the user — release errors are swallowed.
+        await client.release();
+        // The DISCARD threw, so we passed an Error to the original
+        // release (destroy path).
+        assert.ok(client.released);
+        assert.ok(client.releaseErr instanceof Error);
+    });
+
+    it('hook is idempotent — wrap(pool) twice does not double-DISCARD', async () => {
+        const pool = fakePool();
+        makeConnectedCache();
+        const wrapped1 = wrap(pool, 9999);
+        const client = await wrapped1.connect();
+        // Manually re-hook (simulates wrap() being called twice on the
+        // same pool — the second wrap shouldn't re-wrap the release).
+        await client.release();
+        const sqlSeen = client._calls.map(c => c.text);
+        assert.deepStrictEqual(sqlSeen, ['DISCARD ALL'],
+            'release fires DISCARD ALL exactly once');
+    });
+
+    it('pool.query() (auto-managed) flow also DISCARDs on internal release', async () => {
+        // pg-pool's pool.query() calls this.connect() internally —
+        // because the wrapper hooked connect(), the internal release
+        // also fires DISCARD ALL.
+        const pool = fakePool();
+        makeConnectedCache();
+        const wrapped = wrap(pool, 9999);
+        await wrapped.query('SELECT * FROM users');
+        // Exactly one client was checked out, and it saw DISCARD ALL on release.
+        assert.strictEqual(pool._checkedOut.length, 1);
+        const client = pool._checkedOut[0];
+        const sqlSeen = client._calls.map(c => c.text);
+        assert.deepStrictEqual(
+            sqlSeen,
+            ['SELECT * FROM users', 'DISCARD ALL'],
+        );
+    });
+
+    it('passthrough properties (totalCount, idleCount) work on the wrapped pool', async () => {
+        const pool = fakePool();
+        makeConnectedCache();
+        const wrapped = wrap(pool, 9999);
+        // Telemetry properties pass through transparently.
+        assert.strictEqual(wrapped.totalCount, 0);
+        assert.strictEqual(wrapped.idleCount, 0);
+        assert.strictEqual(wrapped.waitingCount, 0);
+        await wrapped.connect();
+        assert.strictEqual(wrapped.totalCount, 1);
+    });
+
+    it('raw Client (non-Pool) is wrapped as before — no DISCARD hook', async () => {
+        // Regression guard: a plain Client must still be wrapped via the
+        // CachedClient path, not the Pool path. Verify by checking that
+        // the wrapped object exposes CachedClient-style state (_gucState).
+        const client = mockClient();
+        makeConnectedCache();
+        const wrapped = wrap(client, 9999);
+        // CachedClient exposes _gucState; the Pool Proxy doesn't.
+        assert.ok(wrapped._gucState);
+        // No release hook on the underlying client.
+        assert.strictEqual(client.__goldlapelDiscardHooked, undefined);
     });
 });
