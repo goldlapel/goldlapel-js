@@ -1,7 +1,7 @@
 import { spawn, execFileSync } from 'child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { NativeCache } from './cache.js';
-import { wrap } from './wrap.js';
+import { wrap, VALID_AGGRESSIVE_VERIFY_MODES, _setWrapDefaults } from './wrap.js';
 import { createConnection } from 'net';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
@@ -465,6 +465,17 @@ export class GoldLapel {
         // `--disable-sqloptimize`, `--disable-auto-indexes`). Atomic
         // break — passing them inside `config` is rejected.
         disableMatviews, disableProxyCache, disableSqloptimize, disableAutoIndexes,
+        // Aggressive-verify mode (see goldlapel/docs/todos/
+        // aggressive-verify-flag.md). 'auto' (default) runs a one-shot
+        // pg_trigger / pg_proc body probe on first query and enables
+        // post-DML verify if any user trigger function looks stateful.
+        // 'on' / 'off' skip the probe and force the behavior.
+        // `aggressiveVerifyActive` is the license-payload override —
+        // truthy/falsy values bypass auto-detect entirely. The wrapper
+        // itself doesn't parse the license file; HQ-driven flows can
+        // pass the resolved boolean here once the license payload
+        // surfaces it.
+        aggressiveVerify, aggressiveVerifyActive,
     } = {}) {
         this._upstream = upstream;
         this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
@@ -506,6 +517,31 @@ export class GoldLapel {
         this._disableProxyCache = !!disableProxyCache;
         this._disableSqloptimize = !!disableSqloptimize;
         this._disableAutoIndexes = !!disableAutoIndexes;
+        // Aggressive-verify mode — validated eagerly (cheap; one Set
+        // lookup) so a typo lands at construction time instead of
+        // surfacing on first DML.
+        const av = aggressiveVerify ?? 'auto';
+        if (!VALID_AGGRESSIVE_VERIFY_MODES.has(av)) {
+            throw new Error(
+                `aggressiveVerify must be one of: 'auto', 'on', 'off' (got '${av}')`
+            );
+        }
+        this._aggressiveVerify = av;
+        // License-payload override — null/undefined means "no
+        // override, fall through to mode". true/false force the
+        // verify on/off and skip detection.
+        this._aggressiveVerifyActive = (
+            aggressiveVerifyActive === true || aggressiveVerifyActive === false
+        ) ? aggressiveVerifyActive : null;
+        // Push these into `wrap.js`'s default-option slot so a later
+        // `wrap(client)` (no third arg) picks up the mode users set at
+        // the GoldLapel constructor. Per-call options on `wrap()`
+        // still win. Same singleton-pattern shape as
+        // `disableNativeCache` flowing into NativeCache above.
+        _setWrapDefaults({
+            aggressiveVerify: this._aggressiveVerify,
+            aggressiveVerifyActive: this._aggressiveVerifyActive,
+        });
         // Toggle the wrapper's in-process native cache off without losing
         // the tuned `cacheSize`. When `true`, NativeCache acts as a no-op
         // pass-through (get always misses, put is a no-op) — the
@@ -901,6 +937,8 @@ function _call(gl, fn, args) {
  * @param {boolean} [opts.disableSqloptimize=false]  Disable the SQL rewrite / optimization pipeline on the proxy (`--disable-sqloptimize`). Per-kind disables in `config` still apply on top.
  * @param {boolean} [opts.disableAutoIndexes=false]  Disable automatic index recommendations / creation on the proxy (`--disable-auto-indexes`).
  * @param {boolean} [opts.disableNativeCache=false]  Disable the wrapper's in-process native cache without losing the tuned `cacheSize`. When `true`, gets always miss and puts are no-ops; the invalidation socket still connects so telemetry continues to flow. Use to A/B the native cache layer (e.g. measure end-to-end latency with and without it) while keeping your size config intact.
+ * @param {'auto'|'on'|'off'} [opts.aggressiveVerify='auto']  Schedule a `pg_settings` reconcile after every successful INSERT/UPDATE/DELETE/MERGE/TRUNCATE so trigger-internal `SET app.user_id = ...` mutations are observed. `'auto'` (default) probes `pg_trigger` + `pg_proc` on first query and enables verify only if a user trigger function looks stateful (cached per database for the life of the process). `'on'` skips detection and forces it on; `'off'` skips detection and forces it off.
+ * @param {boolean} [opts.aggressiveVerifyActive]  License-payload override for `aggressiveVerify`. When `true`/`false`, bypasses auto-detection and the mode flag entirely. The wrapper itself doesn't parse the license file; HQ-driven flows pass the resolved boolean here.
  * @returns {Promise<GoldLapel>}
  */
 export async function start(upstream, opts = {}) {
