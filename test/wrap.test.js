@@ -1,7 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { NativeCache } from '../cache.js';
-import { wrap, CachedClient, _isPgPool } from '../wrap.js';
+import {
+    wrap, CachedClient, _isPgPool, _containsOpaqueFunctionCall,
+} from '../wrap.js';
 
 function makeConnectedCache() {
     NativeCache._reset();
@@ -911,5 +913,385 @@ describe('pg-pool DISCARD-on-release hook', () => {
         assert.ok(wrapped._gucState);
         // No release hook on the underlying client.
         assert.strictEqual(client.__goldlapelDiscardHooked, undefined);
+    });
+});
+
+// ─── Opaque-function-call detection (RLS hardening 2026-05-05) ────────────
+//
+// Top-level `SELECT [pg_catalog.]<ident>(...)` triggers an async post-call
+// verify because the function body may have run a SET internally. This
+// section pins the matcher's truth table so the verify stays narrow:
+// non-function SELECTs don't fire (waste a verify), `set_config` doesn't
+// fire (already applied inline), and unambiguous function calls always
+// fire even when buried in larger SELECTs or multi-statement bodies.
+
+describe('_containsOpaqueFunctionCall', () => {
+    it('matches plain function call', () => {
+        assert.ok(_containsOpaqueFunctionCall('SELECT my_func()'));
+        assert.ok(_containsOpaqueFunctionCall('SELECT my_func(1, 2)'));
+    });
+    it('matches pg_catalog-qualified function call', () => {
+        assert.ok(_containsOpaqueFunctionCall('SELECT pg_catalog.my_func()'));
+    });
+    it('case-insensitive', () => {
+        assert.ok(_containsOpaqueFunctionCall('select MY_FUNC()'));
+        assert.ok(_containsOpaqueFunctionCall('Select My_Func ( )'));
+    });
+    it('matches function call with trailing FROM clause', () => {
+        // `SELECT my_setter(), col FROM tbl` is a real RLS pattern —
+        // the function may set a GUC as a side effect of producing a row.
+        assert.ok(_containsOpaqueFunctionCall('SELECT my_setter() FROM tbl'));
+    });
+    it('does NOT match plain row-SELECT', () => {
+        assert.ok(!_containsOpaqueFunctionCall('SELECT * FROM users'));
+        assert.ok(!_containsOpaqueFunctionCall('SELECT id, name FROM users'));
+        assert.ok(!_containsOpaqueFunctionCall('SELECT 1'));
+    });
+    it('does NOT match set_config (handled inline)', () => {
+        assert.ok(!_containsOpaqueFunctionCall(
+            "SELECT set_config('app.user_id', '42', false)"
+        ));
+        assert.ok(!_containsOpaqueFunctionCall(
+            "SELECT pg_catalog.set_config('app.user_id', '42', false)"
+        ));
+    });
+    it('matches inside multi-statement body', () => {
+        assert.ok(_containsOpaqueFunctionCall('SELECT 1; SELECT my_fn()'));
+        assert.ok(_containsOpaqueFunctionCall('SELECT my_fn(); SELECT 1'));
+    });
+    it('multi-statement with only set_config + plain SELECTs does NOT fire', () => {
+        assert.ok(!_containsOpaqueFunctionCall(
+            "SELECT set_config('app.x', '1', false); SELECT * FROM t"
+        ));
+    });
+    it('non-string / empty input returns false', () => {
+        assert.ok(!_containsOpaqueFunctionCall(''));
+        assert.ok(!_containsOpaqueFunctionCall(null));
+        assert.ok(!_containsOpaqueFunctionCall(undefined));
+        assert.ok(!_containsOpaqueFunctionCall(42));
+    });
+    it('non-SELECT statements do not match', () => {
+        assert.ok(!_containsOpaqueFunctionCall('INSERT INTO t VALUES (my_func())'));
+        assert.ok(!_containsOpaqueFunctionCall('UPDATE t SET x = my_func()'));
+        assert.ok(!_containsOpaqueFunctionCall('BEGIN'));
+    });
+});
+
+// ─── Async post-call verify (concern 6) ───────────────────────────────────
+//
+// On a top-level `SELECT <fn>(...)` the wrapper schedules an async query
+// against pg_settings to detect any GUCs the function set internally.
+// Updates state map on success, marks `_dirty` on failure. Never blocks
+// the user's hot path; never fails the user's query.
+
+function settle() {
+    // Yield to the microtask queue so any queueMicrotask-scheduled
+    // verify gets a chance to run + resolve. Two `setImmediate` ticks
+    // is overkill but cheap and bullet-proof in the test environment.
+    return new Promise((resolve) => setImmediate(() => setImmediate(resolve)));
+}
+
+function verifyableMockClient({ functionResult, sessionRows, queryThrows }) {
+    // Mock client that handles three query shapes:
+    //   1. `SELECT name, setting FROM pg_settings WHERE source = 'session'`
+    //      → returns sessionRows (or throws if queryThrows is set)
+    //   2. The opaque function call (whatever the test passes) → returns
+    //      `functionResult` (defaults to a successful no-row SELECT)
+    //   3. Anything else → also returns the function-call default.
+    const calls = [];
+    return {
+        async query(text, values) {
+            calls.push({ text, values });
+            if (typeof text === 'string' && text.startsWith(
+                "SELECT name, setting FROM pg_settings"
+            )) {
+                if (queryThrows) throw new Error('pg_settings query failed');
+                return { rows: sessionRows ?? [], fields: [], rowCount: 0, command: 'SELECT' };
+            }
+            return functionResult ?? { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+        },
+        connect: async () => {},
+        end: async () => {},
+        on: () => {}, off: () => {}, once: () => {},
+        _calls: calls,
+    };
+}
+
+describe('async post-call verify on top-level SELECT <fn>(...)', () => {
+    it('successful verify updates state from pg_settings', async () => {
+        const client = verifyableMockClient({
+            sessionRows: [
+                { name: 'app.user_id', setting: '42' },
+                { name: 'app.tenant', setting: 'acme' },
+                { name: 'application_name', setting: 'foo' }, // safe — ignored
+            ],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('SELECT my_setter()');
+        // Wait for the async verify to settle.
+        await settle();
+        // pg_settings query should have been issued exactly once.
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 1);
+        // Unsafe-GUC state was rebuilt from the response.
+        assert.strictEqual(cached._gucState._values.size, 2);
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42');
+        assert.strictEqual(cached._gucState._values.get('app.tenant'), 'acme');
+        // application_name was filtered out (safe).
+        assert.ok(!cached._gucState._values.has('application_name'));
+        // Hash is non-zero now.
+        assert.notStrictEqual(cached._gucState.stateHash(), 0);
+        // _dirty cleared on success.
+        assert.strictEqual(cached._dirty, false);
+    });
+
+    it('failed verify marks _dirty for next-checkout reconcile', async () => {
+        const client = verifyableMockClient({ queryThrows: true });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('SELECT my_setter()');
+        await settle();
+        assert.strictEqual(cached._dirty, true);
+    });
+
+    it('verify never throws to the user (failure is internal)', async () => {
+        const client = verifyableMockClient({ queryThrows: true });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        // The user's query must NOT reject because the post-call verify
+        // failed. Verify by awaiting the user's call AND letting the
+        // verify settle without unhandled-rejection events.
+        const result = await cached.query('SELECT my_setter()');
+        assert.deepStrictEqual(result.rows, []);
+        await settle();
+        assert.strictEqual(cached._dirty, true);
+    });
+
+    it('plain SELECT (non-function) does NOT trigger verify', async () => {
+        const client = verifyableMockClient({});
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('SELECT * FROM users');
+        await settle();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0);
+    });
+
+    it('SELECT set_config(...) does NOT trigger verify (handled inline)', async () => {
+        const client = verifyableMockClient({});
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query("SELECT set_config('app.user_id', '42', false)");
+        await settle();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0);
+        // The hash was still moved by the inline set_config recognition.
+        assert.notStrictEqual(cached._gucState.stateHash(), 0);
+    });
+
+    it('verify is single-flight (back-to-back fn calls do not stack)', async () => {
+        const client = verifyableMockClient({
+            sessionRows: [{ name: 'app.user_id', setting: '42' }],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        // Two fn calls in quick succession — only the first should
+        // schedule a verify; the second sees `_pendingVerify` set and
+        // skips. Net: exactly one pg_settings query.
+        const p1 = cached.query('SELECT my_fn()');
+        const p2 = cached.query('SELECT my_other_fn()');
+        await Promise.all([p1, p2]);
+        await settle();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 1, 'single-flight: at most one verify in flight');
+    });
+
+    it('verify does not fire while in transaction', async () => {
+        const client = verifyableMockClient({
+            sessionRows: [{ name: 'app.user_id', setting: '42' }],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN');
+        await cached.query('SELECT my_setter()');
+        await settle();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0,
+            'no verify scheduled mid-tx (would see uncommitted state)');
+    });
+
+    it('verify does not fire after end() (closed connection)', async () => {
+        const client = verifyableMockClient({});
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.end();
+        // Even if a fn-call query were issued after end(), verify
+        // should be suppressed. Simulate by directly calling
+        // _scheduleVerify (the user code wouldn't issue queries after
+        // end, but pending verifies might race).
+        cached._scheduleVerify();
+        await settle();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0);
+    });
+
+    it('verify after end() — close mid-flight does not crash', async () => {
+        // Simulate connection-close-mid-verify: kick off a verify,
+        // immediately close, ensure no unhandled rejection.
+        let resolveQuery;
+        const pendingQuery = new Promise((resolve) => { resolveQuery = resolve; });
+        const client = {
+            async query(text, values) {
+                if (typeof text === 'string'
+                    && text.startsWith("SELECT name, setting FROM pg_settings")) {
+                    return pendingQuery; // hangs until we resolve
+                }
+                return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+            },
+            end: async () => {},
+        };
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('SELECT my_fn()');
+        // verify is in flight; close the connection.
+        await cached.end();
+        // Make the verify reject as if the connection died.
+        resolveQuery(Promise.reject(new Error('connection closed')));
+        await settle();
+        // No throw, _dirty set (verify failed → dirty path).
+        assert.strictEqual(cached._dirty, true);
+    });
+});
+
+// ─── Verify-on-checkout (concern 5) ───────────────────────────────────────
+//
+// `_dirty=true` means we can't trust the state hash. The next user query
+// reconciles by querying pg_settings synchronously before the cache
+// lookup. Models the case where an async post-call verify failed (or
+// the connection was handed off and re-acquired in a way that leaves
+// the wrapper unable to track state on the wire).
+
+describe('verify-on-checkout (lazy fallback)', () => {
+    it('dirty + next query → reconciles before cache lookup', async () => {
+        const client = verifyableMockClient({
+            sessionRows: [{ name: 'app.user_id', setting: '99' }],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        // Pretend a previous async verify failed — _dirty is set.
+        cached._dirty = true;
+        // Pre-populate the cache under the (stale) baseline-empty hash.
+        cache.put('SELECT * FROM accounts', null, [{ id: 'STALE' }], [], 0);
+        // Next user query should reconcile FIRST, then look up cache
+        // under the new (post-reconcile) hash — which doesn't match
+        // the baseline-empty slot.
+        const result = await cached.query('SELECT * FROM accounts');
+        // pg_settings was queried.
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 1);
+        // _dirty cleared.
+        assert.strictEqual(cached._dirty, false);
+        // The stale baseline-hash entry was NOT served — the wrapper
+        // missed cache and went to _real.query (returning [] from our mock).
+        assert.notDeepStrictEqual(result.rows, [{ id: 'STALE' }]);
+    });
+
+    it('dirty + tx → does NOT reconcile (would see uncommitted state)', async () => {
+        const client = verifyableMockClient({
+            sessionRows: [{ name: 'app.user_id', setting: '99' }],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        cached._inTransaction = true;
+        cached._dirty = true;
+        await cached.query('SELECT * FROM users');
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0,
+            'no reconcile mid-tx — wait until tx ends');
+        // _dirty stays set (will retry on first post-tx query).
+        assert.strictEqual(cached._dirty, true);
+    });
+
+    it('dirty cleared after successful reconcile', async () => {
+        const client = verifyableMockClient({
+            sessionRows: [],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        cached._dirty = true;
+        await cached.query('SELECT 1');
+        assert.strictEqual(cached._dirty, false);
+    });
+
+    it('reconcile failure leaves _dirty set for next attempt', async () => {
+        const client = verifyableMockClient({ queryThrows: true });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        cached._dirty = true;
+        // The reconcile fails; the user's query continues.
+        await cached.query('SELECT 1');
+        assert.strictEqual(cached._dirty, true);
+    });
+
+    it('reconcile + post-call verify combine cleanly on a fn-call query', async () => {
+        // After a fn call: the post-call verify reconciles asynchronously.
+        // After that reconcile failure, _dirty is set; the next user
+        // query reconciles synchronously. End-to-end behavior:
+        //   1. Fn call → real query → schedule async verify.
+        //   2. Async verify fails → _dirty = true.
+        //   3. Next user query → sync reconcile (pg_settings) → cleared.
+        let firstVerify = true;
+        const client = {
+            async query(text, values) {
+                if (typeof text === 'string'
+                    && text.startsWith("SELECT name, setting FROM pg_settings")) {
+                    if (firstVerify) {
+                        firstVerify = false;
+                        throw new Error('first verify failed');
+                    }
+                    return {
+                        rows: [{ name: 'app.user_id', setting: 'X' }],
+                        fields: [], rowCount: 0, command: 'SELECT',
+                    };
+                }
+                return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+            },
+            end: async () => {},
+        };
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('SELECT my_fn()');
+        await settle();
+        // First verify failed → dirty.
+        assert.strictEqual(cached._dirty, true);
+        await cached.query('SELECT 1');
+        // Second verify succeeded as part of checkout reconcile → clean.
+        assert.strictEqual(cached._dirty, false);
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), 'X');
     });
 });

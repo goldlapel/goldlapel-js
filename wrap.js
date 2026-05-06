@@ -11,9 +11,53 @@ import {
 // Truthy-array check (`result.rows && result.fields`) misses this in JS
 // because `[] && []` is truthy.
 const NON_CACHEABLE_COMMANDS = new Set([
-    'SET', 'RESET', 'LISTEN', 'UNLISTEN', 'NOTIFY',
+    'SET', 'RESET', 'DISCARD', 'LISTEN', 'UNLISTEN', 'NOTIFY',
     'BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT',
 ]);
+
+// Test whether `sql` contains a top-level `SELECT [pg_catalog.]<ident>(...)`
+// — i.e. an opaque function call whose body could SET unsafe GUCs without
+// the wire layer seeing it. Used to decide whether to schedule an async
+// post-call state verify.
+//
+// Multi-statement bodies are walked: any segment whose top-level shape
+// matches triggers verify. `SELECT set_config(...)` is excluded because
+// `parseSetCommand` already applied it inline; running a follow-up verify
+// would be redundant.
+//
+// Conservative: false positives (a SELECT-of-function-call that doesn't
+// actually mutate state) just trigger one extra cheap pg_settings query,
+// which is harmless. False negatives (missing a real SET) are the bug we
+// can't tolerate, so the matcher errs toward firing.
+function _containsOpaqueFunctionCall(sql) {
+    if (typeof sql !== 'string' || sql.length === 0) return false;
+    const trimmed = sql.trimEnd().replace(/;+$/, '');
+    if (!trimmed.includes(';')) {
+        return _segmentIsOpaqueFunctionCall(sql);
+    }
+    for (const seg of splitStatements(sql)) {
+        if (_segmentIsOpaqueFunctionCall(seg)) return true;
+    }
+    return false;
+}
+
+// Per-segment top-level-function-call detector. Returns true for shapes
+// like `SELECT foo()`, `SELECT pg_catalog.foo(...)`, `SELECT FOO(args)`,
+// excluding `SELECT set_config(...)` which is already handled inline by
+// `parseSetCommand`. The matcher checks the leading shape only — anything
+// after the function call (e.g. `... FROM tbl`, `... || other`) does NOT
+// disqualify it (a function called inside a larger SELECT can still be
+// stateful — `SELECT my_setter(), * FROM users` is a common pattern).
+const _OPAQUE_FN_RE = /^\s*SELECT\s+(?:pg_catalog\s*\.\s*)?([A-Za-z_][\w$]*)\s*\(/i;
+function _segmentIsOpaqueFunctionCall(seg) {
+    if (typeof seg !== 'string') return false;
+    const m = seg.match(_OPAQUE_FN_RE);
+    if (!m) return false;
+    const fn = m[1].toLowerCase();
+    // set_config() is the function-form SET — already applied inline.
+    if (fn === 'set_config') return false;
+    return true;
+}
 
 // Multi-statement Q-message write detection. Reuses splitStatements so
 // `SET app.user_id = '42'; INSERT INTO orders VALUES (1)` (a single Q
@@ -310,6 +354,26 @@ class CachedClient {
         // a shared singleton cache (the wrapper has one cache singleton
         // per process; CachedClient is per-conn).
         this._gucState = new ConnectionGucState();
+        // Dirty bit — set when we have reason to believe `_gucState`
+        // diverges from the actual server-side session state. The next
+        // user-visible query will reconcile by querying `pg_settings`
+        // and rebuilding `_gucState` from the response. Causes:
+        //   1. An async post-call verify (after a `SELECT <fn>(...)`)
+        //      failed — connection blip, server in error state, etc.
+        //      We can no longer trust the hash.
+        //   2. The user manually flipped it (e.g. via `gl.using()`
+        //      semantics that hand the conn to another consumer).
+        // Cleared by `_runVerify()` on success.
+        this._dirty = false;
+        // Promise tracking the in-flight async post-call verify. Single-
+        // flight: never two verifies queued at once on the same conn.
+        // Resolves to `undefined` on success, never rejects (we swallow
+        // failures into `_dirty`).
+        this._pendingVerify = null;
+        // Set to true when the underlying connection is closed via
+        // `client.end()`. Suppresses any pending or future verify so
+        // we don't try to query a dead connection.
+        this._closed = false;
     }
 
     async query(textOrConfig, values) {
@@ -322,6 +386,17 @@ class CachedClient {
             params = values;
         }
 
+        // Verify-on-checkout: if a previous async verify failed (or
+        // the client was handed off and re-acquired) we can't trust
+        // `_gucState`. Reconcile synchronously by querying pg_settings
+        // before continuing — this guarantees the cache key derived
+        // below reflects real server-side state. Skipped while in tx
+        // (cache is bypassed anyway, and verify-during-tx would see
+        // uncommitted state).
+        if (this._dirty && !this._inTransaction) {
+            await this._runVerify();
+        }
+
         // GUC state observation. Runs on every query before any
         // transaction / write / read branching: a `SET app.user_id =
         // '42'` shifts the hash, so the very next SELECT must key
@@ -330,6 +405,15 @@ class CachedClient {
         if (typeof sql === 'string' && sql.length > 0) {
             this._gucState.observeSql(sql);
         }
+
+        // Detect top-level `SELECT <ident>(...)` shape in the original
+        // SQL — opaque function calls may SET unsafe GUCs internally
+        // (the wire layer can't see the SET). Schedule an async verify
+        // AFTER the user's query completes; outcome updates the state
+        // map without ever blocking the user's hot path.
+        // Single-statement set_config(...) calls were already applied
+        // by observeSql above and don't need a follow-up verify.
+        const needsVerify = _containsOpaqueFunctionCall(sql);
 
         // Multi-statement-aware write detection. Runs BEFORE transaction
         // tracking so a single Q message like `BEGIN; INSERT INTO orders
@@ -356,7 +440,9 @@ class CachedClient {
         // cache for every subsequent read until the next BEGIN/COMMIT
         // pair reset state. Single-statement bodies skip the splitter.
         if (applyTxBoundaries(sql, this)) {
-            return this._real.query(textOrConfig, values);
+            const r = await this._real.query(textOrConfig, values);
+            if (needsVerify) this._scheduleVerify();
+            return r;
         }
 
         // If this was a single-statement write, we've already invalidated
@@ -365,12 +451,16 @@ class CachedClient {
         // alongside SELECTs are uncacheable (extractTables on the joined
         // SQL would index against the wrong slot), so they also exit here.
         if (writeTables !== null) {
-            return this._real.query(textOrConfig, values);
+            const r = await this._real.query(textOrConfig, values);
+            if (needsVerify) this._scheduleVerify();
+            return r;
         }
 
         // Inside transaction: bypass cache
         if (this._inTransaction) {
-            return this._real.query(textOrConfig, values);
+            const r = await this._real.query(textOrConfig, values);
+            if (needsVerify) this._scheduleVerify();
+            return r;
         }
 
         // Read path: check native cache, gated on the per-connection
@@ -379,6 +469,8 @@ class CachedClient {
         const stateHash = this._gucState.stateHash();
         const entry = this._cache.get(sql, params, stateHash);
         if (entry !== null) {
+            // Cache hit — no _real.query ran, so no opaque function got
+            // a chance to mutate state. No verify needed.
             return {
                 rows: entry.rows,
                 fields: entry.fields,
@@ -408,7 +500,87 @@ class CachedClient {
             this._cache.put(sql, params, result.rows, result.fields, stateHash);
         }
 
+        if (needsVerify) this._scheduleVerify();
         return result;
+    }
+
+    // Schedule an async post-call state verify. Single-flight: if a
+    // verify is already in flight, don't queue another — the in-flight
+    // one will see whatever state the server is in by the time it
+    // runs. Never blocks the caller; never throws (failures land in
+    // `_dirty` for the next checkout-time reconcile).
+    //
+    // We deliberately use `setImmediate` (or a microtask via Promise
+    // resolution if setImmediate is unavailable) so the verify queues
+    // AFTER the current call's result has been returned to the user.
+    // This keeps the user's hot path strictly one network round-trip,
+    // even on connections that observe a function call.
+    _scheduleVerify() {
+        if (this._closed) return;
+        if (this._inTransaction) return; // verify-in-tx sees uncommitted state
+        if (this._pendingVerify) return; // single-flight
+        // Wrap in a Promise that will never reject — failures go into
+        // `_dirty`. Use `queueMicrotask` for predictable test ordering;
+        // it runs strictly after the current call's resolution and
+        // before the next event-loop tick.
+        const verifyPromise = new Promise((resolve) => {
+            queueMicrotask(() => {
+                this._runVerify().finally(resolve);
+            });
+        });
+        this._pendingVerify = verifyPromise;
+        verifyPromise.finally(() => {
+            // Clear the single-flight token once the verify resolves
+            // (success or fail). A subsequent function call will then
+            // schedule a fresh verify.
+            if (this._pendingVerify === verifyPromise) {
+                this._pendingVerify = null;
+            }
+        });
+    }
+
+    // Synchronously reconcile `_gucState` with `pg_settings`. Runs
+    // either:
+    //   - As the body of a scheduled async verify (after a top-level
+    //     SELECT <fn>(...) so we may have missed an internal SET).
+    //   - On the user's next query if `_dirty` is set (verify-on-
+    //     checkout fallback for the case where an async verify failed
+    //     or we couldn't schedule one).
+    //
+    // Failures (connection broken, server in error state) flip
+    // `_dirty=true` so the next user query reconciles again. Never
+    // re-throws — the user's flow must not be derailed by our
+    // bookkeeping. On success clears `_dirty` and replaces
+    // `_gucState`'s contents with the live server-side unsafe-GUC set.
+    async _runVerify() {
+        if (this._closed) return;
+        try {
+            const result = await this._real.query(
+                "SELECT name, setting FROM pg_settings WHERE source = 'session'"
+            );
+            const newValues = new Map();
+            for (const row of (result && result.rows) || []) {
+                // pg returns column values as strings here; defensive
+                // string coercion lets us handle adapters that return
+                // {name: Buffer} or similar quirks.
+                const name = String(row.name || '').toLowerCase();
+                if (!name) continue;
+                if (isUnsafeGuc(name)) {
+                    newValues.set(name, String(row.setting ?? ''));
+                }
+            }
+            // Mutate the existing ConnectionGucState in place so any
+            // outside reference (e.g. test introspection on
+            // `cached._gucState`) stays current.
+            this._gucState._values = newValues;
+            this._gucState._recomputeHash();
+            this._dirty = false;
+        } catch {
+            // Anything went wrong — connection blip, server error
+            // state, mid-tx unexpected verify. Mark dirty so the next
+            // user query retries the reconcile. Never re-throw.
+            this._dirty = true;
+        }
     }
 
     async connect() {
@@ -416,6 +588,11 @@ class CachedClient {
     }
 
     async end() {
+        // Mark closed BEFORE forwarding so any in-flight `_pendingVerify`
+        // that hasn't yet fired its query becomes a no-op. Verifies
+        // already in flight will throw on the closing connection and
+        // fall into the dirty path, which is harmless after end().
+        this._closed = true;
         return this._real.end();
     }
 
@@ -432,4 +609,4 @@ class CachedClient {
     }
 }
 
-export { CachedClient };
+export { CachedClient, _containsOpaqueFunctionCall };
