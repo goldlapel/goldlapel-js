@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { NativeCache } from '../cache.js';
 import {
     wrap, CachedClient, _isPgPool, _containsOpaqueFunctionCall,
+    _DETECTION_SQL, _runDetection, _smartVerifyCache,
+    _resetSmartVerifyCache, _setWrapDefaults,
+    VALID_AGGRESSIVE_VERIFY_MODES,
 } from '../wrap.js';
 
 function makeConnectedCache() {
@@ -1579,5 +1582,498 @@ describe('SET-actually-applied: tx snapshot revert on ROLLBACK', () => {
         await cached.query('ROLLBACK');
         assert.strictEqual(cached._gucState._txStack.length, 0,
             'ROLLBACK pops the BEGIN snapshot');
+    });
+});
+
+// ─── Smart aggressive-verify (auto / on / off + license override) ──────────
+//
+// "Aggressive verify" runs the same `pg_settings` reconcile we already fire
+// after `SELECT <fn>(...)` but on every successful DML (INSERT/UPDATE/
+// DELETE/MERGE/TRUNCATE). Closes the trigger-internal-SET hole filed in
+// `goldlapel/docs/todos/aggressive-verify-flag.md`. Smart-auto detects
+// stateful triggers via a one-shot pg_trigger / pg_proc probe on first
+// DML, cached per-database.
+
+// Mock client whose `query()` responds to three shapes:
+//   1. `SELECT current_database() AS db` → returns the configured db name.
+//   2. The full `_DETECTION_SQL` body → returns has_stateful_triggers.
+//   3. `SELECT name, setting FROM pg_settings...` → returns sessionRows
+//      (the post-DML verify reconcile).
+//   4. Anything else (the user's INSERT/SELECT/etc.) → returns the
+//      generic queryResult.
+function smartVerifyMock({
+    dbName = 'app',
+    hasStatefulTriggers = false,
+    sessionRows = [],
+    queryResult,
+    detectionThrows = false,
+} = {}) {
+    const calls = [];
+    return {
+        async query(text, values) {
+            calls.push({ text, values });
+            if (typeof text === 'string') {
+                if (text.startsWith('SELECT current_database()')) {
+                    if (detectionThrows) throw new Error('current_database failed');
+                    return {
+                        rows: [{ db: dbName }],
+                        fields: [{ name: 'db' }],
+                        rowCount: 1,
+                        command: 'SELECT',
+                    };
+                }
+                // Detection probe — match on the leading SELECT EXISTS.
+                if (text.includes('FROM pg_trigger') && text.includes('pg_proc')) {
+                    if (detectionThrows) throw new Error('pg_proc unreadable');
+                    return {
+                        rows: [{ has_stateful_triggers: hasStatefulTriggers }],
+                        fields: [{ name: 'has_stateful_triggers' }],
+                        rowCount: 1,
+                        command: 'SELECT',
+                    };
+                }
+                if (text.startsWith("SELECT name, setting FROM pg_settings")) {
+                    return {
+                        rows: sessionRows,
+                        fields: [],
+                        rowCount: sessionRows.length,
+                        command: 'SELECT',
+                    };
+                }
+            }
+            return queryResult ?? { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+        },
+        connect: async () => {},
+        end: async () => {},
+        on: () => {}, off: () => {}, once: () => {},
+        _calls: calls,
+    };
+}
+
+function settleVerify() {
+    // Yield enough microtasks to let detection + a follow-up scheduled
+    // verify both resolve. Three setImmediate ticks covers the chain
+    // (detection promise → resolve → kickoff verify → microtask →
+    // _runVerify → another microtask).
+    return new Promise((resolve) => setImmediate(() => setImmediate(() => setImmediate(resolve))));
+}
+
+describe('smart aggressive-verify — option validation', () => {
+    afterEach(() => { _resetSmartVerifyCache(); });
+
+    it("CachedClient default is 'off' (raw constructor — internal callers)", () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        assert.strictEqual(cached._aggressiveVerifyMode, 'off');
+        assert.strictEqual(cached._aggressiveVerifyActive, false);
+        assert.strictEqual(cached._aggressiveVerifyDetectionDone, true);
+    });
+
+    it("wrap() default is 'auto' (user-facing entry point)", () => {
+        const client = smartVerifyMock();
+        makeConnectedCache();
+        const wrapped = wrap(client, 9999);
+        // The Proxy exposes the underlying CachedClient state via prop reads.
+        assert.strictEqual(wrapped._aggressiveVerifyMode, 'auto');
+        assert.strictEqual(wrapped._aggressiveVerifyDetectionDone, false);
+    });
+
+    it("rejects an unknown aggressiveVerify mode", () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        assert.throws(
+            () => new CachedClient(client, cache, { aggressiveVerify: 'maybe' }),
+            /aggressiveVerify must be one of/
+        );
+    });
+
+    it("'on' resolves immediately to active=true, no detection", () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+        assert.strictEqual(cached._aggressiveVerifyMode, 'on');
+        assert.strictEqual(cached._aggressiveVerifyActive, true);
+        assert.strictEqual(cached._aggressiveVerifyDetectionDone, true);
+    });
+
+    it("'off' resolves immediately to active=false, no detection", () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'off' });
+        assert.strictEqual(cached._aggressiveVerifyMode, 'off');
+        assert.strictEqual(cached._aggressiveVerifyActive, false);
+        assert.strictEqual(cached._aggressiveVerifyDetectionDone, true);
+    });
+
+    it("license override true wins over mode='auto'", () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, {
+            aggressiveVerify: 'auto',
+            aggressiveVerifyActive: true,
+        });
+        assert.strictEqual(cached._aggressiveVerifyActive, true);
+        assert.strictEqual(cached._aggressiveVerifyDetectionDone, true,
+            'license override skips auto-detect probe');
+    });
+
+    it("license override false wins over mode='on'", () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, {
+            aggressiveVerify: 'on',
+            aggressiveVerifyActive: false,
+        });
+        assert.strictEqual(cached._aggressiveVerifyActive, false);
+        assert.strictEqual(cached._aggressiveVerifyDetectionDone, true);
+    });
+
+    it("VALID_AGGRESSIVE_VERIFY_MODES is exported", () => {
+        assert.ok(VALID_AGGRESSIVE_VERIFY_MODES instanceof Set);
+        assert.strictEqual(VALID_AGGRESSIVE_VERIFY_MODES.size, 3);
+        assert.ok(VALID_AGGRESSIVE_VERIFY_MODES.has('auto'));
+        assert.ok(VALID_AGGRESSIVE_VERIFY_MODES.has('on'));
+        assert.ok(VALID_AGGRESSIVE_VERIFY_MODES.has('off'));
+    });
+});
+
+describe('smart aggressive-verify — detection probe', () => {
+    afterEach(() => { _resetSmartVerifyCache(); });
+
+    it("_DETECTION_SQL references both pg_trigger and pg_proc", () => {
+        // The dispatch's spec is that detection joins pg_trigger + pg_proc
+        // and regex-matches the function body. Sanity-check the SQL text.
+        assert.match(_DETECTION_SQL, /FROM\s+pg_trigger/);
+        assert.match(_DETECTION_SQL, /JOIN\s+pg_proc/);
+        assert.match(_DETECTION_SQL, /set_config/);
+        assert.match(_DETECTION_SQL, /tgisinternal\s*=\s*false/,
+            'filters out PG-managed (FK constraint) triggers');
+        assert.match(_DETECTION_SQL, /pg_catalog/,
+            'excludes pg_catalog from candidate triggers');
+    });
+
+    it("_runDetection returns true when probe sees stateful triggers", async () => {
+        const client = smartVerifyMock({ dbName: 'db1', hasStatefulTriggers: true });
+        const result = await _runDetection(client);
+        assert.strictEqual(result, true);
+    });
+
+    it("_runDetection returns false when probe sees no stateful triggers", async () => {
+        const client = smartVerifyMock({ dbName: 'db2', hasStatefulTriggers: false });
+        const result = await _runDetection(client);
+        assert.strictEqual(result, false);
+    });
+
+    it("_runDetection caches per-database — second call is one round trip", async () => {
+        const client = smartVerifyMock({ dbName: 'db3', hasStatefulTriggers: true });
+        await _runDetection(client);
+        const callsAfterFirst = client._calls.length;
+        const result = await _runDetection(client);
+        // Second call: only `current_database()` should re-issue (cache
+        // is keyed by db name); the trigger probe should be served from
+        // the cache.
+        assert.strictEqual(result, true);
+        const detectionProbeCalls = client._calls.filter(c =>
+            typeof c.text === 'string' && c.text.includes('FROM pg_trigger')
+        );
+        assert.strictEqual(detectionProbeCalls.length, 1,
+            'second call re-uses cached probe verdict');
+        assert.ok(client._calls.length > callsAfterFirst,
+            'second call still runs current_database to scope cache');
+    });
+
+    it("_runDetection treats failure as 'off' (false)", async () => {
+        const client = smartVerifyMock({ dbName: 'db4', detectionThrows: true });
+        const result = await _runDetection(client);
+        assert.strictEqual(result, false,
+            'detection failure defaults off, not on');
+    });
+
+    it("concurrent _runDetection calls share a single in-flight probe", async () => {
+        const client = smartVerifyMock({ dbName: 'db5', hasStatefulTriggers: true });
+        const [a, b, c] = await Promise.all([
+            _runDetection(client),
+            _runDetection(client),
+            _runDetection(client),
+        ]);
+        assert.strictEqual(a, true);
+        assert.strictEqual(b, true);
+        assert.strictEqual(c, true);
+        const detectionProbeCalls = client._calls.filter(c =>
+            typeof c.text === 'string' && c.text.includes('FROM pg_trigger')
+        );
+        assert.strictEqual(detectionProbeCalls.length, 1,
+            'in-flight Promise is shared across concurrent callers');
+    });
+});
+
+describe('smart aggressive-verify — post-DML verify firing', () => {
+    afterEach(() => { _resetSmartVerifyCache(); });
+
+    it("mode='on' fires verify after INSERT", async () => {
+        const client = smartVerifyMock({ sessionRows: [{ name: 'app.user_id', setting: '7' }] });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+        await cached.query('INSERT INTO orders VALUES (1)');
+        await settleVerify();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 1);
+        // The verify reconciled the GUC state from pg_settings.
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '7');
+    });
+
+    it("mode='on' fires verify after UPDATE", async () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+        await cached.query("UPDATE orders SET total = 99 WHERE id = 1");
+        await settleVerify();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 1);
+    });
+
+    it("mode='on' fires verify after DELETE / MERGE / TRUNCATE", async () => {
+        // Three independent CachedClients — each sees one DML, each fires
+        // exactly one verify. Single-flight is per-client, not per-process.
+        for (const sql of [
+            'DELETE FROM orders WHERE id = 1',
+            'MERGE INTO orders USING staging ON true WHEN MATCHED THEN DO NOTHING',
+            'TRUNCATE TABLE orders',
+        ]) {
+            const client = smartVerifyMock();
+            const cache = makeConnectedCache();
+            const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+            await cached.query(sql);
+            await settleVerify();
+            const verifyCalls = client._calls.filter(c =>
+                typeof c.text === 'string'
+                && c.text.startsWith("SELECT name, setting FROM pg_settings")
+            );
+            assert.strictEqual(verifyCalls.length, 1, `verify fired for: ${sql}`);
+        }
+    });
+
+    it("mode='off' does NOT fire verify after DML", async () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'off' });
+        await cached.query('INSERT INTO orders VALUES (1)');
+        await settleVerify();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0,
+            "off mode skips post-DML verify entirely");
+    });
+
+    it("mode='auto' detects stateful triggers and enables verify on subsequent DML", async () => {
+        const client = smartVerifyMock({
+            dbName: 'auto_on',
+            hasStatefulTriggers: true,
+            sessionRows: [{ name: 'app.user_id', setting: '42' }],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'auto' });
+        // First DML races the detection probe — verify may not fire on
+        // this one. Wait for detection to resolve before issuing the
+        // second DML so the verdict is in.
+        await cached.query('INSERT INTO orders VALUES (1)');
+        await settleVerify();
+        // Detection should now be done and active=true.
+        assert.strictEqual(cached._aggressiveVerifyDetectionDone, true);
+        assert.strictEqual(cached._aggressiveVerifyActive, true);
+        // Second DML — verify must fire.
+        const callsBefore = client._calls.length;
+        await cached.query('INSERT INTO orders VALUES (2)');
+        await settleVerify();
+        const verifyCallsAfterSecond = client._calls.slice(callsBefore).filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCallsAfterSecond.length, 1,
+            'second DML triggers verify after detection completes');
+    });
+
+    it("mode='auto' detects no stateful triggers → no verify fires", async () => {
+        const client = smartVerifyMock({
+            dbName: 'auto_off',
+            hasStatefulTriggers: false,
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'auto' });
+        await cached.query('INSERT INTO orders VALUES (1)');
+        await settleVerify();
+        assert.strictEqual(cached._aggressiveVerifyActive, false);
+        // Run a second DML — no verify should fire.
+        const callsBefore = client._calls.length;
+        await cached.query('INSERT INTO orders VALUES (2)');
+        await settleVerify();
+        const verifyCallsAfterSecond = client._calls.slice(callsBefore).filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCallsAfterSecond.length, 0);
+    });
+
+    it("license override true skips detection and fires verify on first DML", async () => {
+        const client = smartVerifyMock({
+            sessionRows: [{ name: 'app.user_id', setting: '99' }],
+        });
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, {
+            aggressiveVerify: 'auto',
+            aggressiveVerifyActive: true,  // license says: always on
+        });
+        await cached.query('INSERT INTO orders VALUES (1)');
+        await settleVerify();
+        // No detection probe should ever run — license bypassed it.
+        const detectionCalls = client._calls.filter(c =>
+            typeof c.text === 'string' && c.text.includes('FROM pg_trigger')
+        );
+        assert.strictEqual(detectionCalls.length, 0,
+            'license override skips detection entirely');
+        // Verify ran.
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 1);
+    });
+
+    it("does not fire verify on plain SELECT (read path)", async () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+        await cached.query('SELECT * FROM orders');
+        await settleVerify();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0,
+            'reads do not need post-call verify');
+    });
+
+    it("does not fire verify mid-transaction (uncommitted state)", async () => {
+        const client = smartVerifyMock();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+        await cached.query('BEGIN');
+        await cached.query('INSERT INTO orders VALUES (1)');
+        await settleVerify();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 0,
+            'mid-tx verify would see uncommitted state — suppressed');
+        await cached.query('COMMIT');
+    });
+
+    it("does not fire verify on a write that throws", async () => {
+        const client = {
+            async query(text) {
+                if (typeof text === 'string' && text.startsWith('INSERT')) {
+                    throw new Error('FK violation');
+                }
+                return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+            },
+            end: async () => {},
+            on: () => {}, off: () => {}, once: () => {},
+        };
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+        await assert.rejects(() => cached.query('INSERT INTO orders VALUES (1)'));
+        await settleVerify();
+        // No verify scheduled — the write didn't succeed, so there's
+        // nothing for a trigger to have mutated.
+        // (Note: post-Wave-2 the wrapper still marks _dirty after a
+        // failed write with pending ops, but a lone INSERT has no
+        // pending ops, so dirty stays false too.)
+        assert.strictEqual(cached._dirty, false);
+    });
+
+    it("post-DML verify is single-flight (back-to-back DMLs do not stack)", async () => {
+        // Two DMLs in quick succession; only one verify should be in
+        // flight at a time — the second DML sees the in-flight token
+        // and skips scheduling a redundant probe.
+        let pendingResolve;
+        const client = {
+            async query(text) {
+                if (typeof text === 'string'
+                    && text.startsWith("SELECT name, setting FROM pg_settings")) {
+                    return new Promise((resolve) => { pendingResolve = resolve; });
+                }
+                return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+            },
+            end: async () => {},
+            on: () => {}, off: () => {}, once: () => {},
+            _calls: [],
+        };
+        const origQuery = client.query;
+        client.query = async function(text, values) {
+            client._calls.push({ text, values });
+            return origQuery.call(this, text, values);
+        };
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache, { aggressiveVerify: 'on' });
+        await cached.query('INSERT INTO orders VALUES (1)');
+        await cached.query('INSERT INTO orders VALUES (2)');
+        // Wait microtasks but DON'T resolve the first verify yet.
+        await settleVerify();
+        const verifyCalls = client._calls.filter(c =>
+            typeof c.text === 'string'
+            && c.text.startsWith("SELECT name, setting FROM pg_settings")
+        );
+        assert.strictEqual(verifyCalls.length, 1,
+            'single-flight: second DML reuses the in-flight verify');
+        // Tidy up — let the dangling verify resolve so we don't leak.
+        pendingResolve({ rows: [], fields: [], rowCount: 0, command: 'SELECT' });
+        await settleVerify();
+    });
+});
+
+describe('smart aggressive-verify — _setWrapDefaults plumbing', () => {
+    afterEach(() => {
+        _resetSmartVerifyCache();
+        // Reset defaults so subsequent tests see the un-customized state.
+        _setWrapDefaults({});
+    });
+
+    it("wrap() honors defaults registered by _setWrapDefaults", () => {
+        _setWrapDefaults({ aggressiveVerify: 'on' });
+        const client = smartVerifyMock();
+        makeConnectedCache();
+        const wrapped = wrap(client, 9999);
+        // wrap()'s default is 'auto'; defaults push it to 'on' here.
+        assert.strictEqual(wrapped._aggressiveVerifyMode, 'on');
+        assert.strictEqual(wrapped._aggressiveVerifyActive, true);
+    });
+
+    it("per-call wrap() options win over _setWrapDefaults", () => {
+        _setWrapDefaults({ aggressiveVerify: 'on' });
+        const client = smartVerifyMock();
+        makeConnectedCache();
+        const wrapped = wrap(client, 9999, { aggressiveVerify: 'off' });
+        assert.strictEqual(wrapped._aggressiveVerifyMode, 'off');
+        assert.strictEqual(wrapped._aggressiveVerifyActive, false);
+    });
+
+    it("license override flows through _setWrapDefaults", () => {
+        _setWrapDefaults({ aggressiveVerify: 'auto', aggressiveVerifyActive: true });
+        const client = smartVerifyMock();
+        makeConnectedCache();
+        const wrapped = wrap(client, 9999);
+        assert.strictEqual(wrapped._aggressiveVerifyActive, true);
+        assert.strictEqual(wrapped._aggressiveVerifyDetectionDone, true,
+            'license override skips detection at the wrap layer too');
     });
 });

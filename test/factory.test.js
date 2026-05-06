@@ -789,3 +789,48 @@ describe('default export symmetry', () => {
             `named exports missing from default: ${JSON.stringify(missing)}`);
     });
 });
+
+// ─── GoldLapel: aggressiveVerify constructor option ───────────────────────
+
+describe('GoldLapel — aggressiveVerify option', () => {
+    it("default is 'auto' and 'aggressiveVerifyActive' is null", () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        assert.strictEqual(gl._aggressiveVerify, 'auto');
+        assert.strictEqual(gl._aggressiveVerifyActive, null);
+    });
+
+    it("accepts 'on' / 'off' / 'auto'", () => {
+        for (const mode of ['on', 'off', 'auto']) {
+            const gl = new GoldLapel('postgresql://localhost:5432/mydb', { aggressiveVerify: mode });
+            assert.strictEqual(gl._aggressiveVerify, mode);
+        }
+    });
+
+    it("rejects invalid aggressiveVerify mode", () => {
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', { aggressiveVerify: 'maybe' }),
+            /aggressiveVerify must be one of/
+        );
+    });
+
+    it("aggressiveVerifyActive=true is stored as true", () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            aggressiveVerifyActive: true,
+        });
+        assert.strictEqual(gl._aggressiveVerifyActive, true);
+    });
+
+    it("aggressiveVerifyActive=false is stored as false", () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            aggressiveVerifyActive: false,
+        });
+        assert.strictEqual(gl._aggressiveVerifyActive, false);
+    });
+
+    it("non-boolean aggressiveVerifyActive resolves to null (no override)", () => {
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
+            aggressiveVerifyActive: 'yes', // truthy but not boolean — ignored
+        });
+        assert.strictEqual(gl._aggressiveVerifyActive, null);
+    });
+});
