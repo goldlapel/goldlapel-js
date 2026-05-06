@@ -1,8 +1,12 @@
 import {
     NativeCache, detectWrite, DDL_SENTINEL, TX_START, TX_END,
-    ConnectionGucState, splitStatements,
+    ConnectionGucState, splitStatements, parseSetCommand,
     isUnsafeGuc,
 } from './cache.js';
+
+// Distinguish ROLLBACK (revert) from COMMIT/END (persist) — both match
+// TX_END but only ROLLBACK rolls back any SETs that ran inside the tx.
+const TX_ROLLBACK = /^\s*ROLLBACK\b/i;
 
 // Postgres response `command` strings that signal a session-state /
 // control-flow command rather than a cacheable read. Caching their
@@ -85,52 +89,83 @@ function detectWritesMulti(sql) {
     return tables.size > 0 ? tables : null;
 }
 
-// Multi-statement-aware transaction-boundary classification. A single Q
-// message like `BEGIN; INSERT INTO t VALUES (1); COMMIT` opens AND closes
-// a transaction server-side, but the pre-fix first-token check
-// (`TX_START.test(sql)`) only saw `BEGIN` and left the wrapper stuck
-// thinking it was still in a tx — so subsequent reads bypassed the cache
-// forever (or until a fresh BEGIN/COMMIT cycle reset state). The fix
-// walks every segment and applies the boundary that segment carries, so
-// the wrapper's final tx flag matches what the server actually did.
+// Walk a SQL body and build a list of state-mutation operations to apply
+// AFTER the server confirms execution. Each op is one of:
+//   { kind: 'begin' }                — push tx snapshot, _inTransaction=true
+//   { kind: 'commit' }               — discard snapshot, _inTransaction=false
+//   { kind: 'rollback' }             — restore snapshot, _inTransaction=false
+//   { kind: 'set',  cmd: parsedSet } — apply parsed SET / RESET / DISCARD
 //
-// Returns:
-//   - true   if the body contains at least one tx-boundary segment
-//            (caller bypasses the cache read path; the body is dispatched
-//            to the real client and tx state has been updated in place)
-//   - false  if no segment is a tx boundary (caller proceeds normally)
+// Order matches segment order in the SQL — replayed in order on success
+// so a body like `BEGIN; SET app.user_id='42'; COMMIT` snapshots THEN
+// applies the SET THEN discards the snapshot, matching the server's
+// post-COMMIT state.
 //
-// Single-statement bodies (no inner `;`) skip the splitter — the existing
-// TX_START / TX_END regex check is sufficient and the hot path is hot.
-function applyTxBoundaries(sql, client) {
-    if (typeof sql !== 'string' || sql.length === 0) return false;
-    // Fast path: no inner `;` → single-statement, original first-token check.
+// `hasTxBoundary` is true iff any segment is BEGIN/COMMIT/ROLLBACK/END —
+// the caller uses this to decide whether to bypass the cache read path
+// for THIS query (tx-boundary statements are never cacheable). It does
+// NOT mutate `_inTransaction` or `_gucState`; the deferred-apply call
+// site does that on response confirmation.
+//
+// Wave 2 (2026-05-05): replaces the eager-mutate `applyTxBoundaries` and
+// the eager `observeSql` call. Pre-fix, both ran BEFORE `_real.query`,
+// which meant a failed SET (server rejects the statement) left the
+// wrapper's hash diverged from server-side state. Now nothing mutates
+// until `_real.query` resolves successfully.
+function _buildPendingOps(sql) {
+    if (typeof sql !== 'string' || sql.length === 0) {
+        return { ops: [], hasTxBoundary: false };
+    }
+    const ops = [];
+    let hasTxBoundary = false;
+    // Fast path: no inner `;` → single-statement body. Skip the splitter.
     const trimmed = sql.trimEnd().replace(/;+$/, '');
-    if (!trimmed.includes(';')) {
-        if (TX_START.test(sql)) {
-            client._inTransaction = true;
-            return true;
-        }
-        if (TX_END.test(sql)) {
-            client._inTransaction = false;
-            return true;
-        }
-        return false;
-    }
-    // Multi-statement body: walk segments, update tx state per-segment.
-    // Final state reflects the last tx-boundary segment in execution
-    // order, mirroring how the server processes the Q message.
-    let touched = false;
-    for (const seg of splitStatements(sql)) {
+    const segments = trimmed.includes(';') ? splitStatements(sql) : [sql];
+    for (const seg of segments) {
         if (TX_START.test(seg)) {
-            client._inTransaction = true;
-            touched = true;
-        } else if (TX_END.test(seg)) {
-            client._inTransaction = false;
-            touched = true;
+            ops.push({ kind: 'begin' });
+            hasTxBoundary = true;
+            continue;
+        }
+        if (TX_END.test(seg)) {
+            ops.push({ kind: TX_ROLLBACK.test(seg) ? 'rollback' : 'commit' });
+            hasTxBoundary = true;
+            continue;
+        }
+        // Not a tx-boundary segment — try parsing it as a SET / RESET /
+        // DISCARD / set_config(). Non-matching segments contribute no op.
+        const cmd = parseSetCommand(seg);
+        if (cmd) ops.push({ kind: 'set', cmd });
+    }
+    return { ops, hasTxBoundary };
+}
+
+// Replay a pending-ops list on the given CachedClient, mutating
+// `_inTransaction` and `_gucState` to reflect the server's confirmed
+// state. Called from the success branch of a `_real.query` await.
+function _commitPendingOps(client, ops) {
+    if (!Array.isArray(ops) || ops.length === 0) return;
+    for (const op of ops) {
+        switch (op.kind) {
+            case 'begin':
+                client._gucState.beginTx();
+                client._inTransaction = true;
+                break;
+            case 'commit':
+                client._gucState.commitTx();
+                client._inTransaction = false;
+                break;
+            case 'rollback':
+                client._gucState.rollbackTx();
+                client._inTransaction = false;
+                break;
+            case 'set':
+                client._gucState.apply(op.cmd);
+                break;
+            default:
+                break;
         }
     }
-    return touched;
 }
 
 let _cache = null;
@@ -397,22 +432,25 @@ class CachedClient {
             await this._runVerify();
         }
 
-        // GUC state observation. Runs on every query before any
-        // transaction / write / read branching: a `SET app.user_id =
-        // '42'` shifts the hash, so the very next SELECT must key
-        // against the new hash. Cheap on the hot path — fast-path
-        // single-statement queries skip the splitter entirely.
-        if (typeof sql === 'string' && sql.length > 0) {
-            this._gucState.observeSql(sql);
-        }
+        // Build the pending state-mutation op list (SET / RESET / DISCARD
+        // / set_config + tx snapshots for BEGIN/COMMIT/ROLLBACK). NOTHING
+        // is applied yet — we wait for `_real.query` to confirm the
+        // server actually executed the body. Pre-Wave-2, this was an
+        // eager `observeSql` + `applyTxBoundaries` pair; a failed SET
+        // would leave wrapper state diverged from server state. The
+        // deferred-apply contract: success → `_commitPendingOps`, error →
+        // discard the op list and mark `_dirty=true` so the next query
+        // reconciles from `pg_settings`.
+        const { ops: pendingOps, hasTxBoundary } = _buildPendingOps(sql);
 
         // Detect top-level `SELECT <ident>(...)` shape in the original
         // SQL — opaque function calls may SET unsafe GUCs internally
         // (the wire layer can't see the SET). Schedule an async verify
         // AFTER the user's query completes; outcome updates the state
         // map without ever blocking the user's hot path.
-        // Single-statement set_config(...) calls were already applied
-        // by observeSql above and don't need a follow-up verify.
+        // Single-statement set_config(...) calls were already captured
+        // as pendingOps and will commit on success — no follow-up
+        // verify needed for those.
         const needsVerify = _containsOpaqueFunctionCall(sql);
 
         // Multi-statement-aware write detection. Runs BEFORE transaction
@@ -423,6 +461,10 @@ class CachedClient {
         // would never invalidate the `orders` cache slot. Same gap fixed
         // for `SET app.tenant = 'x'; INSERT INTO t ...` (SET hides the
         // INSERT from detectWrite's single-token shape).
+        //
+        // Invalidation runs eagerly even though the SQL hasn't run yet:
+        // a failed write doesn't leave the cache stale (it just makes
+        // the next read miss → re-fetch), so eager invalidation is safe.
         const writeTables = detectWritesMulti(sql);
         if (writeTables !== null) {
             if (writeTables === DDL_SENTINEL) {
@@ -432,33 +474,16 @@ class CachedClient {
             }
         }
 
-        // Transaction tracking. Walks every segment in multi-statement
-        // bodies so a Q like `BEGIN; INSERT INTO t VALUES (1); COMMIT`
-        // ends with `_inTransaction=false` — matching the server, which
-        // ran the COMMIT. Pre-fix, only the leading BEGIN was seen and
-        // the wrapper stayed stuck thinking a tx was open, bypassing the
-        // cache for every subsequent read until the next BEGIN/COMMIT
-        // pair reset state. Single-statement bodies skip the splitter.
-        if (applyTxBoundaries(sql, this)) {
-            const r = await this._real.query(textOrConfig, values);
-            if (needsVerify) this._scheduleVerify();
-            return r;
-        }
-
-        // If this was a single-statement write, we've already invalidated
-        // and now just dispatch to the real client without going through
-        // the read path. Multi-statement bodies that contain writes
-        // alongside SELECTs are uncacheable (extractTables on the joined
-        // SQL would index against the wrong slot), so they also exit here.
-        if (writeTables !== null) {
-            const r = await this._real.query(textOrConfig, values);
-            if (needsVerify) this._scheduleVerify();
-            return r;
-        }
-
-        // Inside transaction: bypass cache
-        if (this._inTransaction) {
-            const r = await this._real.query(textOrConfig, values);
+        // Tx-boundary, write, or already-inside-tx → bypass the cache
+        // read path and dispatch straight to the real client. Each path
+        // uses `_runRealQuery` which awaits `_real.query` and then either
+        // commits the pending ops (success) or discards + marks dirty
+        // (error). Tx-boundary bodies (BEGIN/COMMIT/ROLLBACK) are never
+        // cacheable; multi-statement bodies that contain writes are also
+        // uncacheable (extractTables on the joined SQL would index the
+        // wrong slot).
+        if (hasTxBoundary || writeTables !== null || this._inTransaction) {
+            const r = await this._runRealQuery(textOrConfig, values, pendingOps);
             if (needsVerify) this._scheduleVerify();
             return r;
         }
@@ -470,7 +495,10 @@ class CachedClient {
         const entry = this._cache.get(sql, params, stateHash);
         if (entry !== null) {
             // Cache hit — no _real.query ran, so no opaque function got
-            // a chance to mutate state. No verify needed.
+            // a chance to mutate state, and no SET could have been on
+            // the wire (cache hits are SELECTs, never SET commands —
+            // pendingOps is empty for a cacheable SELECT). No verify or
+            // op-commit needed.
             return {
                 rows: entry.rows,
                 fields: entry.fields,
@@ -479,8 +507,9 @@ class CachedClient {
             };
         }
 
-        // Cache miss: execute for real
-        const result = await this._real.query(textOrConfig, values);
+        // Cache miss: execute for real (and commit pending ops on
+        // success — though for a pure SELECT pendingOps is empty).
+        const result = await this._runRealQuery(textOrConfig, values, pendingOps);
 
         // Cache the result only if it's a real read response. Same state
         // hash gating as the get() above — the entry is keyed to the
@@ -501,6 +530,41 @@ class CachedClient {
         }
 
         if (needsVerify) this._scheduleVerify();
+        return result;
+    }
+
+    // Dispatch the user's query to the real client and, on success,
+    // commit any pending state-mutation ops (SET / RESET / DISCARD / tx
+    // boundary). On error: discard the ops AND mark `_dirty=true` so
+    // the next user query reconciles `_gucState` from `pg_settings`.
+    //
+    // The "discard + dirty" combo is conservative-correct: in a
+    // multi-statement body like `SET a; SET b; <other>`, when the server
+    // hits an error mid-batch, statements 1..N-1 already applied
+    // server-side but we can't tell from pg's single rejection which
+    // succeeded. Discarding all pendingOps + reconciling on the next
+    // query reads the canonical post-batch state out of `pg_settings`
+    // and rebuilds `_values` / `_hash` to match.
+    //
+    // This method ALWAYS re-throws the underlying error so the user's
+    // promise rejects exactly as pg would have rejected — wrapper-side
+    // bookkeeping is invisible to the caller.
+    async _runRealQuery(textOrConfig, values, pendingOps) {
+        let result;
+        try {
+            result = await this._real.query(textOrConfig, values);
+        } catch (err) {
+            // Server rejected the batch — never trust optimistic state.
+            // Mark dirty so the next query reconciles from pg_settings.
+            // Skip the dirty mark if the connection is closed (no
+            // recovery is possible; the next query won't run anyway).
+            if (!this._closed && pendingOps && pendingOps.length > 0) {
+                this._dirty = true;
+            }
+            throw err;
+        }
+        // Server confirmed — commit the pending ops in order.
+        _commitPendingOps(this, pendingOps);
         return result;
     }
 

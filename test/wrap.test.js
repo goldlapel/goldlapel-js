@@ -1295,3 +1295,289 @@ describe('verify-on-checkout (lazy fallback)', () => {
         assert.strictEqual(cached._gucState._values.get('app.user_id'), 'X');
     });
 });
+
+// ─── SET-actually-applied (Wave 2) ────────────────────────────────────────
+//
+// State-hash mutation is deferred until `_real.query` resolves. Failed
+// SETs (server rejects with ErrorResponse) MUST NOT shift the wrapper's
+// hash — pre-Wave-2 they did, leaving wrapper state diverged from server
+// state and causing cache leaks across user contexts (a SET that the
+// server rejected because of an ACL or syntax error would still
+// fragment the wrapper's cache as if it had succeeded).
+//
+// On error the wrapper discards pending mutations AND marks `_dirty=true`
+// so the next user query reconciles from `pg_settings` — conservative-
+// correct for multi-statement bodies where the server may have applied
+// some statements before erroring (we don't know how far it got, so we
+// reread the canonical state instead of guessing).
+
+function rejectingMockClient(rejectOn) {
+    // Mock client whose query rejects when the SQL contains `rejectOn`
+    // (substring match — easy to target a specific statement in a
+    // multi-statement body). Records every call so tests can assert
+    // call counts.
+    const calls = [];
+    return {
+        async query(text, values) {
+            calls.push({ text, values });
+            if (typeof text === 'string' && text.includes(rejectOn)) {
+                throw new Error(`server rejected: ${rejectOn}`);
+            }
+            return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+        },
+        connect: async () => {},
+        end: async () => {},
+        on: () => {}, off: () => {}, once: () => {},
+        _calls: calls,
+    };
+}
+
+describe('SET-actually-applied: state hash deferred until response confirms', () => {
+    it('successful SET shifts the hash (baseline behavior preserved)', async () => {
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        assert.strictEqual(cached._gucState.stateHash(), 0);
+        await cached.query("SET app.user_id = '42'");
+        assert.notStrictEqual(cached._gucState.stateHash(), 0,
+            'successful SET commits its mutation');
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42');
+    });
+
+    it('failed SET does NOT shift the hash and marks _dirty', async () => {
+        // Server rejects the SET (e.g. permission denied, syntax error).
+        // Wrapper must NOT apply the optimistic mutation — pre-fix the
+        // hash diverged from server-side state on every rejected SET.
+        const client = rejectingMockClient("SET app.user_id");
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await assert.rejects(
+            cached.query("SET app.user_id = '42'"),
+            /server rejected/,
+            'wrapper re-throws server rejection unchanged',
+        );
+        assert.strictEqual(cached._gucState.stateHash(), 0,
+            'rejected SET leaves the hash at baseline');
+        assert.strictEqual(cached._gucState._values.size, 0,
+            'rejected SET never enters the values map');
+        assert.strictEqual(cached._dirty, true,
+            'rejected mutation marks dirty for next-query reconcile');
+    });
+
+    it('failed RESET does NOT clear values (pre-RESET state preserved)', async () => {
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        // Establish state.
+        await cached.query("SET app.user_id = '42'");
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42');
+        // Now make the next call reject.
+        client.query = async (text, values) => {
+            if (typeof text === 'string' && text.includes('RESET')) {
+                throw new Error('server rejected RESET');
+            }
+            return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+        };
+        await assert.rejects(cached.query('RESET app.user_id'));
+        // Values map is unchanged — RESET never committed.
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42',
+            'rejected RESET leaves prior state intact');
+        assert.strictEqual(cached._dirty, true);
+    });
+
+    it('failed SET does not poison cache lookups for previously-set users', async () => {
+        // Two CachedClients on a shared cache. A populates under hash_A.
+        // B attempts to SET hash_B but the server rejects. B must NOT be
+        // able to read A's cached row (pre-fix: B's hash optimistically
+        // mutated to hash_B, would key against hash_B for lookup, miss
+        // cache → real query — fine. But if instead the test were
+        // reversed [SET fails on A], A would see baseline hash and could
+        // read across context). Here we focus on the simpler case: the
+        // failed SET leaves B's hash unchanged from baseline.
+        const clientA = mockClient({
+            rows: [{ id: 'A-row' }], fields: [{ name: 'id' }],
+            rowCount: 1, command: 'SELECT',
+        });
+        const clientB = rejectingMockClient("SET app.user_id");
+        const cache = makeConnectedCache();
+        const cachedA = new CachedClient(clientA, cache);
+        const cachedB = new CachedClient(clientB, cache);
+
+        await cachedA.query("SET app.user_id = 'A'");
+        await cachedA.query('SELECT * FROM accounts');
+
+        // B's SET fails — its hash stays at 0 (baseline).
+        await assert.rejects(cachedB.query("SET app.user_id = 'B'"));
+        assert.strictEqual(cachedB._gucState.stateHash(), 0);
+        assert.strictEqual(cachedB._dirty, true);
+    });
+
+    it('multi-statement: failed batch discards ALL pending mutations', async () => {
+        // `SET a; SET b; <broken>` — server may have applied SET a + b
+        // before erroring on the third statement, but we can't tell from
+        // pg's single rejection. Discard everything + mark dirty so the
+        // next query reconciles from pg_settings.
+        const client = rejectingMockClient("SELECT broken_thing");
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await assert.rejects(
+            cached.query("SET app.user_id = '42'; SET app.tenant = 'acme'; SELECT broken_thing()"),
+        );
+        assert.strictEqual(cached._gucState._values.size, 0,
+            'no pending mutation commits on a rejected batch');
+        assert.strictEqual(cached._gucState.stateHash(), 0);
+        assert.strictEqual(cached._dirty, true,
+            'dirty mark triggers pg_settings reconcile on next query');
+    });
+
+    it('multi-statement: successful batch commits SETs in segment order', async () => {
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query("SET app.user_id = '42'; SET app.tenant = 'acme'");
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42');
+        assert.strictEqual(cached._gucState._values.get('app.tenant'), 'acme');
+    });
+
+    it('connection error during SET marks dirty (no optimistic apply)', async () => {
+        // Network blip / connection torn down → query rejects with a
+        // generic Error. State must NOT shift — the server may never
+        // have processed the SET at all.
+        const client = {
+            async query() { throw new Error('ECONNRESET'); },
+            end: async () => {},
+            on: () => {}, off: () => {}, once: () => {},
+        };
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await assert.rejects(cached.query("SET app.user_id = '42'"));
+        assert.strictEqual(cached._gucState.stateHash(), 0);
+        assert.strictEqual(cached._dirty, true);
+    });
+
+    it('error on a non-SET query does NOT mark dirty (no pending ops)', async () => {
+        // A failed SELECT has no state-mutation ops to discard. Marking
+        // dirty would force a pointless pg_settings reconcile on every
+        // next query after any failed read — wasteful and noisy. Only
+        // mark dirty when there were pending mutations at risk.
+        const client = rejectingMockClient("SELECT * FROM");
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await assert.rejects(cached.query('SELECT * FROM users'));
+        assert.strictEqual(cached._dirty, false,
+            'failed read with no pending mutation does not need reconcile');
+    });
+});
+
+describe('SET-actually-applied: tx snapshot revert on ROLLBACK', () => {
+    it('BEGIN; SET; ROLLBACK reverts the SET to pre-tx state', async () => {
+        // Server-side: bare SET inside a tx reverts on ROLLBACK. The
+        // wrapper must mirror that — pre-fix, the SET's mutation
+        // committed at the SET statement and never reverted, leaving
+        // the wrapper's hash diverged from server-side state after the
+        // ROLLBACK.
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN');
+        await cached.query("SET app.user_id = '42'");
+        // Mid-tx, the wrapper has applied the SET (we want it visible to
+        // any read that runs in this tx — though the cache is bypassed
+        // mid-tx anyway).
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42');
+        await cached.query('ROLLBACK');
+        // Post-ROLLBACK: SET reverted, hash back to baseline.
+        assert.strictEqual(cached._gucState.stateHash(), 0,
+            'ROLLBACK restores pre-tx hash');
+        assert.ok(!cached._gucState._values.has('app.user_id'),
+            'ROLLBACK clears tx-scoped SET');
+    });
+
+    it('BEGIN; SET; COMMIT persists the SET (snapshot discarded)', async () => {
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN');
+        await cached.query("SET app.user_id = '42'");
+        await cached.query('COMMIT');
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42',
+            'COMMIT keeps tx-applied SET');
+        assert.notStrictEqual(cached._gucState.stateHash(), 0);
+    });
+
+    it('multi-statement BEGIN; SET; ROLLBACK in one Q reverts cleanly', async () => {
+        // The whole tx body is a single multi-statement Q-message. The
+        // wrapper must walk the segments, snapshot at BEGIN, apply SET,
+        // then restore from snapshot at ROLLBACK — all within one
+        // `_runRealQuery` success.
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query("BEGIN; SET app.user_id = '42'; ROLLBACK");
+        assert.strictEqual(cached._gucState.stateHash(), 0,
+            'inline ROLLBACK reverts the inline SET');
+        assert.strictEqual(cached._inTransaction, false);
+    });
+
+    it('multi-statement BEGIN; SET; COMMIT in one Q persists', async () => {
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query("BEGIN; SET app.user_id = '42'; COMMIT");
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42');
+        assert.strictEqual(cached._inTransaction, false);
+    });
+
+    it('SET outside tx + BEGIN; SET2; ROLLBACK reverts only the inner SET', async () => {
+        // The pre-tx SET should persist; only the SET inside the tx
+        // reverts. Snapshot was taken AFTER the first SET so the
+        // restore-on-rollback brings us back to (first SET applied).
+        const client = mockClient();
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query("SET app.user_id = '42'"); // outside tx — persists
+        const hashBeforeTx = cached._gucState.stateHash();
+        assert.notStrictEqual(hashBeforeTx, 0);
+
+        await cached.query('BEGIN');
+        await cached.query("SET app.user_id = '99'"); // inside tx — reverts
+        await cached.query('ROLLBACK');
+
+        // Outside-tx value is preserved.
+        assert.strictEqual(cached._gucState._values.get('app.user_id'), '42');
+        assert.strictEqual(cached._gucState.stateHash(), hashBeforeTx,
+            'hash restored to pre-BEGIN state');
+    });
+
+    it('failed SET inside tx does NOT add a snapshot frame', async () => {
+        // BEGIN succeeds → snapshot pushed. SET inside tx fails → no
+        // additional snapshot, no apply. ROLLBACK pops the BEGIN's
+        // snapshot. End state: no leaked snapshots, no leaked SETs,
+        // _dirty marked from the failed SET.
+        let stage = 0;
+        const client = {
+            async query(text) {
+                stage++;
+                // stage 1 = BEGIN, succeed
+                // stage 2 = SET, fail
+                // stage 3 = ROLLBACK, succeed
+                if (stage === 2) throw new Error('SET rejected');
+                return { rows: [], fields: [], rowCount: 0, command: 'SELECT' };
+            },
+            end: async () => {},
+            on: () => {}, off: () => {}, once: () => {},
+        };
+        const cache = makeConnectedCache();
+        const cached = new CachedClient(client, cache);
+        await cached.query('BEGIN');
+        assert.strictEqual(cached._gucState._txStack.length, 1);
+        await assert.rejects(cached.query("SET app.user_id = 'x'"));
+        // SET rejection sets dirty but doesn't add a snapshot frame.
+        assert.strictEqual(cached._gucState._txStack.length, 1,
+            'failed SET inside tx leaves snapshot stack at 1 frame');
+        assert.strictEqual(cached._dirty, true);
+        await cached.query('ROLLBACK');
+        assert.strictEqual(cached._gucState._txStack.length, 0,
+            'ROLLBACK pops the BEGIN snapshot');
+    });
+});

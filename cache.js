@@ -520,10 +520,29 @@ function parseSetCommand(sql) {
 // `stateHash` returns 0 for empty/baseline state — a fresh connection's
 // hash matches "no GUCs set" cache slots, which is exactly the correct
 // behavior (cache hits across connections that never SET any unsafe GUC).
+//
+// Wave 2 (2026-05-05) — SET-actually-applied: state mutation is split into
+// two phases. `parseSql()` returns parsed commands without applying them
+// (so the wrapper can run the query first); `applyParsed()` commits them
+// after the server confirms the SET took effect. Failed SETs (server
+// rejects with ErrorResponse) discard the pending commands without ever
+// touching `_values` / `_hash`, so wrapper state can never diverge from
+// server-side state on a failed mutation.
+//
+// Transaction snapshots (`beginTx` / `commitTx` / `rollbackTx`): bare
+// `SET` inside a transaction reverts on ROLLBACK server-side (only `SET
+// LOCAL` is special-cased — that's already a wrapper no-op). Snapshot
+// stack saves the pre-tx values + hash; ROLLBACK restores the snapshot,
+// COMMIT discards it.
 class ConnectionGucState {
     constructor() {
         this._values = new Map();
         this._hash = 0;
+        // Transaction snapshot stack — supports nested savepoint-like
+        // usage in the future, but for now BEGIN/COMMIT/ROLLBACK push +
+        // pop a single frame at a time. Each frame is `{values, hash}`
+        // captured at BEGIN.
+        this._txStack = [];
     }
 
     stateHash() {
@@ -584,22 +603,93 @@ class ConnectionGucState {
     // message containing `SET app.user_id = '42'; SELECT 1`) are split on
     // top-level `;` so callers don't have to. Returns true iff the hash
     // changed.
+    //
+    // Note (Wave 2): callers that need to defer mutation until after the
+    // server confirms the SET should use `parseSql()` + `applyParsed()`
+    // instead. `observeSql` is the eager-apply path and remains the right
+    // API for direct unit tests of state semantics, but it is no longer
+    // called from `wrap.js`'s `CachedClient.query()` hot path.
     observeSql(sql) {
         if (typeof sql !== 'string' || sql.length === 0) return false;
         const before = this._hash;
+        for (const cmd of this.parseSql(sql)) {
+            this.apply(cmd);
+        }
+        return this._hash !== before;
+    }
+
+    // Parse a SQL string into an array of recognised SET / RESET / DISCARD
+    // commands (and `SELECT set_config(...)` calls), WITHOUT applying any
+    // of them to `_values` / `_hash`. Multi-statement bodies are split on
+    // top-level `;`. Statements that don't match a SET-shape return
+    // nothing for that segment (so the array length reflects only
+    // recognised mutations — never a 1:1 mapping to the input statements).
+    //
+    // Used by the wrapper's deferred-mutation flow: parse before the real
+    // query runs, then `applyParsed()` only after the server confirms.
+    parseSql(sql) {
+        if (typeof sql !== 'string' || sql.length === 0) return [];
         // Fast path — most queries are single-statement bodies. Avoid the
         // splitter's allocation when there's no inner `;`.
         const trimmed = sql.trimEnd().replace(/;+$/, '');
         if (!trimmed.includes(';')) {
             const cmd = parseSetCommand(sql);
-            if (cmd) this.apply(cmd);
-        } else {
-            for (const stmt of splitStatements(sql)) {
-                const cmd = parseSetCommand(stmt);
-                if (cmd) this.apply(cmd);
-            }
+            return cmd ? [cmd] : [];
+        }
+        const out = [];
+        for (const stmt of splitStatements(sql)) {
+            const cmd = parseSetCommand(stmt);
+            if (cmd) out.push(cmd);
+        }
+        return out;
+    }
+
+    // Apply an array of pre-parsed commands (from `parseSql`) in order.
+    // Each command goes through the same `apply()` switch as the eager
+    // path, so safe-GUC filtering, SET LOCAL no-ops, RESET ALL clears,
+    // and DISCARD ALL handling are all consistent. Returns true iff the
+    // hash changed.
+    applyParsed(cmds) {
+        if (!Array.isArray(cmds) || cmds.length === 0) return false;
+        const before = this._hash;
+        for (const cmd of cmds) {
+            this.apply(cmd);
         }
         return this._hash !== before;
+    }
+
+    // ─── Transaction snapshots ────────────────────────────────────────────
+    //
+    // Server-side, `SET app.user_id = '42'` issued inside a transaction
+    // reverts on ROLLBACK and persists on COMMIT. The wrapper mirrors that
+    // by snapshotting state at BEGIN and restoring (or discarding) the
+    // snapshot at ROLLBACK / COMMIT. `SET LOCAL` is already a wrapper
+    // no-op so it's not in scope here — only bare `SET` mutations made
+    // during the open tx need to be reverted.
+    //
+    // The stack is per-instance; nested BEGINs (which Postgres treats as
+    // savepoints in some clients) push additional frames. ROLLBACK pops
+    // and restores; COMMIT pops and discards. Empty-stack ROLLBACK is a
+    // no-op (there was no tx to revert).
+
+    beginTx() {
+        this._txStack.push({
+            values: new Map(this._values),
+            hash: this._hash,
+        });
+    }
+
+    commitTx() {
+        // Discard the snapshot — current state IS the post-COMMIT state.
+        if (this._txStack.length > 0) this._txStack.pop();
+    }
+
+    rollbackTx() {
+        // Restore from snapshot — undoes any SETs that ran inside the tx.
+        if (this._txStack.length === 0) return;
+        const snap = this._txStack.pop();
+        this._values = snap.values;
+        this._hash = snap.hash;
     }
 
     _recomputeHash() {

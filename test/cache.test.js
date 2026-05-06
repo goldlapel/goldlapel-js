@@ -1801,3 +1801,117 @@ describe('isUnsafeGuc known-safe list', () => {
         assert.ok(KNOWN_SAFE_GUCS.has('lc_time'));
     });
 });
+
+// ─── ConnectionGucState — Wave 2 deferred-apply primitives ────────────────
+//
+// Direct unit tests for `parseSql` (parse without apply), `applyParsed`
+// (commit pre-parsed cmds), and the tx snapshot stack
+// (`beginTx`/`commitTx`/`rollbackTx`). These are the primitives the
+// wrapper layers on to defer state-hash mutation until the server
+// confirms each SET — see wrap.js Wave 2 commit for the integration.
+
+describe('ConnectionGucState.parseSql / applyParsed (deferred-apply)', () => {
+    it('parseSql returns parsed cmds without mutating state', () => {
+        const s = new ConnectionGucState();
+        const cmds = s.parseSql("SET app.user_id = '42'");
+        assert.strictEqual(s.stateHash(), 0,
+            'parseSql is non-mutating — hash stays at baseline');
+        assert.strictEqual(cmds.length, 1);
+        assert.strictEqual(cmds[0].kind, 'set');
+        assert.strictEqual(cmds[0].name, 'app.user_id');
+        assert.strictEqual(cmds[0].value, '42');
+    });
+
+    it('parseSql on multi-statement returns one cmd per recognised segment', () => {
+        const s = new ConnectionGucState();
+        const cmds = s.parseSql("SET app.user_id = '42'; SELECT 1; RESET app.user_id");
+        // SELECT 1 isn't a SET-shape, so only the SET + RESET appear.
+        assert.strictEqual(cmds.length, 2);
+        assert.strictEqual(cmds[0].kind, 'set');
+        assert.strictEqual(cmds[1].kind, 'reset');
+    });
+
+    it('parseSql on a pure SELECT returns an empty array', () => {
+        const s = new ConnectionGucState();
+        assert.deepStrictEqual(s.parseSql('SELECT * FROM users'), []);
+    });
+
+    it('applyParsed commits cmds and returns true iff hash changed', () => {
+        const s = new ConnectionGucState();
+        const cmds = s.parseSql("SET app.user_id = '42'");
+        const changed = s.applyParsed(cmds);
+        assert.strictEqual(changed, true);
+        assert.notStrictEqual(s.stateHash(), 0);
+        // Second apply with no-op cmds returns false.
+        assert.strictEqual(s.applyParsed([]), false);
+    });
+
+    it('applyParsed of safe-only cmds is a no-op', () => {
+        const s = new ConnectionGucState();
+        const cmds = s.parseSql("SET timezone = 'UTC'");
+        assert.strictEqual(s.applyParsed(cmds), false);
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('parseSql + applyParsed produces same end-state as observeSql', () => {
+        // Equivalence: deferred-apply path reaches the same hash as the
+        // eager path. Important because the only thing that should
+        // differ between the two is timing, not the resulting state.
+        const eager = new ConnectionGucState();
+        eager.observeSql("SET app.user_id = '42'; SET app.tenant = 'acme'");
+        const deferred = new ConnectionGucState();
+        const cmds = deferred.parseSql("SET app.user_id = '42'; SET app.tenant = 'acme'");
+        deferred.applyParsed(cmds);
+        assert.strictEqual(deferred.stateHash(), eager.stateHash());
+    });
+});
+
+describe('ConnectionGucState — tx snapshot stack', () => {
+    it('beginTx + rollbackTx restores pre-tx state', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const preTxHash = s.stateHash();
+        s.beginTx();
+        s.observeSql("SET app.user_id = '99'");
+        assert.notStrictEqual(s.stateHash(), preTxHash,
+            'mid-tx hash reflects the in-tx SET');
+        s.rollbackTx();
+        assert.strictEqual(s.stateHash(), preTxHash,
+            'rollback restores the snapshotted hash');
+        assert.strictEqual(s._values.get('app.user_id'), '42',
+            'rollback restores the snapshotted values');
+    });
+
+    it('beginTx + commitTx keeps in-tx mutations', () => {
+        const s = new ConnectionGucState();
+        s.beginTx();
+        s.observeSql("SET app.user_id = '42'");
+        s.commitTx();
+        assert.strictEqual(s._values.get('app.user_id'), '42');
+        assert.strictEqual(s._txStack.length, 0,
+            'commitTx pops the snapshot frame');
+    });
+
+    it('rollbackTx with empty stack is a no-op (no throw)', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const before = s.stateHash();
+        // No beginTx → empty stack. Should not throw, should not mutate.
+        s.rollbackTx();
+        assert.strictEqual(s.stateHash(), before);
+    });
+
+    it('nested begin/commit + begin/rollback handles each frame independently', () => {
+        const s = new ConnectionGucState();
+        s.beginTx();
+        s.observeSql("SET app.user_id = '1'");
+        s.commitTx();
+        // Outer 'commit' kept it.
+        assert.strictEqual(s._values.get('app.user_id'), '1');
+        s.beginTx();
+        s.observeSql("SET app.user_id = '2'");
+        s.rollbackTx();
+        // Inner rollback reverted the second SET back to '1'.
+        assert.strictEqual(s._values.get('app.user_id'), '1');
+    });
+});
