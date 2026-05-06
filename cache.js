@@ -225,20 +225,13 @@ function _parseSetConfigCall(sql) {
     const valueRaw = args[1].trim();
     const isLocalRaw = args[2].trim();
 
-    // The first arg is a string literal containing the GUC name; the
-    // wrapper requires it (PG also accepts an expression but tracking
-    // expressions accurately is out of scope — Option Y v1 limitation).
+    // The first arg MUST be a string literal containing the GUC name —
+    // PG also accepts an expression there, but evaluating expressions
+    // accurately is out of scope (Option Y v1 limitation). Detect the
+    // literal case by checking that quote-stripping actually peeled
+    // something; bare-identifier args are rejected.
     const nameStripped = _stripValueQuotes(nameRaw);
-    if (nameStripped.length === 0 || nameStripped === nameRaw) {
-        // The name MUST have been a string literal (stripping changed
-        // something). If the raw and stripped values are identical it
-        // was a bare expression — we can't trust it.
-        if (nameStripped !== nameRaw) {
-            // stripping did happen, ok
-        } else {
-            return null;
-        }
-    }
+    if (nameStripped === nameRaw || nameStripped.length === 0) return null;
     const name = _normalizeGucName(nameStripped);
     if (!name) return null;
 

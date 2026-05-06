@@ -1,7 +1,7 @@
 import {
     NativeCache, detectWrite, DDL_SENTINEL, TX_START, TX_END,
     ConnectionGucState, splitStatements,
-    isUnsafeGuc, parseSetCommand,
+    isUnsafeGuc,
 } from './cache.js';
 
 // Postgres response `command` strings that signal a session-state /
