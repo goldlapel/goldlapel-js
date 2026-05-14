@@ -538,15 +538,54 @@ class ConnectionGucState {
     constructor() {
         this._values = new Map();
         this._hash = 0;
+        // Monotonic counter bumped by `_bumpDmlSeq()` after every observed
+        // DML when aggressive-verify is active. Folded into the state
+        // hash so each post-DML read on this connection produces a fresh
+        // cache slot — closes the trigger-internal-SET correctness gap:
+        // a server-side trigger that did `SET app.user_id = ...` would
+        // otherwise be invisible to the wire-side state observer, and a
+        // cached pre-DML response could be served under stale state.
+        //
+        // Reset to 0 whenever the rest of the state is wiped (RESET ALL /
+        // DISCARD ALL) so a recycled connection re-converges to a
+        // peer-shareable baseline. Matches the proxy's `dml_seq` field
+        // (see `src/guc_state.rs` ConnectionGucState::dml_seq).
+        this._dmlSeq = 0;
         // Transaction snapshot stack — supports nested savepoint-like
         // usage in the future, but for now BEGIN/COMMIT/ROLLBACK push +
-        // pop a single frame at a time. Each frame is `{values, hash}`
-        // captured at BEGIN.
+        // pop a single frame at a time. Each frame is `{values, hash,
+        // dmlSeq}` captured at BEGIN — the `dmlSeq` save mirrors the
+        // values save so a ROLLBACK undoing tx-internal SETs also undoes
+        // tx-internal post-DML bumps (a server-side ROLLBACK reverts
+        // both).
         this._txStack = [];
     }
 
     stateHash() {
         return this._hash;
+    }
+
+    // Bump the post-DML sequence counter so the next cache-key
+    // computation on this connection produces a fresh slot. Called from
+    // `CachedClient.query()` after every confirmed
+    // INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL when aggressive-verify is
+    // active. The bump means any subsequent cacheable read on this
+    // connection cannot share a slot with a pre-DML read from this same
+    // connection — closing the trigger-internal-SET correctness gap.
+    //
+    // This is the v1 mitigation: cache-key isolation, not observation of
+    // the trigger-applied GUC values. The server always knows its own
+    // session state and returns correct rows from `_real.query`; the
+    // wrapper just guarantees the cache can't hand back a stale response
+    // keyed on the pre-trigger state.
+    _bumpDmlSeq() {
+        // JS numbers are double-precision floats; integer-safe up to
+        // 2^53. Wrap at 2^32 to stay in 32-bit unsigned territory (same
+        // domain as `_fnv1a32`'s output) — a connection issuing 4B DMLs
+        // would wrap, and post-wrap collisions with the same `_values`
+        // are statistically irrelevant.
+        this._dmlSeq = (this._dmlSeq + 1) >>> 0;
+        this._recomputeHash();
     }
 
     // Apply a parsed SET / RESET / DISCARD command. No-op for SetLocal
@@ -580,9 +619,14 @@ class ConnectionGucState {
                 // including custom unsafe GUCs. Treat as RESET ALL for
                 // hash purposes. (DISCARD ALL also drops temp tables,
                 // prepared plans, and listen channels — all out of scope
-                // for the GUC state hash.)
-                if (this._values.size > 0) {
+                // for the GUC state hash.) Also resets `_dmlSeq` to 0
+                // so a recycled connection rejoins the peer-shareable
+                // baseline (otherwise a returned-to-pool conn with a
+                // non-zero seq would never collide with a fresh peer's
+                // cache slots).
+                if (this._values.size > 0 || this._dmlSeq !== 0) {
                     this._values.clear();
+                    this._dmlSeq = 0;
                     this._recomputeHash();
                 }
                 break;
@@ -676,6 +720,7 @@ class ConnectionGucState {
         this._txStack.push({
             values: new Map(this._values),
             hash: this._hash,
+            dmlSeq: this._dmlSeq,
         });
     }
 
@@ -685,15 +730,21 @@ class ConnectionGucState {
     }
 
     rollbackTx() {
-        // Restore from snapshot — undoes any SETs that ran inside the tx.
+        // Restore from snapshot — undoes any SETs AND any post-DML
+        // sequence bumps that ran inside the tx (server-side ROLLBACK
+        // reverts both).
         if (this._txStack.length === 0) return;
         const snap = this._txStack.pop();
         this._values = snap.values;
         this._hash = snap.hash;
+        this._dmlSeq = snap.dmlSeq;
     }
 
     _recomputeHash() {
-        if (this._values.size === 0) {
+        // Empty values + zero dml_seq is the canonical "fresh
+        // connection" state — keep the hash exactly 0 so cache-slot-
+        // sharing across "no SETs, no DMLs yet" peers stays intact.
+        if (this._values.size === 0 && this._dmlSeq === 0) {
             this._hash = 0;
             return;
         }
@@ -704,12 +755,19 @@ class ConnectionGucState {
         // Build a single canonical buffer string. \x1f (ASCII unit
         // separator) and \x1e (record separator) keep value boundaries
         // unambiguous so `name=foo, value=bar:` and `name=foo:bar, value=`
-        // can never collide.
+        // can never collide. `_dmlSeq` is appended as a record so two
+        // states with identical SETs but different seqs hash to
+        // different slots.
         let buf = '';
         for (const k of keys) {
             buf += k;
             buf += '\x1f';
             buf += this._values.get(k);
+            buf += '\x1e';
+        }
+        if (this._dmlSeq !== 0) {
+            buf += '\x1f';
+            buf += String(this._dmlSeq);
             buf += '\x1e';
         }
         this._hash = _fnv1a32(buf);

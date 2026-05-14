@@ -1866,6 +1866,111 @@ describe('ConnectionGucState.parseSql / applyParsed (deferred-apply)', () => {
     });
 });
 
+// ─── _dmlSeq: post-DML cache-key bump ──────────────────────────────────────
+//
+// `_bumpDmlSeq()` increments a per-connection counter folded into the
+// state hash. Each call produces a fresh slot so a server-side trigger
+// that mutated session GUCs can't leak a stale cached response to the
+// next read. RESET ALL / DISCARD ALL resets the counter back to 0 so a
+// recycled connection rejoins the peer-shareable baseline.
+
+describe('ConnectionGucState — _dmlSeq', () => {
+    it('starts at 0; bump moves the hash off baseline', () => {
+        const s = new ConnectionGucState();
+        assert.strictEqual(s._dmlSeq, 0);
+        assert.strictEqual(s.stateHash(), 0);
+        s._bumpDmlSeq();
+        assert.strictEqual(s._dmlSeq, 1);
+        assert.notStrictEqual(s.stateHash(), 0,
+            'bump rolls the cache key forward from baseline');
+    });
+
+    it('successive bumps produce distinct hashes', () => {
+        const s = new ConnectionGucState();
+        s._bumpDmlSeq();
+        const h1 = s.stateHash();
+        s._bumpDmlSeq();
+        const h2 = s.stateHash();
+        s._bumpDmlSeq();
+        const h3 = s.stateHash();
+        assert.notStrictEqual(h1, h2);
+        assert.notStrictEqual(h2, h3);
+        assert.notStrictEqual(h1, h3);
+    });
+
+    it('bump on a state with unsafe-GUCs changes the hash', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        const before = s.stateHash();
+        s._bumpDmlSeq();
+        assert.notStrictEqual(s.stateHash(), before,
+            'bump folds into the hash on top of any unsafe-GUC state');
+    });
+
+    it('DISCARD ALL resets _dmlSeq AND values back to baseline', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        s._bumpDmlSeq();
+        s._bumpDmlSeq();
+        assert.strictEqual(s._dmlSeq, 2);
+        assert.notStrictEqual(s.stateHash(), 0);
+        s.observeSql('DISCARD ALL');
+        assert.strictEqual(s._dmlSeq, 0,
+            'DISCARD ALL clears the post-DML sequence (recycled-conn baseline)');
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('RESET ALL resets _dmlSeq AND values back to baseline', () => {
+        const s = new ConnectionGucState();
+        s.observeSql("SET app.user_id = '42'");
+        s._bumpDmlSeq();
+        s.observeSql('RESET ALL');
+        assert.strictEqual(s._dmlSeq, 0);
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('DISCARD ALL with only a non-zero _dmlSeq resets to 0', () => {
+        // Edge case: no unsafe GUCs ever SET, but DMLs bumped the seq.
+        // DISCARD ALL must still reset the seq (otherwise a recycled
+        // connection inherits the predecessor's bump count and never
+        // rejoins the peer-shareable baseline).
+        const s = new ConnectionGucState();
+        s._bumpDmlSeq();
+        assert.notStrictEqual(s.stateHash(), 0);
+        s.observeSql('DISCARD ALL');
+        assert.strictEqual(s._dmlSeq, 0);
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('rollbackTx restores _dmlSeq alongside values', () => {
+        // Server-side, a ROLLBACK reverts DMLs that ran inside the tx.
+        // The wrapper's snapshot must capture _dmlSeq so a tx-internal
+        // bump (used by tests that simulate it directly) is undone on
+        // rollback. In production the wrapper suppresses mid-tx bumps,
+        // but the snapshot semantic should still be correct for parity
+        // with the proxy.
+        const s = new ConnectionGucState();
+        s.beginTx();
+        s._bumpDmlSeq();
+        s._bumpDmlSeq();
+        assert.strictEqual(s._dmlSeq, 2);
+        s.rollbackTx();
+        assert.strictEqual(s._dmlSeq, 0,
+            'rollback undoes tx-internal bumps');
+        assert.strictEqual(s.stateHash(), 0);
+    });
+
+    it('commitTx keeps _dmlSeq mutations (matches server-side persist)', () => {
+        const s = new ConnectionGucState();
+        s.beginTx();
+        s._bumpDmlSeq();
+        s.commitTx();
+        assert.strictEqual(s._dmlSeq, 1,
+            'commit keeps the bump');
+        assert.notStrictEqual(s.stateHash(), 0);
+    });
+});
+
 describe('ConnectionGucState — tx snapshot stack', () => {
     it('beginTx + rollbackTx restores pre-tx state', () => {
         const s = new ConnectionGucState();
