@@ -175,92 +175,40 @@ function _detectInvalidationPort() {
     return 7934;
 }
 
-// ─── Smart aggressive-verify auto-detection ───────────────────────────────
+// ─── Aggressive verify: always-on post-DML cache-key bump ────────────────
 //
-// "Aggressive verify" = schedule the same async post-call verify we already
-// fire on `SELECT <fn>(...)` (the stored-function SET case) after EVERY
-// successful INSERT/UPDATE/DELETE/MERGE/TRUNCATE. This closes the
-// trigger-internal-SET hole filed in
-// `goldlapel/docs/todos/aggressive-verify-flag.md`: a server-side trigger
-// that mutates session state on DML — the wire layer never sees the SET
-// directly. The verify reconciles `_gucState` from `pg_settings` after the
-// write so subsequent reads on the same conn use the right cache slot.
+// "Aggressive verify" = bump the per-connection `_dmlSeq` after every
+// successful INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL so any subsequent
+// cacheable read on this connection lands on a fresh cache slot. This
+// closes the trigger-internal-SET hole filed in
+// `goldlapel/docs/todos/aggressive-verify-flag.md`: a server-side
+// trigger that did `SET app.user_id = ...` would otherwise be invisible
+// to the wire-side state observer, and a cached pre-DML response could
+// be served under stale state.
 //
-// Smart-auto: rather than force every customer to think about whether their
-// schema has stateful triggers, on the first query against a database we
-// fire a single detection probe that asks Postgres "do any of your triggers
-// look like they call SET / set_config(...)?" The probe is a single round
-// trip; the result is cached per-database for the life of the process.
+// Default is always-on (modes `'auto'`/`'on'`): the bump is one integer
+// increment + hash recompute, no network round-trip, ~microseconds.
+// `'off'` opt-out is offered for users who explicitly want pre-bump
+// behavior (e.g. measured-clean schemas with no stateful triggers); we
+// log a warning so it shows up in operator output.
 //
-//   Mode 'auto' (default):
-//     - First query → fire detection probe in the background.
-//     - If probe says "yes, you have stateful triggers" → enable verify.
-//     - If probe says "no" or fails → leave it off.
-//   Mode 'on'  → skip probe, always-on. Customer opt-in for paranoid mode.
-//   Mode 'off' → skip probe, always-off. Customer opt-out.
-//
-//   `aggressiveVerifyActive` (third option, optional) — license-payload
-//   override. If the license payload says `aggressive_verify_active=true`
-//   (HQ has decided this customer always wants it on, e.g. compliance
-//   tier), we honor that and skip detection entirely. `false` skips
-//   detection and forces off. `null`/`undefined` → fall through to mode.
-//
-// Per-database cache key: we use the `current_database()` reply because
-// the wrapper's `_cache` singleton is process-scoped and may be shared
-// across multiple connections to multiple databases (uncommon but
-// possible — distinct CachedClients with distinct underlying clients).
-// Caching by db name keeps the probe firing once per logical database.
+// `aggressiveVerifyActive` (license-payload override): when `true`/
+// `false`, hard-forces on/off and skips the mode flag entirely. The
+// wrapper itself doesn't parse the license file; HQ-driven flows
+// pass the resolved boolean here.
 
 const VALID_AGGRESSIVE_VERIFY_MODES = new Set(['auto', 'on', 'off']);
 
-// Detection probe — one round trip. Looks for triggers on user-schema
-// tables whose function bodies contain `SET ` or `set_config(` patterns.
-// Excludes pg_catalog / information_schema / GoldLapel's own
-// `_goldlapel` schema (no false positives from our own DDL).
-//
-// `prosrc ~* '\mset_config\s*\('` — case-insensitive Postgres regex with
-// `\m` word-boundary for the function-form SET. The second alternation
-// (`\mset\s+(local\s+)?<ident>\s*(=|to)\s`) catches statement-form SETs
-// inside trigger bodies — `SET app.user_id = ...`, `SET LOCAL x TO 'y'`
-// — without false-matching SETOF / SETTING / SETUP (the `\s+` after
-// `set` means a real keyword, not a prefix).
-//
-// `tgisinternal = false` filters out PG-managed triggers (FK constraint
-// triggers, etc.). The probe returns a single boolean row: true iff at
-// least one user trigger function body matches. Conservative — bias
-// toward enabling verify when in doubt; the cost of a false positive is
-// ~1ms per write, the cost of a false negative is silent cache stale-
-// ness on RLS rows.
-const _DETECTION_SQL = `
-SELECT EXISTS (
-    SELECT 1
-    FROM pg_trigger t
-    JOIN pg_proc p ON p.oid = t.tgfoid
-    JOIN pg_class c ON c.oid = t.tgrelid
-    JOIN pg_namespace tn ON tn.oid = c.relnamespace
-    JOIN pg_namespace pn ON pn.oid = p.pronamespace
-    WHERE t.tgisinternal = false
-      AND tn.nspname NOT IN ('pg_catalog', 'information_schema', '_goldlapel')
-      AND pn.nspname NOT IN ('pg_catalog', 'information_schema')
-      AND (
-          p.prosrc ~* '\\mset_config\\s*\\('
-          OR p.prosrc ~* '\\mset\\s+(local\\s+)?[a-z_][a-z0-9_.]*\\s*(=|to)\\s'
-      )
-) AS has_stateful_triggers
-`.trim();
+// Process-wide flag: have we already emitted the `aggressiveVerify='off'`
+// opt-out warning? The warning is meaningful once per process — a
+// typical app has one CachedClient (or a pool of identical clones) and
+// spamming the same message per checkout is noisy. Reset between tests
+// via `_resetAggressiveVerifyOptOutWarning()` so each opt-out assertion
+// can verify the warning fires.
+let _aggressiveVerifyOptOutWarned = false;
 
-// Per-database detection result cache. Keyed by `current_database()`
-// reply (lowercased). Value is a Promise<boolean> while the probe is
-// in flight, then the resolved boolean is cached so subsequent
-// CachedClients on the same db reuse the answer without re-probing.
-//
-// Exported (`_smartVerifyCache`) for test reset. Cleared via
-// `_resetSmartVerifyCache()` between tests so a mocked client's
-// detection probe doesn't leak across cases.
-const _smartVerifyCache = new Map();
-
-export function _resetSmartVerifyCache() {
-    _smartVerifyCache.clear();
+export function _resetAggressiveVerifyOptOutWarning() {
+    _aggressiveVerifyOptOutWarned = false;
 }
 
 // Wrapper-level defaults pushed in by `goldlapel.start({ aggressiveVerify
@@ -282,58 +230,6 @@ export function _setWrapDefaults(opts) {
 
 export function _getWrapDefaults() {
     return { ..._wrapDefaults };
-}
-
-// Detection probe runner. Returns a Promise<boolean>. Issues the
-// `current_database()` query first to scope the cache, then runs the
-// trigger-body probe. Cache hit on the same db short-circuits the second
-// query. Failure (connection error, permission error on pg_proc — the
-// latter is rare since pg_proc is world-readable by default) resolves to
-// `false` rather than rejecting; aggressive verify defaults off if we
-// can't tell.
-//
-// `realClient` — same `query(text, values)` shape we use elsewhere in
-// CachedClient. The probe runs as a regular query on the underlying
-// connection (NOT through CachedClient.query — that would recursively
-// trigger detection on the probe itself, deadlocking the lazy init).
-async function _runDetection(realClient) {
-    let dbName = '_unknown';
-    try {
-        const r = await realClient.query('SELECT current_database() AS db');
-        if (r && r.rows && r.rows.length > 0) {
-            const row = r.rows[0];
-            const v = row.db ?? row.DB ?? row[0];
-            if (v != null) dbName = String(v).toLowerCase();
-        }
-    } catch {
-        // Couldn't even resolve the database name — bail to a fresh
-        // probe under a sentinel key. Don't cache the failure under a
-        // real db name (we don't know which one).
-    }
-    if (_smartVerifyCache.has(dbName)) {
-        return _smartVerifyCache.get(dbName);
-    }
-    const promise = (async () => {
-        try {
-            const r = await realClient.query(_DETECTION_SQL);
-            const row = (r && r.rows && r.rows[0]) || {};
-            const v = row.has_stateful_triggers ?? row.HAS_STATEFUL_TRIGGERS ?? row[0];
-            // pg returns booleans as JS booleans; postgres.js can return
-            // 't'/'f' strings depending on the driver. Defensive coerce.
-            if (v === true || v === 't' || v === 'true' || v === 1) return true;
-            return false;
-        } catch {
-            return false;
-        }
-    })();
-    // Cache the in-flight Promise so concurrent CachedClients on the
-    // same db don't each issue their own probe.
-    _smartVerifyCache.set(dbName, promise);
-    const result = await promise;
-    // Replace the Promise with the resolved value so subsequent
-    // lookups don't pay the await cost.
-    _smartVerifyCache.set(dbName, result);
-    return result;
 }
 
 // Heuristic: is `obj` a pg-pool `Pool` instance? pg-pool's Pool has a
@@ -523,22 +419,22 @@ export function wrap(client, invalidationPort, options) {
     // CachedClient — the per-Pool object doesn't have a meaningful
     // single GUC state.
     //
-    // Aggressive-verify smart-auto detection is per-CachedClient and
-    // wouldn't apply at the Pool level (a Pool's per-checkout client has
-    // its own GUC state and DISCARDs on release anyway). Pool callers
-    // who want aggressive verify should construct their own
-    // per-checkout CachedClient via `new CachedClient(...)` or pass
-    // `aggressiveVerify` to `start()` and let GoldLapel push the option
-    // through `wrap()` on individual Clients.
+    // Aggressive-verify is per-CachedClient — at the Pool level we just
+    // ensure DISCARD on release. Pool callers who want the post-DML
+    // cache-key bump should pass `aggressiveVerify` to `start()` and
+    // let GoldLapel push the option through `wrap()` on individual
+    // Clients, or construct their own per-checkout CachedClient.
     if (_isPgPool(client)) {
         return _wrapPoolForDiscard(client);
     }
     // Merge per-call options on top of any defaults registered by
     // `goldlapel.start({ aggressiveVerify, ... })`. Per-call wins.
     // wrap() is the user-facing entry point so the default mode is
-    // 'auto' here — versus the raw `new CachedClient(...)` constructor
-    // which defaults to 'off' to keep internal-only callers (and the
-    // wrapper's own test suite) free of probe traffic.
+    // 'auto' here (always-on cache-key bump after DML) — versus the
+    // raw `new CachedClient(...)` constructor which defaults to 'off'
+    // to keep internal-only callers (the test suite, namespaces that
+    // construct their own CachedClient through `wrap()`) free of the
+    // per-DML hash bump unless they ask for it.
     const opts = options ? { ..._wrapDefaults, ...options } : { ..._wrapDefaults };
     if (opts.aggressiveVerify === undefined) opts.aggressiveVerify = 'auto';
     const cached = new CachedClient(client, _cache, opts);
@@ -559,21 +455,22 @@ class CachedClient {
         this._real = realClient;
         this._cache = cache;
         this._inTransaction = false;
-        // Aggressive-verify configuration. Three sources of truth, in
+        // Aggressive-verify configuration. Two sources of truth, in
         // descending priority:
         //   1. `options.aggressiveVerifyActive` — license-payload
-        //      override. If `true`/`false`, force verify on/off and
-        //      skip detection. `null`/`undefined` falls through.
+        //      override. If `true`/`false`, hard-forces on/off and
+        //      skips the mode flag entirely. `null`/`undefined` falls
+        //      through.
         //   2. `options.aggressiveVerify` — user-facing mode flag:
-        //      'auto', 'on', 'off'.
-        //   3. Auto-detect from pg_trigger + pg_proc body regex on the
-        //      first user query, cached per-database.
+        //      'auto' / 'on' → always-on cache-key bump after DML.
+        //      'off' → opt out (with a one-time warning logged so
+        //      operators can see it in startup output).
         //
         // Default for the raw constructor is 'off' — internal-only
         // callers (the test suite, namespaces that construct their
-        // own CachedClient through `wrap()`) shouldn't pay probe
-        // overhead unless they ask for it. The user-facing
-        // `wrap(client)` entry point defaults to 'auto'.
+        // own CachedClient through `wrap()`) shouldn't pay the per-
+        // DML hash bump unless they ask for it. The user-facing
+        // `wrap(client)` entry point defaults to 'auto' (always-on).
         const mode = options.aggressiveVerify ?? 'off';
         if (!VALID_AGGRESSIVE_VERIFY_MODES.has(mode)) {
             throw new Error(
@@ -581,30 +478,32 @@ class CachedClient {
             );
         }
         this._aggressiveVerifyMode = mode;
-        // Resolved boolean — whether aggressive-verify fires after DML
-        // on this connection. Materialized eagerly for 'on' / 'off' /
-        // license-payload paths; deferred (`null`) until the detection
-        // probe lands for 'auto'.
+        // Resolved boolean — whether aggressive-verify bumps `_dmlSeq`
+        // after a successful DML on this connection.
         const licenseOverride = options.aggressiveVerifyActive;
         if (licenseOverride === true || licenseOverride === false) {
             this._aggressiveVerifyActive = licenseOverride;
-            // License has spoken — never run detection on this conn.
-            this._aggressiveVerifyDetectionDone = true;
-        } else if (mode === 'on') {
-            this._aggressiveVerifyActive = true;
-            this._aggressiveVerifyDetectionDone = true;
         } else if (mode === 'off') {
             this._aggressiveVerifyActive = false;
-            this._aggressiveVerifyDetectionDone = true;
+            // Surface the opt-out once per process so it's visible in
+            // operator logs without spamming. A typical app has one
+            // CachedClient (or a pool of identical clones) — printing
+            // per-checkout would drown out other startup output.
+            // `_resetAggressiveVerifyOptOutWarning()` resets the
+            // process-wide flag for test isolation.
+            if (!_aggressiveVerifyOptOutWarned) {
+                _aggressiveVerifyOptOutWarned = true;
+                console.warn(
+                    "[goldlapel] aggressiveVerify='off' — post-DML cache-key bump "
+                    + "disabled. RLS rows mutated by a server-side trigger "
+                    + "(via `SET app.user_id = ...` inside a trigger function) "
+                    + "may be served from a stale cache slot on this connection."
+                );
+            }
         } else {
-            // mode === 'auto' — detection deferred to first query.
-            this._aggressiveVerifyActive = false;
-            this._aggressiveVerifyDetectionDone = false;
+            // 'auto' or 'on' → always-on.
+            this._aggressiveVerifyActive = true;
         }
-        // Tracks an in-flight detection probe (single-flight). Resolves
-        // when detection finishes; subsequent queries on this conn
-        // await it before deciding whether to schedule post-DML verify.
-        this._aggressiveVerifyDetectionPromise = null;
         // Per-connection unsafe-GUC state hash. Mirrors the proxy's
         // per-connection `ConnectionGucState` (commit 3e02359). Folded
         // into the native cache key on every read/write so two
@@ -642,6 +541,19 @@ class CachedClient {
         } else {
             sql = textOrConfig;
             params = values;
+        }
+
+        // Serialize behind any in-flight async verify. The post-call
+        // verify path (after an opaque `SELECT <fn>(...)` call) schedules
+        // a `pg_settings` reconcile in a microtask; if the user's next
+        // query fires before that resolves, the cache lookup below could
+        // race against `_gucState` being rewritten. Awaiting the pending
+        // verify here means subsequent queries see the post-reconcile
+        // state hash. Single-flight is still preserved by
+        // `_scheduleVerify` — only one verify is ever in flight, and
+        // multiple concurrent user queries await the same Promise.
+        if (this._pendingVerify) {
+            try { await this._pendingVerify; } catch { /* never rejects */ }
         }
 
         // Verify-on-checkout: if a previous async verify failed (or
@@ -706,64 +618,81 @@ class CachedClient {
         // uncacheable (extractTables on the joined SQL would index the
         // wrong slot).
         if (hasTxBoundary || writeTables !== null || this._inTransaction) {
-            // Smart aggressive-verify: kick off detection lazily on the
-            // first DML we see (auto mode, not yet resolved). Detection
-            // runs in the background — the FIRST DML on this conn may
-            // race ahead of the verdict (in which case verify isn't
-            // scheduled for that one write) and subsequent DML calls
-            // pick up the verdict. Detection is per-database (cached on
-            // the module-level `_smartVerifyCache`), so the race only
-            // costs the first wrapper-instance's first DML.
-            if (
-                writeTables !== null
-                && this._aggressiveVerifyMode === 'auto'
-                && !this._aggressiveVerifyDetectionDone
-            ) {
-                this._kickoffAggressiveVerifyDetection();
-            }
             const r = await this._runRealQuery(textOrConfig, values, pendingOps);
-            if (needsVerify) this._scheduleVerify();
-            // Schedule a post-call verify after any successful
-            // INSERT/UPDATE/DELETE/MERGE/TRUNCATE (or DDL, which we
-            // already invalidate-all on but may also have mutated
-            // session state via embedded function calls). Skip mid-tx
-            // (verify-in-tx sees uncommitted state); that's already
-            // enforced inside `_scheduleVerify`. The check is gated on
-            // `_aggressiveVerifyActive` so 'off' / pre-detect 'auto'
-            // connections pay zero cost. `_runRealQuery` rethrows on
-            // error before we reach this line, so we only schedule
-            // after a server-confirmed write.
+            // Post-DML cache-key bump: after any successful
+            // INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL, bump `_dmlSeq`
+            // so subsequent reads on this connection land on a fresh
+            // cache slot. Closes the trigger-internal-SET gap (a
+            // server-side trigger that did `SET app.user_id = ...`
+            // inside its body would otherwise be invisible to the
+            // wire-side state observer; bumping the seq guarantees
+            // we can never serve a cached pre-DML response keyed on
+            // the pre-trigger state). `_runRealQuery` rethrows on
+            // error before we reach this line, so we only bump after
+            // a server-confirmed write.
+            //
+            // We bump even mid-tx: tx-internal writes that mutate
+            // server-side GUCs via triggers can leak to in-tx reads
+            // (cache is bypassed mid-tx anyway, but the snapshot
+            // mechanism also captures `_dmlSeq` at BEGIN so a
+            // subsequent ROLLBACK restores the pre-tx value and a
+            // COMMIT persists the bump). That makes the bump correct
+            // across `BEGIN; INSERT` (single Q) AND the multi-Q
+            // `BEGIN` → `INSERT` → `COMMIT` flow.
             if (this._aggressiveVerifyActive && writeTables !== null) {
-                this._scheduleVerify();
+                this._gucState._bumpDmlSeq();
             }
+            // Opaque function calls (top-level `SELECT <fn>(...)`) may
+            // also have SET an unsafe GUC inside the function body. We
+            // schedule an actual async `pg_settings` reconcile to read
+            // back the values (cheaper-overall than bumping seq, since
+            // it captures the actual GUC value for any subsequent
+            // cache-slot keying).
+            if (needsVerify) this._scheduleVerify();
             return r;
         }
 
         // Read path: check native cache, gated on the per-connection
         // unsafe-GUC state hash so user A's RLS-scoped rows can never
         // be served to user B from a shared cache slot.
+        //
+        // Bypass the cache when `_dirty` is set: we can't trust the
+        // state hash, so a lookup might either hit a stale slot (key
+        // matches an old hash that doesn't reflect server-side state)
+        // or pollute a new slot with the wrong key. Route this read
+        // straight to the real client; the post-call `_runVerify` (or
+        // the verify-on-checkout fallback above, if not in tx) will
+        // reconcile the state for subsequent reads. While `_dirty &&
+        // _inTransaction` skips the reconcile, we still bypass cache —
+        // mid-tx the cache is bypassed anyway, so this is a no-op for
+        // that path.
         const stateHash = this._gucState.stateHash();
-        const entry = this._cache.get(sql, params, stateHash);
-        if (entry !== null) {
-            // Cache hit — no _real.query ran, so no opaque function got
-            // a chance to mutate state, and no SET could have been on
-            // the wire (cache hits are SELECTs, never SET commands —
-            // pendingOps is empty for a cacheable SELECT). No verify or
-            // op-commit needed.
-            return {
-                rows: entry.rows,
-                fields: entry.fields,
-                rowCount: entry.rows.length,
-                command: 'SELECT',
-            };
+        if (!this._dirty) {
+            const entry = this._cache.get(sql, params, stateHash);
+            if (entry !== null) {
+                // Cache hit — no _real.query ran, so no opaque function
+                // got a chance to mutate state, and no SET could have
+                // been on the wire (cache hits are SELECTs, never SET
+                // commands — pendingOps is empty for a cacheable
+                // SELECT). No verify or op-commit needed.
+                return {
+                    rows: entry.rows,
+                    fields: entry.fields,
+                    rowCount: entry.rows.length,
+                    command: 'SELECT',
+                };
+            }
         }
 
-        // Cache miss: execute for real (and commit pending ops on
-        // success — though for a pure SELECT pendingOps is empty).
+        // Cache miss (or dirty bypass): execute for real (and commit
+        // pending ops on success — though for a pure SELECT pendingOps
+        // is empty).
         const result = await this._runRealQuery(textOrConfig, values, pendingOps);
 
-        // Cache the result only if it's a real read response. Same state
-        // hash gating as the get() above — the entry is keyed to the
+        // Cache the result only if it's a real read response AND we're
+        // not dirty (writing a slot keyed on an untrusted state hash
+        // would corrupt the cache for the next user). Same state hash
+        // gating as the get() above — the entry is keyed to the
         // connection state at the time of the response.
         //
         // Skip session-state command replies. `SET foo = 'bar'` returns
@@ -774,7 +703,8 @@ class CachedClient {
         // Empty-result SELECTs (zero rows from `WHERE id = -1`) are
         // intentionally still cached — the proxy does the same.
         if (
-            result.rows && result.fields
+            !this._dirty
+            && result.rows && result.fields
             && !NON_CACHEABLE_COMMANDS.has(result.command)
         ) {
             this._cache.put(sql, params, result.rows, result.fields, stateHash);
@@ -817,38 +747,6 @@ class CachedClient {
         // Server confirmed — commit the pending ops in order.
         _commitPendingOps(this, pendingOps);
         return result;
-    }
-
-    // Kick off the aggressive-verify auto-detection probe in the
-    // background. Idempotent: subsequent calls while the probe is in
-    // flight (or has already finished) are no-ops. Never blocks the
-    // caller; failures fall back to "detection finished, verdict =
-    // off" so a permission-denied pg_proc read doesn't lock the
-    // connection into permanent paranoia mode.
-    //
-    // Reuses the module-level `_smartVerifyCache` keyed on
-    // `current_database()`, so multiple CachedClients sharing one
-    // database pay the probe cost exactly once per process.
-    _kickoffAggressiveVerifyDetection() {
-        if (this._aggressiveVerifyDetectionDone) return;
-        if (this._aggressiveVerifyDetectionPromise) return;
-        if (this._closed) return;
-        const promise = (async () => {
-            try {
-                const result = await _runDetection(this._real);
-                this._aggressiveVerifyActive = !!result;
-            } catch {
-                // Defense in depth — _runDetection already swallows
-                // errors into `false`, but if anything unexpected
-                // bubbles up we fall back to "off" rather than
-                // stranding the conn in a half-detected state.
-                this._aggressiveVerifyActive = false;
-            } finally {
-                this._aggressiveVerifyDetectionDone = true;
-                this._aggressiveVerifyDetectionPromise = null;
-            }
-        })();
-        this._aggressiveVerifyDetectionPromise = promise;
     }
 
     // Schedule an async post-call state verify. Single-flight: if a
@@ -959,8 +857,5 @@ class CachedClient {
 export {
     CachedClient,
     _containsOpaqueFunctionCall,
-    _DETECTION_SQL,
-    _runDetection,
-    _smartVerifyCache,
     VALID_AGGRESSIVE_VERIFY_MODES,
 };
