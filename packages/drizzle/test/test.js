@@ -3,7 +3,7 @@ import assert from 'node:assert'
 
 import {
     drizzle, init,
-    start, GoldLapel, wrap, NativeCache,
+    start, GoldLapel,
     DocumentsAPI, StreamsAPI,
 } from '../index.js'
 import * as plugin from '../index.js'
@@ -24,15 +24,6 @@ function mockDrizzle() {
         return { _mock: true, client, options }
     }
     return { _drizzle, calls }
-}
-
-function mockWrap() {
-    const calls = []
-    function _wrap(client, invalidationPort) {
-        calls.push({ client, invalidationPort })
-        return { _wrapped: true, _client: client, _invalidationPort: invalidationPort }
-    }
-    return { _wrap, calls }
 }
 
 function mockPg() {
@@ -70,25 +61,21 @@ describe('drizzle', () => {
         }
     })
 
-    it('calls start with DATABASE_URL and passes wrapped pool to drizzle', async () => {
+    it('calls start with DATABASE_URL and passes the plain pool to drizzle', async () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start, calls } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle, calls: drizzleCalls } = mockDrizzle()
-        const { _wrap, calls: wrapCalls } = mockWrap()
         const { _pg, pools } = mockPg()
 
-        const db = await drizzle({ _start, _drizzle, _wrap, _pg })
+        const db = await drizzle({ _start, _drizzle, _pg })
 
         assert.strictEqual(calls.length, 1)
         assert.strictEqual(calls[0].upstream, 'postgresql://user:pass@host:5432/mydb')
         assert.deepStrictEqual(calls[0].opts, { config: undefined, proxyPort: undefined, extraArgs: undefined, noConnect: true })
         assert.strictEqual(pools.length, 1)
         assert.strictEqual(pools[0]._opts.connectionString, 'postgresql://user:pass@localhost:7932/mydb')
-        assert.strictEqual(wrapCalls.length, 1)
-        assert.strictEqual(wrapCalls[0].client, pools[0])
-        assert.strictEqual(wrapCalls[0].invalidationPort, 7934)
         assert.strictEqual(drizzleCalls.length, 1)
-        assert.strictEqual(drizzleCalls[0].client._wrapped, true)
+        assert.strictEqual(drizzleCalls[0].client, pools[0])
         assert.strictEqual(db._mock, true)
     })
 
@@ -96,14 +83,12 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://env@host:5432/db'
         const { _start, calls } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
         await drizzle({
             url: 'postgresql://explicit@host:5432/db',
             _start,
             _drizzle,
-            _wrap,
             _pg,
         })
 
@@ -115,7 +100,6 @@ describe('drizzle', () => {
             () => drizzle({
                 _start: mockStart('x')._start,
                 _drizzle: mockDrizzle()._drizzle,
-                _wrap: mockWrap()._wrap,
                 _pg: mockPg()._pg,
             }),
             /DATABASE_URL not set/,
@@ -126,10 +110,9 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start, calls } = mockStart('postgresql://user:pass@localhost:9000/mydb')
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
-        await drizzle({ proxyPort: 9000, _start, _drizzle, _wrap, _pg })
+        await drizzle({ proxyPort: 9000, _start, _drizzle, _pg })
 
         assert.strictEqual(calls[0].opts.proxyPort, 9000)
     })
@@ -138,14 +121,12 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start, calls } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
         await drizzle({
             extraArgs: ['--verbose'],
             _start,
             _drizzle,
-            _wrap,
             _pg,
         })
 
@@ -156,14 +137,12 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start, calls } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
         await drizzle({
             config: { poolMode: 'transaction', poolSize: 30, disableN1: true },
             _start,
             _drizzle,
-            _wrap,
             _pg,
         })
 
@@ -174,7 +153,6 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle, calls: drizzleCalls } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
         await drizzle({
@@ -182,7 +160,6 @@ describe('drizzle', () => {
             schema: { users: 'mock' },
             _start,
             _drizzle,
-            _wrap,
             _pg,
         })
 
@@ -194,7 +171,6 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle, calls: drizzleCalls } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
         await drizzle({
@@ -204,11 +180,8 @@ describe('drizzle', () => {
             proxyPort: 9000,
             config: { poolMode: 'transaction' },
             extraArgs: ['--verbose'],
-            invalidationPort: 8000,
-            nativeCache: true,
             _start,
             _drizzle,
-            _wrap,
             _pg,
         })
 
@@ -219,10 +192,9 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
-        const db = await drizzle({ _start, _drizzle, _wrap, _pg })
+        const db = await drizzle({ _start, _drizzle, _pg })
 
         assert.strictEqual(db._mock, true)
     })
@@ -231,22 +203,21 @@ describe('drizzle', () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg } = mockPg()
 
         // When no GOLDLAPEL_CLIENT is set, drizzle sets it
-        await drizzle({ _start, _drizzle, _wrap, _pg })
+        await drizzle({ _start, _drizzle, _pg })
         assert.strictEqual(process.env.GOLDLAPEL_CLIENT, 'drizzle')
 
         // When GOLDLAPEL_CLIENT is already set, it should not be overwritten
         process.env.GOLDLAPEL_CLIENT = 'prisma'
-        await drizzle({ _start, _drizzle, _wrap, _pg })
+        await drizzle({ _start, _drizzle, _pg })
         assert.strictEqual(process.env.GOLDLAPEL_CLIENT, 'prisma')
     })
 })
 
 
-describe('drizzle L1 cache', () => {
+describe('drizzle pool', () => {
     const origUrl = process.env.DATABASE_URL
 
     beforeEach(() => {
@@ -261,90 +232,13 @@ describe('drizzle L1 cache', () => {
         }
     })
 
-    it('wraps pool with L1 cache by default', async () => {
-        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
-        const { _drizzle, calls: drizzleCalls } = mockDrizzle()
-        const { _wrap, calls: wrapCalls } = mockWrap()
-        const { _pg, pools } = mockPg()
-
-        await drizzle({ _start, _drizzle, _wrap, _pg })
-
-        assert.strictEqual(wrapCalls.length, 1)
-        assert.strictEqual(wrapCalls[0].client, pools[0])
-        assert.strictEqual(drizzleCalls[0].client._wrapped, true)
-    })
-
-    it('uses default invalidation port (proxy port + 2)', async () => {
-        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
-        const { _drizzle } = mockDrizzle()
-        const { _wrap, calls: wrapCalls } = mockWrap()
-        const { _pg } = mockPg()
-
-        await drizzle({ _start, _drizzle, _wrap, _pg })
-
-        assert.strictEqual(wrapCalls[0].invalidationPort, 7934)
-    })
-
-    it('uses custom invalidation port when specified', async () => {
-        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
-        const { _drizzle } = mockDrizzle()
-        const { _wrap, calls: wrapCalls } = mockWrap()
-        const { _pg } = mockPg()
-
-        await drizzle({ invalidationPort: 9999, _start, _drizzle, _wrap, _pg })
-
-        assert.strictEqual(wrapCalls[0].invalidationPort, 9999)
-    })
-
-    it('computes invalidation port from custom proxy port', async () => {
-        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const { _start } = mockStart('postgresql://user:pass@localhost:9000/mydb')
-        const { _drizzle } = mockDrizzle()
-        const { _wrap, calls: wrapCalls } = mockWrap()
-        const { _pg } = mockPg()
-
-        await drizzle({ proxyPort: 9000, _start, _drizzle, _wrap, _pg })
-
-        assert.strictEqual(wrapCalls[0].invalidationPort, 9002)
-    })
-
-    it('explicit invalidationPort overrides port-based default', async () => {
-        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const { _start } = mockStart('postgresql://user:pass@localhost:9000/mydb')
-        const { _drizzle } = mockDrizzle()
-        const { _wrap, calls: wrapCalls } = mockWrap()
-        const { _pg } = mockPg()
-
-        await drizzle({ proxyPort: 9000, invalidationPort: 5555, _start, _drizzle, _wrap, _pg })
-
-        assert.strictEqual(wrapCalls[0].invalidationPort, 5555)
-    })
-
-    it('skips wrapping when nativeCache is false', async () => {
-        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
-        const { _drizzle, calls: drizzleCalls } = mockDrizzle()
-        const { _wrap, calls: wrapCalls } = mockWrap()
-        const { _pg, pools } = mockPg()
-
-        await drizzle({ nativeCache: false, _start, _drizzle, _wrap, _pg })
-
-        assert.strictEqual(wrapCalls.length, 0)
-        assert.strictEqual(drizzleCalls[0].client._mockPool, true)
-        assert.strictEqual(drizzleCalls[0].client, pools[0])
-    })
-
     it('creates pg.Pool with proxy URL connection string', async () => {
         process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
         const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg, pools } = mockPg()
 
-        await drizzle({ _start, _drizzle, _wrap, _pg })
+        await drizzle({ _start, _drizzle, _pg })
 
         assert.strictEqual(pools.length, 1)
         assert.strictEqual(pools[0]._opts.connectionString, 'postgresql://user:pass@localhost:7932/mydb')
@@ -356,35 +250,12 @@ describe('drizzle L1 cache', () => {
         const instance = { url: 'postgresql://user:pass@localhost:7932/mydb', query: () => {} }
         const { _start } = mockStart(instance)
         const { _drizzle } = mockDrizzle()
-        const { _wrap } = mockWrap()
         const { _pg, pools } = mockPg()
 
-        await drizzle({ _start, _drizzle, _wrap, _pg })
+        await drizzle({ _start, _drizzle, _pg })
 
         assert.strictEqual(pools.length, 1)
         assert.strictEqual(pools[0]._opts.connectionString, 'postgresql://user:pass@localhost:7932/mydb')
-    })
-
-    it('strips nativeCache and invalidationPort from drizzle options', async () => {
-        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
-        const { _start } = mockStart('postgresql://user:pass@localhost:7932/mydb')
-        const { _drizzle, calls: drizzleCalls } = mockDrizzle()
-        const { _wrap } = mockWrap()
-        const { _pg } = mockPg()
-
-        await drizzle({
-            schema: { users: 'mock' },
-            invalidationPort: 9999,
-            nativeCache: true,
-            _start,
-            _drizzle,
-            _wrap,
-            _pg,
-        })
-
-        assert.strictEqual(drizzleCalls[0].options.invalidationPort, undefined)
-        assert.strictEqual(drizzleCalls[0].options.nativeCache, undefined)
-        assert.deepStrictEqual(drizzleCalls[0].options, { schema: { users: 'mock' } })
     })
 })
 
@@ -513,12 +384,9 @@ describe('re-exports', () => {
         assert.strictEqual(typeof GoldLapel, 'function')
     })
 
-    it('re-exports wrap from goldlapel', () => {
-        assert.strictEqual(typeof wrap, 'function')
-    })
-
-    it('re-exports NativeCache from goldlapel', () => {
-        assert.strictEqual(typeof NativeCache, 'function')
+    it('no longer exports the in-process cache', () => {
+        assert.strictEqual(plugin.wrap, undefined)
+        assert.strictEqual(plugin.NativeCache, undefined)
     })
 
     it('re-exports DocumentsAPI from goldlapel', () => {

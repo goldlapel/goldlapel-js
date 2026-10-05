@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+**The in-process cache is gone.** `cacheExtension()` and the
+`NativeCache` re-export are removed, and `withGoldLapel()` no longer takes
+`invalidationPort`. `withGoldLapel()` returns a plain `PrismaClient`
+pointed at the proxy; `init()` is unchanged. Caching now happens in the
+Gold Lapel proxy for every client. If you used `init()` +
+`$extends(cacheExtension())`, drop the `$extends` call.
+
 **Flat `doc*` utility re-exports removed.** The plugin used to re-export
 `docInsert`, `docFind`, `docUpdate`, `docDelete`, `docCount`,
 `docCreateIndex`, `docAggregate`, `docWatch`, `docUnwatch`,
@@ -26,8 +33,7 @@ const gl = await start(process.env.DATABASE_URL)
 await gl.documents.insert('users', { name: 'Alice' })
 ```
 
-`start`, `GoldLapel`, and `NativeCache` continue to be re-exported. The
-ORM-focused entry points (`withGoldLapel()` and `init()`) are unchanged.
+`start` and `GoldLapel` continue to be re-exported.
 
 ### New exports
 

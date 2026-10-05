@@ -1,7 +1,5 @@
 import { spawn, execFileSync } from 'child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { NativeCache } from './cache.js';
-import { wrap, VALID_AGGRESSIVE_VERIFY_MODES, _setWrapDefaults } from './wrap.js';
 import { createConnection } from 'net';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
@@ -54,7 +52,7 @@ const STARTUP_POLL_INTERVAL = 50;
 // Wrapper version, read from package.json. CI rewrites the version in
 // package.json from the git tag at publish time; local dev installs read
 // "0.0.0". Used to build the application_name marker on PG connections so
-// the proxy can classify wrapper-vs-raw traffic and gate L2 result cache.
+// wrapper connections are recognisable in pg_stat_activity.
 function _wrapperVersion() {
     try {
         const pkg = require(join(__dirname, 'package.json'));
@@ -69,35 +67,33 @@ export function _applicationNameMarker() {
 }
 
 // Keys that are valid inside the structured `config` map. Top-level concepts
-// (proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
-// client, configFile, plus the four headline disable flags —
-// disableMatviews, disableProxyCache, disableSqloptimize,
-// disableAutoIndexes) are exposed as their own options on GoldLapel's
-// constructor and are NOT accepted here — passing them through `config`
+// (proxyPort, dashboardPort, logLevel, mode, license, client, configFile,
+// plus the three headline disable flags — disableProxyCache,
+// disableSqloptimize, disableAutoIndexes) are exposed as their own options
+// on GoldLapel's constructor and are NOT accepted here — passing them through `config`
 // raises at argv build time.
 const VALID_CONFIG_KEYS = new Set([
-    'minPatternCount', 'refreshIntervalSecs', 'patternTtlSecs',
-    'maxTablesPerView', 'maxColumnsPerView', 'deepPaginationThreshold',
+    'minPatternCount', 'deepPaginationThreshold',
     'reportIntervalSecs', 'proxyCacheSize', 'batchCacheSize',
     'batchCacheTtlSecs', 'poolSize', 'poolTimeoutSecs',
     'poolMode', 'mgmtIdleTimeout', 'fallback', 'readAfterWriteSecs',
     'n1Threshold', 'n1WindowMs', 'n1CrossThreshold',
     'tlsCert', 'tlsKey', 'tlsClientCa',
-    'disableConsolidation', 'disableBtreeIndexes',
+    'disableBtreeIndexes',
     'disableTrigramIndexes', 'disableExpressionIndexes',
-    'disablePartialIndexes', 'disableRewrite', 'disableRewritePreparedCache',
+    'disablePartialIndexes', 'disableRewritePreparedCache',
     'disablePool',
-    'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
-    'enableCoalescing', 'replica', 'excludeTables',
+    'disableN1', 'disableN1CrossConnection',
+    'disableCoalescing', 'replica', 'excludeTables',
 ]);
 
 const BOOLEAN_KEYS = new Set([
-    'disableConsolidation', 'disableBtreeIndexes',
+    'disableBtreeIndexes',
     'disableTrigramIndexes', 'disableExpressionIndexes',
-    'disablePartialIndexes', 'disableRewrite', 'disableRewritePreparedCache',
+    'disablePartialIndexes', 'disableRewritePreparedCache',
     'disablePool',
-    'disableN1', 'disableN1CrossConnection', 'disableShadowMode',
-    'enableCoalescing',
+    'disableN1', 'disableN1CrossConnection',
+    'disableCoalescing',
 ]);
 
 const LIST_KEYS = new Set([
@@ -233,9 +229,9 @@ export function _findBinary() {
 }
 
 // Append `application_name=goldlapel:js:<version>` to `url` unless it already
-// has one (or PGAPPNAME is set in the env). The marker tells the proxy this
-// is wrapper traffic, so it can skip L2 result cache (the wrapper already has
-// its own L1). Idempotent and override-respecting.
+// has one (or PGAPPNAME is set in the env). The marker labels the connection
+// as Gold Lapel wrapper traffic in pg_stat_activity; the proxy caches it like
+// any other client. Idempotent and override-respecting.
 function _injectApplicationName(url) {
     if (/[?&]application_name=/.test(url)) return url;
     if (process.env.PGAPPNAME) return url;
@@ -456,41 +452,26 @@ function _cleanup() {
 
 export class GoldLapel {
     constructor(upstream, {
-        proxyPort, dashboardPort, invalidationPort, logLevel, mode, license,
+        proxyPort, dashboardPort, logLevel, mode, license,
         client, configFile, config, extraArgs, noConnect, silent,
-        mesh, meshTag, disableNativeCache,
+        mesh, meshTag,
         // Headline strategy disables — promoted out of `config` to
         // first-class top-level options. Each maps 1:1 to a proxy CLI
-        // flag (`--disable-matviews`, `--disable-proxy-cache`,
-        // `--disable-sqloptimize`, `--disable-auto-indexes`). Atomic
-        // break — passing them inside `config` is rejected.
-        disableMatviews, disableProxyCache, disableSqloptimize, disableAutoIndexes,
-        // Aggressive-verify mode (see goldlapel/docs/todos/
-        // aggressive-verify-flag.md). 'auto' (default) and 'on' both
-        // bump the per-connection cache-key sequence after every
-        // confirmed DML so a server-side trigger that did a SET
-        // internally can't leak stale cache to subsequent reads.
-        // 'off' opts out and emits a one-time warning.
-        // `aggressiveVerifyActive` is the license-payload override —
-        // truthy/falsy values hard-force on/off and skip the mode
-        // flag entirely. The wrapper itself doesn't parse the license
-        // file; HQ-driven flows pass the resolved boolean here.
-        aggressiveVerify, aggressiveVerifyActive,
+        // flag (`--disable-proxy-cache`, `--disable-sqloptimize`,
+        // `--disable-auto-indexes`). Atomic break — passing them inside
+        // `config` is rejected.
+        disableProxyCache, disableSqloptimize, disableAutoIndexes,
     } = {}) {
         this._upstream = upstream;
         this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
-        // Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
-        // unset (matches what the Rust binary binds when no --dashboard-port /
-        // --invalidation-port is passed). A user-supplied value (including 0
-        // for "disable dashboard") overrides the derivation.
+        // Dashboard port defaults to proxyPort + 1 when unset (matches what
+        // the Rust binary binds when no --dashboard-port is passed). A
+        // user-supplied value (including 0 for "disable dashboard")
+        // overrides the derivation.
         this._dashboardPortSet = dashboardPort !== undefined;
         this._dashboardPort = dashboardPort !== undefined
             ? Number(dashboardPort)
             : this._proxyPort + 1;
-        this._invalidationPortSet = invalidationPort !== undefined;
-        this._invalidationPort = invalidationPort !== undefined
-            ? Number(invalidationPort)
-            : this._proxyPort + 2;
         this._logLevel = logLevel;
         this._mode = mode;
         this._license = license;
@@ -509,55 +490,11 @@ export class GoldLapel {
         this._mesh = !!mesh;
         this._meshTag = meshTag ? String(meshTag) : null;
         // Headline strategy disables. Each is a first-class top-level
-        // option that maps 1:1 to a proxy CLI flag (Model B pivot —
-        // wrappers no longer opt traffic into the proxy's result cache;
-        // the proxy decides per-connection based on the application_name
-        // marker). Default false; emitted as `--disable-X` when true.
-        this._disableMatviews = !!disableMatviews;
+        // option that maps 1:1 to a proxy CLI flag. Default false;
+        // emitted as `--disable-X` when true.
         this._disableProxyCache = !!disableProxyCache;
         this._disableSqloptimize = !!disableSqloptimize;
         this._disableAutoIndexes = !!disableAutoIndexes;
-        // Aggressive-verify mode — validated eagerly (cheap; one Set
-        // lookup) so a typo lands at construction time instead of
-        // surfacing on first DML.
-        const av = aggressiveVerify ?? 'auto';
-        if (!VALID_AGGRESSIVE_VERIFY_MODES.has(av)) {
-            throw new Error(
-                `aggressiveVerify must be one of: 'auto', 'on', 'off' (got '${av}')`
-            );
-        }
-        this._aggressiveVerify = av;
-        // License-payload override — null/undefined means "no
-        // override, fall through to mode". true/false force the
-        // verify on/off and skip detection.
-        this._aggressiveVerifyActive = (
-            aggressiveVerifyActive === true || aggressiveVerifyActive === false
-        ) ? aggressiveVerifyActive : null;
-        // Push these into `wrap.js`'s default-option slot so a later
-        // `wrap(client)` (no third arg) picks up the mode users set at
-        // the GoldLapel constructor. Per-call options on `wrap()`
-        // still win. Same singleton-pattern shape as
-        // `disableNativeCache` flowing into NativeCache above.
-        _setWrapDefaults({
-            aggressiveVerify: this._aggressiveVerify,
-            aggressiveVerifyActive: this._aggressiveVerifyActive,
-        });
-        // Toggle the wrapper's in-process native cache off without losing
-        // the tuned `cacheSize`. When `true`, NativeCache acts as a no-op
-        // pass-through (get always misses, put is a no-op) — the
-        // invalidation socket still connects so telemetry continues to
-        // flow. The previous workaround was `cacheSize: 0`, which forced
-        // customers to discard their tuned size to flip the layer; the
-        // explicit option lets them keep the size and still toggle.
-        // Applied to the NativeCache singleton at construction time so a
-        // later `wrap(client)` call sees the right state immediately.
-        this._disableNativeCache = !!disableNativeCache;
-        // Push `disabled` into the cache singleton now (creates the
-        // singleton if `wrap()` hasn't yet). This keeps the toggle
-        // effective regardless of whether the user calls wrap() before
-        // or after start(), and without forcing GL to mutate cache state
-        // later from spawn paths that aren't always exercised in tests.
-        new NativeCache({ disabled: this._disableNativeCache });
         // Validate structured-config keys eagerly so a test that constructs
         // without spawning still catches bad keys.
         const unknown = Object.keys(this._config).filter(k => !VALID_CONFIG_KEYS.has(k));
@@ -582,7 +519,7 @@ export class GoldLapel {
         //
         // As of Phase 5 the Redis-compat helper families (counter / zset /
         // hash / queue / geo) are nested too, alongside streams (Phase 1+2)
-        // and documents (Phase 4). Search / cache / auth remain flat —
+        // and documents (Phase 4). Search / pub-sub remain flat —
         // they'll migrate when their own schema-to-core phase fires.
         this.documents = new DocumentsAPI(this);
         this.streams = new StreamsAPI(this);
@@ -609,9 +546,6 @@ export class GoldLapel {
         if (this._dashboardPortSet) {
             args.push('--dashboard-port', String(this._dashboardPort));
         }
-        if (this._invalidationPortSet) {
-            args.push('--invalidation-port', String(this._invalidationPort));
-        }
         if (verboseFlag) {
             args.push(verboseFlag);
         }
@@ -636,9 +570,6 @@ export class GoldLapel {
         // Headline strategy disables — emitted as their own top-level CLI
         // flags. Suppressed when the user hasn't set them so the Rust
         // binary applies its own defaults.
-        if (this._disableMatviews) {
-            args.push('--disable-matviews');
-        }
         if (this._disableProxyCache) {
             args.push('--disable-proxy-cache');
         }
@@ -920,7 +851,6 @@ function _call(gl, fn, args) {
  * @param {object} [opts]
  * @param {number} [opts.proxyPort=7932]  Proxy listen port.
  * @param {number} [opts.dashboardPort]  Dashboard port. Defaults to `proxyPort + 1` (7933 when `proxyPort` is the 7932 default). `0` disables.
- * @param {number} [opts.invalidationPort]  Cache-invalidation port. Defaults to `proxyPort + 2`.
  * @param {'trace'|'debug'|'info'|'warn'|'error'} [opts.logLevel]  Binary log level.
  * @param {string} [opts.mode]  Operating mode (`waiter`, `consideration`, etc).
  * @param {string} [opts.license]  Path to the license file.
@@ -932,13 +862,9 @@ function _call(gl, fn, args) {
  * @param {boolean} [opts.silent]  Suppress the one-line startup banner (wrapper-only; never forwarded to the binary).
  * @param {boolean} [opts.mesh]  Opt into the mesh at startup. HQ enforces the license; denial is non-fatal — proxy runs without clustering.
  * @param {string}  [opts.meshTag]  Mesh tag — instances sharing a tag cluster together.
- * @param {boolean} [opts.disableMatviews=false]  Disable matview optimization on the proxy (`--disable-matviews`). Headline kill switch for the matview strategy.
  * @param {boolean} [opts.disableProxyCache=false]  Disable the proxy's result cache entirely (`--disable-proxy-cache`). Highest-precedence kill switch — overrides finer-grained cache toggles.
  * @param {boolean} [opts.disableSqloptimize=false]  Disable the SQL rewrite / optimization pipeline on the proxy (`--disable-sqloptimize`). Per-kind disables in `config` still apply on top.
  * @param {boolean} [opts.disableAutoIndexes=false]  Disable automatic index recommendations / creation on the proxy (`--disable-auto-indexes`).
- * @param {boolean} [opts.disableNativeCache=false]  Disable the wrapper's in-process native cache without losing the tuned `cacheSize`. When `true`, gets always miss and puts are no-ops; the invalidation socket still connects so telemetry continues to flow. Use to A/B the native cache layer (e.g. measure end-to-end latency with and without it) while keeping your size config intact.
- * @param {'auto'|'on'|'off'} [opts.aggressiveVerify='auto']  Bump the per-connection cache-key sequence after every successful INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL so subsequent reads on the same connection land on a fresh cache slot — closes the trigger-internal-SET correctness gap (a server-side trigger that did `SET app.user_id = ...` inside its body is invisible to the wire-side state observer, and a cached pre-DML response could otherwise be served under stale state). `'auto'` (default) and `'on'` both enable the bump (no network round-trip, one integer increment); `'off'` opts out and logs a one-time warning.
- * @param {boolean} [opts.aggressiveVerifyActive]  License-payload override for `aggressiveVerify`. When `true`/`false`, hard-forces the post-DML bump on/off and skips the mode flag entirely. The wrapper itself doesn't parse the license file; HQ-driven flows pass the resolved boolean here.
  * @returns {Promise<GoldLapel>}
  */
 export async function start(upstream, opts = {}) {
@@ -963,8 +889,6 @@ export async function start(upstream, opts = {}) {
 
 // ─── Module-level exports ──────────────────────────────────────────────────
 
-export { wrap } from './wrap.js';
-export { NativeCache } from './cache.js';
 export { DocumentsAPI } from './documents.js';
 export { StreamsAPI } from './streams.js';
 export { CountersAPI } from './counters.js';
@@ -1004,7 +928,6 @@ export {
 // Every name available as a named export is also reachable via the default.
 export default {
     GoldLapel, start, configKeys, _configToArgs, _logLevelToVerboseFlag,
-    wrap, NativeCache,
     DocumentsAPI, StreamsAPI,
     CountersAPI, ZsetsAPI, HashesAPI, QueuesAPI, GeosAPI,
     publish, subscribe,

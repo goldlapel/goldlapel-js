@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+**The in-process cache is gone.** `drizzle()` hands Drizzle a plain
+`pg.Pool` pointed at the proxy instead of a cache-wrapped one, and no
+longer takes `invalidationPort` or `nativeCache`. The `wrap` and
+`NativeCache` re-exports are removed. Caching now happens in the Gold
+Lapel proxy for every client.
+
 **Flat `doc*` utility re-exports removed.** The plugin used to re-export
 `docInsert`, `docFind`, `docUpdate`, `docDelete`, `docCount`,
 `docCreateIndex`, `docAggregate`, `docWatch`, `docUnwatch`,
@@ -26,8 +32,7 @@ const gl = await start(process.env.DATABASE_URL)
 await gl.documents.insert('users', { name: 'Alice' })
 ```
 
-`start`, `GoldLapel`, `wrap`, and `NativeCache` continue to be re-exported.
-The ORM-focused entry points (`drizzle()` and `init()`) are unchanged.
+`start` and `GoldLapel` continue to be re-exported.
 
 ### New exports
 

@@ -5,9 +5,7 @@
 // or `drizzle-orm/postgres-js`. If you need postgres.js support, use the
 // goldlapel `init()` function to rewrite DATABASE_URL and create your own
 // drizzle instance with the proxy URL.
-import { start, wrap } from 'goldlapel'
-
-const DEFAULT_PROXY_PORT = 7932
+import { start } from 'goldlapel'
 
 // Resolve the proxy URL from whatever `start()` returned. start() in v0.2
 // returns a GoldLapel instance; older/mocked versions may return a string.
@@ -24,13 +22,11 @@ export async function drizzle(options = {}) {
     if (!url) throw new Error('Gold Lapel: DATABASE_URL not set. Pass { url } or set DATABASE_URL.')
     if (!process.env.GOLDLAPEL_CLIENT) process.env.GOLDLAPEL_CLIENT = 'drizzle'
     const {
-        url: _, proxyPort, config, extraArgs, invalidationPort, nativeCache,
-        _start, _drizzle, _wrap, _pg,
+        url: _, proxyPort, config, extraArgs,
+        _start, _drizzle, _pg,
         ...drizzleOptions
     } = options
     const startFn = _start || start
-    const wrapFn = _wrap || wrap
-    const resolvedProxyPort = proxyPort ?? DEFAULT_PROXY_PORT
     // This plugin builds its own pg.Pool against the proxy URL, so the core
     // wrapper doesn't need to open its own driver connection.
     const result = await startFn(url, { config, proxyPort, extraArgs, noConnect: true })
@@ -42,15 +38,8 @@ export async function drizzle(options = {}) {
     const pg = _pg || (await import('pg')).default
     const pool = new pg.Pool({ connectionString: proxyUrlStr })
 
-    // Wrap pool with L1 native cache unless explicitly disabled
-    let client = pool
-    if (nativeCache !== false) {
-        const invPort = invalidationPort ?? (resolvedProxyPort + 2)
-        client = wrapFn(pool, invPort)
-    }
-
     const drizzleFn = _drizzle || (await import('drizzle-orm/node-postgres')).drizzle
-    return drizzleFn(client, drizzleOptions)
+    return drizzleFn(pool, drizzleOptions)
 }
 
 export async function init(options = {}) {
@@ -76,6 +65,6 @@ export async function init(options = {}) {
 // dropped — they require a `patterns` argument resolved from the proxy's
 // dashboard and only the sub-API classes know how to fetch it.
 export {
-    start, GoldLapel, wrap, NativeCache,
+    start, GoldLapel,
     DocumentsAPI, StreamsAPI,
 } from 'goldlapel'

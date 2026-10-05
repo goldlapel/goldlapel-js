@@ -16,9 +16,8 @@ import {
 } from '../index.js';
 
 // The proxy URL gets `application_name=goldlapel:js:<version>` appended so
-// the proxy can classify wrapper-vs-raw traffic and skip L2 cache for
-// wrappers (they have their own L1). The suffix is computed from the
-// installed package.json — local dev installs see "0.0.0".
+// wrapper connections are identifiable in pg_stat_activity. The suffix is
+// computed from the installed package.json — local dev installs see "0.0.0".
 const _APP_NAME_SUFFIX = `application_name=${_applicationNameMarker()}`;
 
 // Every test in this file runs without PGAPPNAME so the marker is applied
@@ -191,10 +190,9 @@ describe('makeProxyUrl', () => {
 
 
 describe('applicationNameMarker', () => {
-    // L2-router architecture: the wrapper tags PG connections with
-    // `application_name=goldlapel:js:<version>` so the proxy can classify
-    // wrapper-vs-raw traffic and gate L2 result cache (wrapper has its
-    // own L1; raw clients don't).
+    // The wrapper tags PG connections with
+    // `application_name=goldlapel:js:<version>`. It's a label only — the
+    // proxy caches wrapper and raw connections the same way.
 
     it('marker has goldlapel:js:<version> shape', () => {
         const m = _applicationNameMarker();
@@ -366,16 +364,16 @@ describe('configToArgs', () => {
     });
 
     it('includes flag for boolean true', () => {
-        // disableConsolidation is still a config-map boolean key.
-        // (disableMatviews / disableProxyCache / disableSqloptimize /
-        // disableAutoIndexes were promoted to top-level options and no
-        // longer appear in VALID_CONFIG_KEYS.)
-        const args = _configToArgs({ disableConsolidation: true });
-        assert.deepStrictEqual(args, ['--disable-consolidation']);
+        // disableCoalescing is still a config-map boolean key.
+        // (disableProxyCache / disableSqloptimize / disableAutoIndexes
+        // were promoted to top-level options and no longer appear in
+        // VALID_CONFIG_KEYS.)
+        const args = _configToArgs({ disableCoalescing: true });
+        assert.deepStrictEqual(args, ['--disable-coalescing']);
     });
 
     it('omits flag for boolean false', () => {
-        const args = _configToArgs({ disableConsolidation: false });
+        const args = _configToArgs({ disableCoalescing: false });
         assert.deepStrictEqual(args, []);
     });
 
@@ -421,7 +419,7 @@ describe('configToArgs', () => {
 
     it('throws TypeError for boolean key with non-boolean value', () => {
         assert.throws(
-            () => _configToArgs({ disableRewrite: 'yes' }),
+            () => _configToArgs({ disablePool: 'yes' }),
             { name: 'TypeError', message: /expects a boolean, got string/ }
         );
     });
@@ -453,7 +451,7 @@ describe('configToArgs', () => {
     it('rejects log_level / mode / dashboardPort inside config map', () => {
         // Regression guard: these are top-level options on the canonical
         // surface. Passing them through `config` must raise.
-        for (const bad of ['logLevel', 'mode', 'dashboardPort', 'invalidationPort', 'license', 'client', 'config']) {
+        for (const bad of ['logLevel', 'mode', 'dashboardPort', 'license', 'client', 'config']) {
             assert.throws(
                 () => new GoldLapel('postgresql://localhost:5432/mydb', {
                     config: { [bad]: 'x' },
@@ -534,68 +532,10 @@ describe('mesh startup options', () => {
 
 // ─── Headline strategy disables — promoted top-level options ──────────────
 //
-// Model B pivot (2026-05-04): the wrapper no longer carries
-// `enableProxyCacheForWrappers` at all; the proxy decides cache routing
-// per-connection from the `application_name` marker. In its place, four
-// headline strategy disables are promoted out of the `config` map to
+// Three headline strategy disables are promoted out of the `config` map to
 // first-class top-level options on `start()` / `new GoldLapel(...)`. Each
 // maps 1:1 to a proxy CLI flag and is rejected inside `config` (atomic
 // break — no aliases).
-
-describe('disableMatviews startup option', () => {
-    it('defaults to false', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._disableMatviews, false);
-    });
-
-    it('stores disableMatviews=true', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: true });
-        assert.strictEqual(gl._disableMatviews, true);
-    });
-
-    it('coerces truthy/falsy to boolean', () => {
-        assert.strictEqual(
-            new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: 1 })._disableMatviews,
-            true,
-        );
-        assert.strictEqual(
-            new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: 0 })._disableMatviews,
-            false,
-        );
-        assert.strictEqual(
-            new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: undefined })._disableMatviews,
-            false,
-        );
-    });
-
-    it('emits --disable-matviews when true', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: true });
-        const args = gl._buildSpawnArgs();
-        assert.ok(args.includes('--disable-matviews'),
-            `argv must contain --disable-matviews: ${args.join(' ')}`);
-    });
-
-    it('omits --disable-matviews when false / unset', () => {
-        const glDefault = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.ok(!glDefault._buildSpawnArgs().includes('--disable-matviews'));
-        const glFalse = new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: false });
-        assert.ok(!glFalse._buildSpawnArgs().includes('--disable-matviews'));
-    });
-
-    it('rejects disableMatviews inside config map', () => {
-        assert.throws(
-            () => new GoldLapel('postgresql://localhost:5432/mydb', {
-                config: { disableMatviews: true },
-            }),
-            /Unknown config keys: disableMatviews/,
-        );
-    });
-
-    it('disableMatviews is not a valid config key', () => {
-        const keys = configKeys();
-        assert.ok(!keys.has('disableMatviews'));
-    });
-});
 
 describe('disableProxyCache startup option', () => {
     it('defaults to false', () => {
@@ -738,34 +678,32 @@ describe('disableAutoIndexes startup option', () => {
     });
 });
 
-describe('Model B pivot — enableProxyCacheForWrappers fully removed', () => {
-    // Atomic break (Model B, 2026-05-04): the proxy decides cache routing
-    // per-connection from the `application_name` marker. The wrapper no
-    // longer carries any opt-in for proxy result caching — even passing
-    // the old key as a top-level option is silently ignored (it isn't
-    // recognised by the constructor) and inside `config` it raises.
+describe('removed options', () => {
+    // The wrappers' in-process cache and the proxy's materialized views are
+    // gone, and so are their options (atomic break, no aliases). As
+    // top-level options they're unrecognised and never reach the binary;
+    // inside `config` they're rejected.
+    const removed = {
+        invalidationPort: 7934,
+        disableNativeCache: true,
+        aggressiveVerify: 'on',
+        disableMatviews: true,
+    };
 
-    it('passing the removed key inside config is rejected', () => {
-        assert.throws(
-            () => new GoldLapel('postgresql://localhost:5432/mydb', {
-                config: { enableProxyCacheForWrappers: true },
-            }),
-            /Unknown config keys: enableProxyCacheForWrappers/,
-        );
+    it('are not forwarded to the binary argv', () => {
+        const args = new GoldLapel('postgresql://localhost:5432/mydb', removed)._buildSpawnArgs();
+        for (const flag of ['--invalidation-port', '--native-cache-size', '--aggressive-verify', '--disable-matviews']) {
+            assert.ok(!args.includes(flag), `argv must not contain ${flag}: ${args.join(' ')}`);
+        }
     });
 
-    it('argv never contains --enable-proxy-cache-for-wrappers', () => {
-        // Even with the (no-op) top-level key passed, the spawn args must
-        // not surface the flag to the proxy binary.
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            enableProxyCacheForWrappers: true,
-        });
-        assert.ok(!gl._buildSpawnArgs().includes('--enable-proxy-cache-for-wrappers'));
-    });
-
-    it('instance has no _enableProxyCacheForWrappers field', () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._enableProxyCacheForWrappers, undefined);
+    it('are rejected inside the config map', () => {
+        for (const key of Object.keys(removed)) {
+            assert.throws(
+                () => new GoldLapel('postgresql://localhost:5432/mydb', { config: { [key]: removed[key] } }),
+                { message: new RegExp(`Unknown config keys: ${key}`) },
+            );
+        }
     });
 });
 
@@ -776,14 +714,13 @@ describe('configKeys', () => {
         assert.ok(keys instanceof Set);
         // Tuning knobs still live in the structured config map.
         assert.ok(keys.has('poolSize'));
-        assert.ok(keys.has('disableConsolidation'));
+        assert.ok(keys.has('disableCoalescing'));
         // Top-level concepts must NOT appear — passing them via config is a
-        // user error. The four headline disables (Model B pivot, 2026-05-04)
-        // were promoted out of `config` to first-class options.
+        // user error. The three headline disables were promoted out of
+        // `config` to first-class options.
         assert.ok(!keys.has('mode'));
         assert.ok(!keys.has('logLevel'));
         assert.ok(!keys.has('dashboardPort'));
-        assert.ok(!keys.has('disableMatviews'));
         assert.ok(!keys.has('disableProxyCache'));
         assert.ok(!keys.has('disableSqloptimize'));
         assert.ok(!keys.has('disableAutoIndexes'));

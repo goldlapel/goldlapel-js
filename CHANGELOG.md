@@ -4,6 +4,36 @@
 
 ### Breaking changes
 
+**The in-process cache (L1) is gone.** Gold Lapel now caches in one place:
+the proxy, which caches every client the same way, wrapper or not. The
+wrapper is the proxy as a managed subprocess (find the binary, start and
+stop it with your app, translate options into proxy flags, hand back a
+driver-ready URL) plus the Postgres-backed helpers, which are unchanged.
+Removed, with no aliases:
+
+- `wrap()` and `NativeCache` (and `cache.js` / `wrap.js`): connections and
+  pools are no longer wrapped. Use your driver's client or pool directly
+  against `gl.url`.
+- Options `invalidationPort`, `disableNativeCache`, `aggressiveVerify`,
+  `aggressiveVerifyActive`. The proxy no longer serves an invalidation
+  port; it listens on two ports, proxy and dashboard (proxy + 1).
+- Env vars `GOLDLAPEL_NATIVE_CACHE`, `GOLDLAPEL_NATIVE_CACHE_SIZE`,
+  `GOLDLAPEL_REPORT_STATS`.
+
+**Materialized-view options removed.** The proxy no longer builds
+materialized views. Removed: the `disableMatviews` option and the
+`config` keys `refreshIntervalSecs`, `patternTtlSecs`, `maxTablesPerView`,
+`maxColumnsPerView`, `disableConsolidation`, `disableRewrite`, and
+`disableShadowMode`.
+
+**`config.enableCoalescing` replaced by `config.disableCoalescing`.**
+Query coalescing is on by default in the proxy, and the proxy only
+accepts `--disable-coalescing`; the old key produced a flag it rejects.
+
+The `application_name=goldlapel:js:<version>` connection tag stays — it
+labels wrapper connections in `pg_stat_activity`; the proxy doesn't treat
+them differently.
+
 **Phase 5 — Redis-compat helpers moved under nested namespaces.** The flat
 counter / zset / hash / queue / geo methods are gone; each family lives
 under its own sub-API. No backwards-compat aliases — search and replace

@@ -1,7 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { GoldLapel, start, _driverNotFoundError, _detectDriver, _connectWithDriver, _logLevelToVerboseFlag, _makePostgresJsAdapter, _DRIVER_CANDIDATES } from '../index.js';
-import { NativeCache } from '../cache.js';
 import * as goldlapel from '../index.js';
 import goldlapelDefault from '../index.js';
 
@@ -489,81 +488,6 @@ describe('silent option', () => {
     });
 });
 
-// ─── disableNativeCache option ─────────────────────────────────────────────
-//
-// `disableNativeCache: true` flips the wrapper's native cache off without
-// touching the tuned `cacheSize`. Previously the only way to disable the
-// native cache was `cacheSize: 0`, which conflated capacity with on/off. The
-// explicit option lets customers A/B the native cache layer (compare
-// end-to-end latency with and without it) while keeping their size config
-// intact. Wrapper-only — never forwarded to the Rust binary as a CLI flag.
-
-describe('disableNativeCache option', () => {
-    it('stored on the instance as a boolean', () => {
-        NativeCache._reset();
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: true });
-        assert.strictEqual(gl._disableNativeCache, true);
-    });
-
-    it('default is false', () => {
-        NativeCache._reset();
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._disableNativeCache, false);
-    });
-
-    it('coerces truthy/falsy values to booleans', () => {
-        NativeCache._reset();
-        const gl1 = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: 1 });
-        assert.strictEqual(gl1._disableNativeCache, true);
-        NativeCache._reset();
-        const gl2 = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: 0 });
-        assert.strictEqual(gl2._disableNativeCache, false);
-        NativeCache._reset();
-        const gl3 = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: undefined });
-        assert.strictEqual(gl3._disableNativeCache, false);
-    });
-
-    it('flips the NativeCache singleton _disabled bit on construction', () => {
-        NativeCache._reset();
-        new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: true });
-        // Re-grab the singleton without overriding (`disabled` not in opts)
-        // and check the bit landed on the cache.
-        const cache = new NativeCache();
-        assert.equal(cache._disabled, true);
-    });
-
-    it('default leaves the cache enabled', () => {
-        NativeCache._reset();
-        new GoldLapel('postgresql://localhost:5432/mydb');
-        const cache = new NativeCache();
-        assert.equal(cache._disabled, false);
-    });
-
-    it('is not forwarded to the binary argv', () => {
-        // disableNativeCache is a wrapper-only knob (the proxy doesn't
-        // have a matching --disable-native-cache flag — the native cache
-        // lives entirely in the wrapper process). Verify nothing leaks
-        // into the argv.
-        NativeCache._reset();
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { disableNativeCache: true });
-        const args = gl._buildSpawnArgs();
-        assert.ok(!args.includes('--disable-native-cache'),
-            `argv must not contain --disable-native-cache: ${args.join(' ')}`);
-        assert.ok(!args.some(a => /--?disable-?native-?cache/i.test(a)),
-            `argv must not contain any disable-native-cache flag: ${args.join(' ')}`);
-    });
-
-    it('disableNativeCache in config object is rejected at construction (wrapper-only key)', () => {
-        NativeCache._reset();
-        assert.throws(
-            () => new GoldLapel('postgresql://localhost:5432/mydb', {
-                config: { disableNativeCache: true },
-            }),
-            /Unknown config keys: disableNativeCache/,
-        );
-    });
-});
-
 // ─── logLevel option ───────────────────────────────────────────────────────
 
 describe('logLevel option', () => {
@@ -763,8 +687,6 @@ describe('default export symmetry', () => {
         assert.strictEqual(goldlapelDefault.GoldLapel, goldlapel.GoldLapel);
         assert.strictEqual(goldlapelDefault.start, goldlapel.start);
         assert.strictEqual(goldlapelDefault.configKeys, goldlapel.configKeys);
-        assert.strictEqual(goldlapelDefault.wrap, goldlapel.wrap);
-        assert.strictEqual(goldlapelDefault.NativeCache, goldlapel.NativeCache);
         assert.strictEqual(goldlapelDefault.publish, goldlapel.publish);
         assert.strictEqual(goldlapelDefault.subscribe, goldlapel.subscribe);
         assert.strictEqual(goldlapelDefault.search, goldlapel.search);
@@ -787,50 +709,5 @@ describe('default export symmetry', () => {
         }
         assert.deepStrictEqual(missing, [],
             `named exports missing from default: ${JSON.stringify(missing)}`);
-    });
-});
-
-// ─── GoldLapel: aggressiveVerify constructor option ───────────────────────
-
-describe('GoldLapel — aggressiveVerify option', () => {
-    it("default is 'auto' and 'aggressiveVerifyActive' is null", () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
-        assert.strictEqual(gl._aggressiveVerify, 'auto');
-        assert.strictEqual(gl._aggressiveVerifyActive, null);
-    });
-
-    it("accepts 'on' / 'off' / 'auto'", () => {
-        for (const mode of ['on', 'off', 'auto']) {
-            const gl = new GoldLapel('postgresql://localhost:5432/mydb', { aggressiveVerify: mode });
-            assert.strictEqual(gl._aggressiveVerify, mode);
-        }
-    });
-
-    it("rejects invalid aggressiveVerify mode", () => {
-        assert.throws(
-            () => new GoldLapel('postgresql://localhost:5432/mydb', { aggressiveVerify: 'maybe' }),
-            /aggressiveVerify must be one of/
-        );
-    });
-
-    it("aggressiveVerifyActive=true is stored as true", () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            aggressiveVerifyActive: true,
-        });
-        assert.strictEqual(gl._aggressiveVerifyActive, true);
-    });
-
-    it("aggressiveVerifyActive=false is stored as false", () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            aggressiveVerifyActive: false,
-        });
-        assert.strictEqual(gl._aggressiveVerifyActive, false);
-    });
-
-    it("non-boolean aggressiveVerifyActive resolves to null (no override)", () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', {
-            aggressiveVerifyActive: 'yes', // truthy but not boolean — ignored
-        });
-        assert.strictEqual(gl._aggressiveVerifyActive, null);
     });
 });

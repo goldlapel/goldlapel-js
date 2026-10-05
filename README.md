@@ -2,7 +2,9 @@
 
 [![Tests](https://github.com/goldlapel/goldlapel-js/actions/workflows/test.yml/badge.svg)](https://github.com/goldlapel/goldlapel-js/actions/workflows/test.yml)
 
-The Node.js wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that watches query patterns and creates materialized views + indexes automatically. Zero code changes beyond the connection string.
+The Node.js wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that watches query patterns, caches results, and creates indexes automatically. Zero code changes beyond the connection string.
+
+The wrapper runs the proxy as a managed subprocess: it finds the binary, starts it with your app and stops it on exit, translates options into proxy flags, and hands back a driver-ready URL. It also carries Postgres-backed helpers (search, documents, streams, counters, sorted sets, hashes, queues, geo, pub/sub). Caching happens in the proxy, for every client alike — the wrapper adds no in-process cache, and the connection you get is a plain driver connection.
 
 ## Install
 
@@ -34,13 +36,13 @@ const { rows } = await client.query('SELECT * FROM users WHERE id = $1', [42]);
 await gl.stop();  // (also cleaned up automatically on process exit)
 ```
 
-Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and your DB, watching query patterns and creating materialized views + indexes automatically. Zero code changes beyond the connection string.
+Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and your DB, caching results and creating indexes as it learns your query patterns. Connections opened through `gl.url` are tagged `application_name=goldlapel:js:<version>` so you can spot them in `pg_stat_activity`.
 
 `await using` auto-cleanup, scoped connections via `gl.using(conn, cb)`, driver auto-detection, and framework integrations are in the docs.
 
 ## Dashboard
 
-Gold Lapel exposes a live dashboard at `gl.dashboardUrl`:
+The proxy listens on two ports: the proxy port (default `7932`) and a dashboard on the next port up. Gold Lapel exposes the live dashboard at `gl.dashboardUrl`:
 
 ```js
 console.log(gl.dashboardUrl);
@@ -53,7 +55,7 @@ Full API reference, configuration, framework integrations (Prisma, Drizzle, Next
 
 ## Uninstalling
 
-Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+Before removing the package, drop Gold Lapel's helper schema and the indexes it created from your Postgres:
 
 ```bash
 goldlapel clean
@@ -67,7 +69,7 @@ rm -rf ~/.goldlapel
 rm -f goldlapel.toml     # only if you wrote one
 ```
 
-Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and the indexes it created go away.
 
 ## License
 
