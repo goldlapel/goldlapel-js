@@ -56,11 +56,13 @@ Both `drizzle()` and `init()` accept an options object:
 | Option | Description |
 |--------|-------------|
 | `url` | Upstream Postgres URL. Defaults to `process.env.DATABASE_URL`. |
-| `proxyPort` | Port for the Gold Lapel proxy. Defaults to `7932`; the dashboard listens on the next port up. |
+| `proxyPort` | Port for the Gold Lapel proxy. Defaults to `7932` (the dashboard listens on the next port up); a second database started in the same process gets the next free pair — `7934`, `7936`, …. |
 | `config` | Config object passed to Gold Lapel (see below). |
 | `extraArgs` | Array of extra CLI args passed to the Gold Lapel binary. |
 
-`drizzle()` forwards all other options to `drizzle-orm/node-postgres`:
+Every other `goldlapel` `start()` option is accepted too and passed through as given: `dashboardPort`, `logLevel`, `mode`, `license`, `client`, `configFile`, `silent`, `mesh`, `meshTag`, `disableProxyCache`, `disableSqloptimize`, `disableAutoIndexes`. Unknown or removed options (`invalidationPort`, `nativeCache`, …) are an error rather than silently ignored.
+
+`drizzle()` forwards everything else (`schema`, `logger`, `casing`, …) to `drizzle-orm/node-postgres`:
 
 ```javascript
 const db = await drizzle({

@@ -42,7 +42,7 @@ Point your Postgres driver at `gl.url`. Gold Lapel sits between your app and you
 
 ## Dashboard
 
-The proxy listens on two ports: the proxy port (default `7932`) and a dashboard on the next port up. Gold Lapel exposes the live dashboard at `gl.dashboardUrl`:
+The proxy listens on two ports: the proxy port (default `7932`) and a dashboard on the next port up. Each database you `start()` in one process gets its own proxy and the next free pair — `7932`/`7933`, then `7934`/`7935`, … — unless you pass `proxyPort`; starting the same database again shares its proxy. Gold Lapel exposes the live dashboard at `gl.dashboardUrl`:
 
 ```js
 console.log(gl.dashboardUrl);

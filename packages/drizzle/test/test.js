@@ -71,7 +71,7 @@ describe('drizzle', () => {
 
         assert.strictEqual(calls.length, 1)
         assert.strictEqual(calls[0].upstream, 'postgresql://user:pass@host:5432/mydb')
-        assert.deepStrictEqual(calls[0].opts, { config: undefined, proxyPort: undefined, extraArgs: undefined, noConnect: true })
+        assert.deepStrictEqual(calls[0].opts, { noConnect: true })
         assert.strictEqual(pools.length, 1)
         assert.strictEqual(pools[0]._opts.connectionString, 'postgresql://user:pass@localhost:7932/mydb')
         assert.strictEqual(drizzleCalls.length, 1)
@@ -413,5 +413,84 @@ describe('re-exports', () => {
         for (const name of removed) {
             assert.strictEqual(plugin[name], undefined, `${name} should not be re-exported`)
         }
+    })
+})
+
+
+describe('goldlapel options', () => {
+    const origUrl = process.env.DATABASE_URL
+
+    beforeEach(() => {
+        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
+    })
+
+    afterEach(() => {
+        if (origUrl !== undefined) {
+            process.env.DATABASE_URL = origUrl
+        } else {
+            delete process.env.DATABASE_URL
+        }
+    })
+
+    // Every start() option, as a caller might set it.
+    const allOptions = {
+        proxyPort: 9000, dashboardPort: 9100, logLevel: 'debug', mode: 'waiter',
+        license: '/etc/gl.pem', client: 'my-app', configFile: 'goldlapel.toml',
+        config: { poolSize: 5 }, extraArgs: ['--verbose'], silent: true,
+        mesh: true, meshTag: 'eu', disableProxyCache: true,
+        disableSqloptimize: true, disableAutoIndexes: true,
+    }
+
+    it('covers every start() option', async () => {
+        const { startOptionKeys } = await import('goldlapel')
+        const keys = new Set(Object.keys(allOptions))
+        keys.add('noConnect')
+        assert.deepStrictEqual([...keys].sort(), [...startOptionKeys()].sort())
+    })
+
+    it('drizzle forwards every start() option to start and none to drizzle-orm', async () => {
+        const { _start, calls } = mockStart('postgresql://user:pass@localhost:9000/mydb')
+        const { _drizzle, calls: drizzleCalls } = mockDrizzle()
+        const { _pg } = mockPg()
+
+        await drizzle({ ...allOptions, schema: { users: 'mock' }, casing: 'snake_case', _start, _drizzle, _pg })
+
+        assert.deepStrictEqual(calls[0].opts, { ...allOptions, noConnect: true })
+        assert.deepStrictEqual(drizzleCalls[0].options, { schema: { users: 'mock' }, casing: 'snake_case' })
+    })
+
+    it('init forwards every start() option', async () => {
+        const { _start, calls } = mockStart('postgresql://user:pass@localhost:9000/mydb')
+        await init({ ...allOptions, _start })
+        assert.deepStrictEqual(calls[0].opts, { ...allOptions, noConnect: true })
+    })
+
+    it('removed options go to start(), never to drizzle-orm', async () => {
+        const { _start, calls } = mockStart('postgresql://user:pass@localhost:7932/mydb')
+        const { _drizzle, calls: drizzleCalls } = mockDrizzle()
+        const { _pg } = mockPg()
+
+        await drizzle({ nativeCache: true, invalidationPort: 7934, _start, _drizzle, _pg })
+
+        assert.deepStrictEqual(calls[0].opts, { nativeCache: true, invalidationPort: 7934, noConnect: true })
+        assert.deepStrictEqual(drizzleCalls[0].options, {})
+    })
+
+    it('rejects removed options, naming why', async () => {
+        const { _drizzle } = mockDrizzle()
+        const { _pg } = mockPg()
+        await assert.rejects(
+            () => drizzle({ nativeCache: true, _drizzle, _pg }),
+            /Unknown options: nativeCache \(removed with the in-process cache\)/,
+        )
+    })
+
+    it('init rejects options that are not start() options', async () => {
+        const { _start, calls } = mockStart('postgresql://user:pass@localhost:7932/mydb')
+        await assert.rejects(
+            () => init({ schema: {}, _start }),
+            /Unknown options: schema/,
+        )
+        assert.strictEqual(calls.length, 0)
     })
 })

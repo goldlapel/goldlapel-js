@@ -4,6 +4,23 @@
 
 ### Breaking changes
 
+**Unknown top-level options are rejected.** `start()` / `new GoldLapel()`
+throw `Unknown options: …` like unknown `config` keys already did, and name
+why for removed ones: `invalidationPort`, `disableNativeCache`,
+`aggressiveVerify(Active)` and `nativeCache(Size)` (removed with the
+in-process cache), `disableMatviews` (removed with materialized views).
+They used to be silently ignored. `startOptionKeys()` lists the valid ones.
+
+**The app URL no longer carries the upstream's TLS / GSS parameters.**
+`gl.url` drops `sslmode`, `ssl`, `sslcert`, `sslkey`, `sslrootcert`,
+`sslcrl`, `sslcrldir`, `sslpassword`, `sslsni`, `sslnegotiation`,
+`ssl_min/max_protocol_version`, `requiressl`, `channel_binding`,
+`gssencmode`, `krbsrvname` and `gsslib`. They describe the proxy's hop to
+the database (which still uses them); the proxy declines client TLS unless
+given a certificate, so `?sslmode=require` — every Neon, Supabase and RDS
+URL — made the app's connection fail. They're kept when `config.tlsCert`
+or `--tls-cert` turns on client TLS.
+
 **The in-process cache (L1) is gone.** Gold Lapel now caches in one place:
 the proxy, which caches every client the same way, wrapper or not. The
 wrapper is the proxy as a managed subprocess (find the binary, start and
@@ -164,6 +181,28 @@ goldlapel clean   # drops _goldlapel.* tables
 If you have a v0.2-pre wrapper running against a v0.2-post proxy, the
 wrapper's first `gl.documents.<verb>` call surfaces a clear
 `version_mismatch` error pointing to this CHANGELOG.
+
+### Proxy ports, sharing and startup
+
+- **Several databases in one process get their own ports.** A `start()`
+  without `proxyPort` takes the smallest port from 7932 up whose pair
+  (proxy + dashboard) no other proxy of this process holds and the OS can
+  bind right now — 7932, then 7934, 7936, …. Before, every upstream got
+  7932, and the second proxy shared the first one's port. Probing the OS
+  also skips ports other programs hold.
+- **A second `start()` for the same upstream shares its proxy.** Each call
+  returns its own instance; the proxy stops when the last one does. Asking
+  the shared proxy for different options is an error, not silently ignored.
+- **An explicit `proxyPort` or `dashboardPort` another proxy of this process
+  holds is an error** naming the port and the other upstream (password
+  masked). One another program holds fails with the proxy's own "already in
+  use" message.
+- **Startup checks the proxy is ours.** `start()` succeeds only if the port
+  answers and the spawned proxy is still running; if it exited, the error
+  gives its exit status and stderr. Before, another listener on the port
+  passed the readiness check.
+- **The proxy is stopped on process exit.** The exit handler called the
+  async `stop()`, which never reached the kill.
 
 ### New exports
 

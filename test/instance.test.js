@@ -170,7 +170,9 @@ describe('wrapper methods throw before conn is available', () => {
     });
 
     it('gl.documents.find throws', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        // No dashboard, so nothing listening on the default port (another
+        // test's proxy, say) can answer.
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { dashboardPort: 0 });
         // Before start(), there's no dashboard token + no default conn —
         // expect either flavour of "not connected" (no token, or no
         // conn after a token came from env/file).
@@ -181,7 +183,9 @@ describe('wrapper methods throw before conn is available', () => {
     });
 
     it('gl.streams.add throws', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb');
+        // No dashboard, so nothing listening on the default port (another
+        // test's proxy, say) can answer.
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { dashboardPort: 0 });
         await assert.rejects(
             () => gl.streams.add('events', { type: 'click' }),
             /(No dashboard token|Not connected|dashboard not reachable|No dashboard port)/i,

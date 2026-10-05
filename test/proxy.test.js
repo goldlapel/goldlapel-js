@@ -13,6 +13,8 @@ import {
     _makeProxyUrl,
     _waitForPort,
     _configToArgs,
+    _redactUpstream,
+    startOptionKeys,
 } from '../index.js';
 
 // The proxy URL gets `application_name=goldlapel:js:<version>` appended so
@@ -105,8 +107,8 @@ describe('makeProxyUrl', () => {
 
     it('preserves query params', () => {
         assert.strictEqual(
-            _makeProxyUrl('postgresql://user:pass@remote:5432/mydb?sslmode=require', 7932),
-            `postgresql://user:pass@localhost:7932/mydb?sslmode=require&${_APP_NAME_SUFFIX}`
+            _makeProxyUrl('postgresql://user:pass@remote:5432/mydb?connect_timeout=10', 7932),
+            `postgresql://user:pass@localhost:7932/mydb?connect_timeout=10&${_APP_NAME_SUFFIX}`
         );
     });
 
@@ -155,7 +157,7 @@ describe('makeProxyUrl', () => {
     it('handles @ in password with query params', () => {
         assert.strictEqual(
             _makeProxyUrl('postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue', 7932),
-            `postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&${_APP_NAME_SUFFIX}`
+            `postgresql://user:p@ss@localhost:7932/mydb?param=val@ue&${_APP_NAME_SUFFIX}`
         );
     });
 
@@ -189,6 +191,75 @@ describe('makeProxyUrl', () => {
 });
 
 
+describe('makeProxyUrl drops TLS / GSS parameters meant for the upstream', () => {
+    it('drops sslmode and channel_binding, keeps the rest', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://u:p@ep-x.neon.tech/db?sslmode=require&channel_binding=require&application_name=app', 7932),
+            'postgresql://u:p@localhost:7932/db?application_name=app'
+        );
+    });
+
+    it('drops every upstream-only parameter, case-insensitively', () => {
+        const params = [
+            'ssl=true', 'sslmode=verify-full', 'sslcert=/c', 'sslkey=/k', 'sslrootcert=/r',
+            'sslcrl=/l', 'sslcrldir=/d', 'sslpassword=x', 'sslsni=1', 'sslnegotiation=direct',
+            'ssl_min_protocol_version=TLSv1.2', 'ssl_max_protocol_version=TLSv1.3',
+            'requiressl=1', 'channel_binding=require', 'gssencmode=disable',
+            'krbsrvname=postgres', 'gsslib=gssapi', 'SSLMode=require',
+        ];
+        assert.strictEqual(
+            _makeProxyUrl(`postgresql://u:p@db:5432/db?${params.join('&')}&connect_timeout=5`, 7932),
+            `postgresql://u:p@localhost:7932/db?connect_timeout=5&${_APP_NAME_SUFFIX}`
+        );
+    });
+
+    it('drops the query entirely when nothing else is left', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://u:p@db:5432/db?sslmode=require', 7932),
+            `postgresql://u:p@localhost:7932/db?${_APP_NAME_SUFFIX}`
+        );
+    });
+
+    it('leaves percent-encoded values of other parameters untouched', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://u:p%40ss@db/db?sslmode=require&options=-c%20search_path%3Dx', 7932),
+            `postgresql://u:p%40ss@localhost:7932/db?options=-c%20search_path%3Dx&${_APP_NAME_SUFFIX}`
+        );
+    });
+
+    it('keeps them when the proxy serves client TLS itself', () => {
+        assert.strictEqual(
+            _makeProxyUrl('postgresql://u:p@db/db?sslmode=require', 7932, true),
+            `postgresql://u:p@localhost:7932/db?sslmode=require&${_APP_NAME_SUFFIX}`
+        );
+    });
+
+    it('client TLS is on when config.tlsCert or --tls-cert is given', () => {
+        const up = 'postgresql://u:p@db/db';
+        assert.strictEqual(new GoldLapel(up)._clientTls(), false);
+        assert.strictEqual(new GoldLapel(up, { config: { tlsCert: '/c', tlsKey: '/k' } })._clientTls(), true);
+        assert.strictEqual(new GoldLapel(up, { extraArgs: ['--tls-cert', '/c'] })._clientTls(), true);
+        assert.strictEqual(new GoldLapel(up, { extraArgs: ['--tls-cert=/c'] })._clientTls(), true);
+    });
+});
+
+
+describe('redactUpstream', () => {
+    it('masks the password', () => {
+        assert.strictEqual(_redactUpstream('postgresql://u:s3cret@db:5432/x'), 'postgresql://u:***@db:5432/x');
+    });
+
+    it('masks a password containing @', () => {
+        assert.strictEqual(_redactUpstream('postgresql://u:a@b@db/x?sslmode=require'), 'postgresql://u:***@db/x?sslmode=require');
+    });
+
+    it('leaves URLs without a password alone', () => {
+        assert.strictEqual(_redactUpstream('postgresql://u@db/x'), 'postgresql://u@db/x');
+        assert.strictEqual(_redactUpstream('postgresql://db/x'), 'postgresql://db/x');
+    });
+});
+
+
 describe('applicationNameMarker', () => {
     // The wrapper tags PG connections with
     // `application_name=goldlapel:js:<version>`. It's a label only — the
@@ -205,8 +276,8 @@ describe('applicationNameMarker', () => {
     });
 
     it('appends marker after existing query params', () => {
-        const out = _makeProxyUrl('postgresql://localhost:5432/mydb?sslmode=require', 7932);
-        assert.ok(out.includes('sslmode=require'));
+        const out = _makeProxyUrl('postgresql://localhost:5432/mydb?connect_timeout=10', 7932);
+        assert.ok(out.includes('connect_timeout=10'));
         assert.ok(out.includes(`&${_APP_NAME_SUFFIX}`));
     });
 
@@ -680,9 +751,8 @@ describe('disableAutoIndexes startup option', () => {
 
 describe('removed options', () => {
     // The wrappers' in-process cache and the proxy's materialized views are
-    // gone, and so are their options (atomic break, no aliases). As
-    // top-level options they're unrecognised and never reach the binary;
-    // inside `config` they're rejected.
+    // gone, and so are their options (atomic break, no aliases). Passing one
+    // is an error that says why, at top level and inside `config`.
     const removed = {
         invalidationPort: 7934,
         disableNativeCache: true,
@@ -690,11 +760,19 @@ describe('removed options', () => {
         disableMatviews: true,
     };
 
-    it('are not forwarded to the binary argv', () => {
-        const args = new GoldLapel('postgresql://localhost:5432/mydb', removed)._buildSpawnArgs();
-        for (const flag of ['--invalidation-port', '--native-cache-size', '--aggressive-verify', '--disable-matviews']) {
-            assert.ok(!args.includes(flag), `argv must not contain ${flag}: ${args.join(' ')}`);
+    it('are rejected at top level, saying what removed them', () => {
+        for (const key of ['invalidationPort', 'disableNativeCache', 'aggressiveVerify']) {
+            assert.throws(
+                () => new GoldLapel('postgresql://localhost:5432/mydb', { [key]: removed[key] }),
+                { message: `Unknown options: ${key} (${key === 'invalidationPort'
+                    ? 'removed with the in-process cache; the proxy listens on two ports, proxy and dashboard'
+                    : 'removed with the in-process cache'})` },
+            );
         }
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', { disableMatviews: true }),
+            { message: 'Unknown options: disableMatviews (removed with materialized views)' },
+        );
     });
 
     it('are rejected inside the config map', () => {
@@ -704,6 +782,34 @@ describe('removed options', () => {
                 { message: new RegExp(`Unknown config keys: ${key}`) },
             );
         }
+    });
+});
+
+
+describe('unknown top-level options', () => {
+    it('are rejected, all named at once', () => {
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', { proxyport: 1, port: 2 }),
+            { message: 'Unknown options: port, proxyport' },
+        );
+    });
+
+    it('are rejected even when undefined', () => {
+        assert.throws(
+            () => new GoldLapel('postgresql://localhost:5432/mydb', { invalidationPort: undefined }),
+            /Unknown options: invalidationPort/,
+        );
+    });
+
+    it('every option in startOptionKeys() is accepted', () => {
+        const opts = Object.fromEntries([...startOptionKeys()].map(k => [k, undefined]));
+        assert.doesNotThrow(() => new GoldLapel('postgresql://localhost:5432/mydb', opts));
+    });
+
+    it('startOptionKeys() returns a new Set each call', () => {
+        assert.notStrictEqual(startOptionKeys(), startOptionKeys());
+        assert.ok(startOptionKeys().has('proxyPort'));
+        assert.ok(!startOptionKeys().has('invalidationPort'));
     });
 });
 

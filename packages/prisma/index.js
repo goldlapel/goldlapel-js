@@ -10,18 +10,20 @@ function _resolveProxyUrl(result) {
     return null
 }
 
+// Every option besides `url` and the test seams is a goldlapel start()
+// option and goes to it as given — start() rejects unknown ones.
+function _startOptions(options) {
+    const { url: _, _start, _PrismaClient, ...goldlapelOptions } = options
+    // Prisma has its own driver; we don't need the wrapper's internal conn.
+    return { ...goldlapelOptions, noConnect: true }
+}
+
 export async function withGoldLapel(options = {}) {
     const url = options.url || process.env.DATABASE_URL
     if (!url) throw new Error('Gold Lapel: DATABASE_URL not set. Pass { url } or set DATABASE_URL.')
     if (!process.env.GOLDLAPEL_CLIENT) process.env.GOLDLAPEL_CLIENT = 'prisma'
     const startFn = options._start || start
-    const result = await startFn(url, {
-        config: options.config,
-        proxyPort: options.proxyPort,
-        extraArgs: options.extraArgs,
-        // Prisma has its own driver; we don't need the wrapper's internal conn.
-        noConnect: true,
-    })
+    const result = await startFn(url, _startOptions(options))
     const proxyUrlStr = _resolveProxyUrl(result)
     process.env.DATABASE_URL = proxyUrlStr
 
@@ -34,12 +36,7 @@ export async function init(options = {}) {
     if (!url) throw new Error('Gold Lapel: DATABASE_URL not set. Pass { url } or set DATABASE_URL.')
     if (!process.env.GOLDLAPEL_CLIENT) process.env.GOLDLAPEL_CLIENT = 'prisma'
     const startFn = options._start || start
-    const result = await startFn(url, {
-        config: options.config,
-        proxyPort: options.proxyPort,
-        extraArgs: options.extraArgs,
-        noConnect: true,
-    })
+    const result = await startFn(url, _startOptions(options))
     const proxyUrlStr = _resolveProxyUrl(result)
     process.env.DATABASE_URL = proxyUrlStr
     return proxyUrlStr

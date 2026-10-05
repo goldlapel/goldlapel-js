@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+**Every `goldlapel` start option is forwarded.** Besides `proxyPort`,
+`config` and `extraArgs`, the plugin now passes `dashboardPort`, `logLevel`,
+`mode`, `license`, `client`, `configFile`, `silent`, `mesh`, `meshTag` and
+the `disable*` switches through to `start()` as given (and `proxyPort` only
+when you set one, so several databases get their own ports). Unknown and
+removed options are an error, from `start()`. Options that aren't Gold Lapel's still go to `drizzle-orm`; removed Gold Lapel options (`nativeCache`, `invalidationPort`) no longer leak into it. `init()` rejects options that aren't Gold Lapel's.
+
 **The in-process cache is gone.** `drizzle()` hands Drizzle a plain
 `pg.Pool` pointed at the proxy instead of a cache-wrapped one, and no
 longer takes `invalidationPort` or `nativeCache`. The `wrap` and

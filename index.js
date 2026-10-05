@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createConnection } from 'net';
+import { createConnection, createServer } from 'net';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { platform, arch } from 'os';
@@ -48,6 +48,16 @@ const require = createRequire(import.meta.url);
 const DEFAULT_PROXY_PORT = 7932;
 const STARTUP_TIMEOUT = 10000;
 const STARTUP_POLL_INTERVAL = 50;
+// How long to wait for the proxy to refuse a port that was already taken
+// when we spawned it. It checks its ports first thing, so it exits within
+// moments; past this, the port was freed in between and it started.
+const BUSY_PORT_GRACE = 2000;
+// The proxy checks its ports long before it binds them (it connects to the
+// upstream in between), so a port that answers within this long of the spawn
+// may be another program's listener; give the child until then to refuse.
+const READY_SETTLE = 300;
+// How much of a failed proxy's stderr goes into the error.
+const STDERR_TAIL = 4000;
 
 // Wrapper version, read from package.json. CI rewrites the version in
 // package.json from the git tag at publish time; local dev installs read
@@ -131,6 +141,40 @@ export function _logLevelToVerboseFlag(level) {
 
 export function configKeys() {
     return new Set(VALID_CONFIG_KEYS);
+}
+
+// Top-level options accepted by GoldLapel's constructor and start().
+const VALID_OPTIONS = new Set([
+    'proxyPort', 'dashboardPort', 'logLevel', 'mode', 'license',
+    'client', 'configFile', 'config', 'extraArgs', 'noConnect', 'silent',
+    'mesh', 'meshTag',
+    'disableProxyCache', 'disableSqloptimize', 'disableAutoIndexes',
+]);
+
+// Options that used to exist, with what took them away — so a caller still
+// passing one learns why instead of having it silently ignored.
+export const _REMOVED_OPTIONS = {
+    invalidationPort: 'removed with the in-process cache; the proxy listens on two ports, proxy and dashboard',
+    disableNativeCache: 'removed with the in-process cache',
+    nativeCache: 'removed with the in-process cache',
+    nativeCacheSize: 'removed with the in-process cache',
+    aggressiveVerify: 'removed with the in-process cache',
+    aggressiveVerifyActive: 'removed with the in-process cache',
+    disableMatviews: 'removed with materialized views',
+};
+
+export function startOptionKeys() {
+    return new Set(VALID_OPTIONS);
+}
+
+function _checkOptions(options) {
+    const unknown = Object.keys(options).filter(k => !VALID_OPTIONS.has(k));
+    if (unknown.length > 0) {
+        const described = unknown.sort().map(k =>
+            _REMOVED_OPTIONS[k] ? `${k} (${_REMOVED_OPTIONS[k]})` : k
+        );
+        throw new Error(`Unknown options: ${described.join(', ')}`);
+    }
 }
 
 export function _configToArgs(config) {
@@ -239,10 +283,54 @@ function _injectApplicationName(url) {
     return `${url}${sep}application_name=${_applicationNameMarker()}`;
 }
 
-export function _makeProxyUrl(upstream, port) {
+// Connection parameters that configure TLS / GSS encryption. They belong to
+// the proxy's upstream hop: the proxy declines client TLS unless it was given
+// a certificate, so `?sslmode=require` (every Neon / Supabase / RDS URL) left
+// on the app's URL would make every connection to the proxy fail. `ssl` is
+// node-postgres's and postgres.js's own spelling.
+const UPSTREAM_ONLY_PARAMS = new Set([
+    'ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert', 'sslcrl', 'sslcrldir',
+    'sslpassword', 'sslsni', 'sslnegotiation', 'ssl_min_protocol_version',
+    'ssl_max_protocol_version', 'requiressl', 'channel_binding', 'gssencmode',
+    'krbsrvname', 'gsslib',
+]);
+
+// Drop UPSTREAM_ONLY_PARAMS from the query of `pathEtc` (path?query#fragment),
+// leaving every other parameter byte-for-byte as it was.
+function _stripUpstreamOnlyParams(pathEtc) {
+    const q = pathEtc.indexOf('?');
+    if (q === -1) return pathEtc;
+    const hash = pathEtc.indexOf('#', q);
+    const query = hash === -1 ? pathEtc.slice(q + 1) : pathEtc.slice(q + 1, hash);
+    const fragment = hash === -1 ? '' : pathEtc.slice(hash);
+    const kept = query.split('&').filter(part => {
+        const key = part.split('=')[0];
+        let decoded = key;
+        try { decoded = decodeURIComponent(key); } catch {}
+        return part !== '' && !UPSTREAM_ONLY_PARAMS.has(decoded.toLowerCase());
+    });
+    const path = pathEtc.slice(0, q);
+    return (kept.length ? `${path}?${kept.join('&')}` : path) + fragment;
+}
+
+// The upstream URL with its password masked, for error messages.
+export function _redactUpstream(upstream) {
+    const m = upstream.match(/^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*)(.*)$/i);
+    if (!m) return upstream;
+    const atIdx = m[2].lastIndexOf('@');
+    if (atIdx === -1) return upstream;
+    const userinfo = m[2].slice(0, atIdx);
+    const colon = userinfo.indexOf(':');
+    if (colon === -1) return upstream;
+    return `${m[1]}${userinfo.slice(0, colon)}:***${m[2].slice(atIdx)}${m[3]}`;
+}
+
+export function _makeProxyUrl(upstream, port, clientTls = false) {
     // Build a proxy URL: replace host with localhost and set the proxy port.
     // Uses regex instead of URL class to avoid decoding percent-encoded characters
     // in passwords (e.g. %40 for @), which would corrupt the URL on reconstruction.
+    // TLS / GSS parameters are dropped unless the proxy itself serves client
+    // TLS (`clientTls`) — they describe the upstream hop, not the app's.
 
     // Split userinfo from host at the LAST @ (passwords may contain literal @).
     // This two-step approach avoids backtracking issues where (?:.*@)? is optional
@@ -255,7 +343,8 @@ export function _makeProxyUrl(upstream, port) {
         // The authority ends at the first / ? or # — only look for @ within it
         const authEnd = rest.search(/[/?#]/);
         const authority = authEnd === -1 ? rest : rest.slice(0, authEnd);
-        const pathEtc = authEnd === -1 ? '' : rest.slice(authEnd);
+        let pathEtc = authEnd === -1 ? '' : rest.slice(authEnd);
+        if (!clientTls) pathEtc = _stripUpstreamOnlyParams(pathEtc);
 
         // Find the last @ within the authority to split userinfo from host
         const atIdx = authority.lastIndexOf('@');
@@ -440,30 +529,97 @@ export async function _connectWithDriver(driverName, url) {
 
 // ─── GoldLapel instance ────────────────────────────────────────────────────
 
-const _liveInstances = new Set();
+// Proxies this process has started, by upstream URL. Each one records the
+// ports it holds and the GoldLapel instances using it (`holders`); a second
+// start() for the same upstream shares the running proxy, and the proxy stops
+// when its last holder does.
+const _proxies = new Map();
 let _cleanupRegistered = false;
 
 function _cleanup() {
-    for (const inst of _liveInstances) {
-        try { inst.stop(); } catch {}
+    // Runs on process 'exit', where nothing async completes — signal the
+    // children directly rather than through the async stop().
+    for (const proxy of _proxies.values()) {
+        if (proxy.process && _alive(proxy.process)) {
+            try { proxy.process.kill('SIGTERM'); } catch {}
+        }
     }
-    _liveInstances.clear();
+    _proxies.clear();
+}
+
+function _alive(proc) {
+    return proc.exitCode === null && !proc.signalCode;
+}
+
+// A proxy still starting up counts as live: its start() settles its fate.
+function _isLive(proxy) {
+    return !proxy.proxyUrl || _alive(proxy.process);
+}
+
+// SIGTERM `proc`, escalating to SIGKILL if it's still up 5s later.
+function _terminate(proc) {
+    if (!proc || !_alive(proc)) return;
+    proc.kill('SIGTERM');
+    setTimeout(() => {
+        if (_alive(proc)) proc.kill('SIGKILL');
+    }, 5000).unref();
+}
+
+// Remove `holder` from `proxy`; the last one out stops it.
+function _dropHolder(proxy, holder) {
+    proxy.holders.delete(holder);
+    if (proxy.holders.size > 0) return;
+    if (_proxies.get(proxy.upstream) === proxy) _proxies.delete(proxy.upstream);
+    _terminate(proxy.process);
+}
+
+// Ports held by this process's live proxies other than `except`, as
+// Map(port -> { upstream, role }): each one's proxy port plus its dashboard
+// port (none when the dashboard is off). A proxy still choosing its ports
+// holds the pair it is currently trying.
+function _claimedPorts(except) {
+    const claimed = new Map();
+    for (const proxy of _proxies.values()) {
+        if (proxy === except || !_isLive(proxy) || proxy.proxyPort === null) continue;
+        claimed.set(proxy.proxyPort, { upstream: proxy.upstream, role: 'proxy' });
+        if (proxy.dashboardPort) {
+            claimed.set(proxy.dashboardPort, { upstream: proxy.upstream, role: 'dashboard' });
+        }
+    }
+    return claimed;
+}
+
+// Whether `port` can be bound on all interfaces right now — the same check
+// the proxy makes before it starts. The probe listener is closed at once.
+export function _portBindable(port) {
+    return new Promise((resolve) => {
+        const srv = createServer();
+        srv.once('error', () => resolve(false));
+        srv.listen({ port, host: '0.0.0.0', exclusive: true }, () => {
+            srv.close(() => resolve(true));
+        });
+    });
 }
 
 export class GoldLapel {
-    constructor(upstream, {
-        proxyPort, dashboardPort, logLevel, mode, license,
-        client, configFile, config, extraArgs, noConnect, silent,
-        mesh, meshTag,
-        // Headline strategy disables — promoted out of `config` to
-        // first-class top-level options. Each maps 1:1 to a proxy CLI
-        // flag (`--disable-proxy-cache`, `--disable-sqloptimize`,
-        // `--disable-auto-indexes`). Atomic break — passing them inside
-        // `config` is rejected.
-        disableProxyCache, disableSqloptimize, disableAutoIndexes,
-    } = {}) {
+    constructor(upstream, options = {}) {
+        _checkOptions(options);
+        const {
+            proxyPort, dashboardPort, logLevel, mode, license,
+            client, configFile, config, extraArgs, noConnect, silent,
+            mesh, meshTag,
+            // Headline strategy disables — promoted out of `config` to
+            // first-class top-level options. Each maps 1:1 to a proxy CLI
+            // flag (`--disable-proxy-cache`, `--disable-sqloptimize`,
+            // `--disable-auto-indexes`). Atomic break — passing them inside
+            // `config` is rejected.
+            disableProxyCache, disableSqloptimize, disableAutoIndexes,
+        } = options;
         this._upstream = upstream;
-        this._proxyPort = proxyPort ?? DEFAULT_PROXY_PORT;
+        // Without an explicit proxyPort, _spawn() picks a free pair starting
+        // at the default; until then the default stands in.
+        this._proxyPortSet = proxyPort !== undefined && proxyPort !== null;
+        this._proxyPort = this._proxyPortSet ? Number(proxyPort) : DEFAULT_PROXY_PORT;
         // Dashboard port defaults to proxyPort + 1 when unset (matches what
         // the Rust binary binds when no --dashboard-port is passed). A
         // user-supplied value (including 0 for "disable dashboard")
@@ -501,6 +657,7 @@ export class GoldLapel {
         if (unknown.length > 0) {
             throw new Error(`Unknown config keys: ${unknown.sort().join(', ')}`);
         }
+        this._proxy = null;
         this._process = null;
         this._proxyUrl = null;
         this._defaultConn = null;
@@ -584,12 +741,146 @@ export class GoldLapel {
         return args;
     }
 
+    // Attach this instance to the proxy for its upstream, starting one if
+    // this process isn't already running it. A new proxy gets the ports the
+    // caller asked for, or the smallest free pair from 7932 up.
     async _spawn() {
-        if (this._process && this._process.exitCode === null) {
+        if (this._proxy) {
+            if (this.running) return;
+            this._release();
+        }
+
+        const existing = _proxies.get(this._upstream);
+        if (existing && _isLive(existing)) {
+            existing.holders.add(this);
+            try {
+                await existing.ready;
+                this._checkSameOptions(existing);
+            } catch (err) {
+                _dropHolder(existing, this);
+                throw err;
+            }
+            this._attach(existing);
             return;
         }
 
-        const args = this._buildSpawnArgs();
+        this._buildSpawnArgs();  // option errors surface before any port is claimed
+        const claimed = _claimedPorts(null);
+        if (this._proxyPortSet) {
+            this._checkPortFree(claimed, this._proxyPort, 'proxy');
+        }
+        if (this._proxyPortSet || this._dashboardPortSet) {
+            this._checkPortFree(claimed, this._dashboardPort, 'dashboard');
+        }
+
+        const proxy = {
+            upstream: this._upstream,
+            proxyPort: this._proxyPortSet ? this._proxyPort : null,
+            dashboardPort: this._proxyPortSet || this._dashboardPortSet ? this._dashboardPort : null,
+            dashboardPortSet: this._dashboardPortSet,
+            args: null,
+            process: null,
+            proxyUrl: null,
+            dashboardToken: null,
+            holders: new Set([this]),
+            ready: null,
+        };
+        _proxies.set(this._upstream, proxy);
+        if (!_cleanupRegistered) {
+            process.on('exit', _cleanup);
+            _cleanupRegistered = true;
+        }
+        proxy.ready = this._launch(proxy);
+        try {
+            await proxy.ready;
+        } catch (err) {
+            _dropHolder(proxy, this);
+            throw err;
+        }
+        this._attach(proxy);
+    }
+
+    _checkPortFree(claimed, port, role) {
+        const holder = port ? claimed.get(port) : undefined;
+        if (holder) {
+            throw new Error(
+                `Gold Lapel cannot use port ${port} as the ${role} port: this ` +
+                `process's proxy for ${_redactUpstream(holder.upstream)} already ` +
+                `holds it as its ${holder.role} port. Choose another port, or omit ` +
+                'proxyPort and dashboardPort to have a free pair assigned.'
+            );
+        }
+    }
+
+    // A second start() for a running upstream shares its proxy, so it must
+    // not ask for a different one. Ports it left unset take the running
+    // proxy's; anything else that would change the proxy's flags is an error
+    // rather than silently ignored.
+    _checkSameOptions(proxy) {
+        if (!this._proxyPortSet) this._proxyPort = proxy.proxyPort;
+        if (!this._dashboardPortSet) {
+            this._dashboardPortSet = proxy.dashboardPortSet;
+            this._dashboardPort = proxy.dashboardPort;
+        }
+        if (this._buildSpawnArgs().join('\0') !== proxy.args.join('\0')) {
+            throw new Error(
+                `Gold Lapel is already running for ${_redactUpstream(this._upstream)} ` +
+                `on port ${proxy.proxyPort} with different options. Start it with ` +
+                'the same options to share that proxy, or stop it first.'
+            );
+        }
+    }
+
+    // Choose ports (unless given), spawn the binary and wait until it
+    // answers on its proxy port.
+    async _launch(proxy) {
+        let portBusy = false;
+        let from = DEFAULT_PROXY_PORT;
+        if (this._proxyPortSet) {
+            // A port something else already listens on would answer our
+            // readiness check on the other listener's behalf; the proxy will
+            // refuse it, so wait for that instead.
+            portBusy = !(await _portBindable(this._proxyPort));
+        }
+        for (;;) {
+            if (!this._proxyPortSet) from = await this._choosePorts(proxy, from) + 1;
+            proxy.proxyPort = this._proxyPort;
+            proxy.dashboardPort = this._dashboardPort;
+            try {
+                await this._spawnProcess(proxy, portBusy);
+                return;
+            } catch (err) {
+                // Another process took the pair we chose between our probe
+                // and the proxy's own check: choose again.
+                if (this._proxyPortSet || !err.portInUse) throw err;
+                proxy.process = null;
+            }
+        }
+    }
+
+    // Pick the smallest proxy port >= `from` whose pair no live proxy of this
+    // process claims and the OS can bind right now. Returns the port.
+    async _choosePorts(proxy, from) {
+        for (let port = from; port <= 65535; port++) {
+            const dashboardPort = this._dashboardPortSet ? this._dashboardPort : port + 1;
+            const claimed = _claimedPorts(proxy);
+            if (claimed.has(port) || (this._dashboardPortSet && port === this._dashboardPort)) continue;
+            if (!this._dashboardPortSet && claimed.has(dashboardPort)) continue;
+            // Claim the pair before probing, so a concurrent start() moves on.
+            proxy.proxyPort = port;
+            proxy.dashboardPort = dashboardPort;
+            if (!(await _portBindable(port))) continue;
+            if (!this._dashboardPortSet && !(await _portBindable(dashboardPort))) continue;
+            this._proxyPort = port;
+            this._dashboardPort = dashboardPort;
+            return port;
+        }
+        throw new Error('Gold Lapel could not find a free proxy port');
+    }
+
+    // Spawn the binary for `proxy` and wait until it answers on its port.
+    async _spawnProcess(proxy, portBusy) {
+        proxy.args = this._buildSpawnArgs();
         const binary = _findBinary();
 
         const env = { ...process.env };
@@ -600,41 +891,105 @@ export class GoldLapel {
         // Provision a session-scoped dashboard token for /api/ddl/* calls.
         // Pre-set env wins (user may already have their own token).
         if (env.GOLDLAPEL_DASHBOARD_TOKEN) {
-            this._dashboardToken = env.GOLDLAPEL_DASHBOARD_TOKEN;
+            proxy.dashboardToken = env.GOLDLAPEL_DASHBOARD_TOKEN;
         } else {
             const { randomBytes } = await import('crypto');
-            this._dashboardToken = randomBytes(32).toString('hex');
-            env.GOLDLAPEL_DASHBOARD_TOKEN = this._dashboardToken;
+            proxy.dashboardToken = randomBytes(32).toString('hex');
+            env.GOLDLAPEL_DASHBOARD_TOKEN = proxy.dashboardToken;
         }
-        this._process = spawn(binary, args, {
+        const spawnedAt = Date.now();
+        const proc = spawn(binary, proxy.args, {
             stdio: ['ignore', 'ignore', 'pipe'],
             env,
         });
+        proxy.process = proc;
+        // A running proxy that dies frees its ports for the next start().
+        // (One that fails to start is cleaned up by _spawn().)
+        proc.on('exit', () => {
+            if (proxy.proxyUrl && _proxies.get(proxy.upstream) === proxy) {
+                _proxies.delete(proxy.upstream);
+            }
+        });
 
         let stderr = '';
+        let spawnFailed = false;
         const onData = (chunk) => { stderr += chunk; };
-        this._process.stderr.on('data', onData);
+        proc.stderr.on('data', onData);
+        proc.on('error', (err) => { spawnFailed = true; stderr += err.message; });
+        // 'close' follows 'exit' (or a failed spawn's 'error') once stderr
+        // has drained, so the whole message is in hand.
+        const closed = new Promise((resolve) => proc.once('close', () => resolve('exited')));
+        const alive = () => !spawnFailed && _alive(proc);
 
-        this._process.on('error', (err) => { stderr += err.message; });
-
-        const ready = await Promise.race([
-            _waitForPort('127.0.0.1', this._proxyPort, STARTUP_TIMEOUT),
-            new Promise((resolve) => {
-                this._process.on('exit', () => resolve(false));
-            }),
-        ]);
-        if (!ready) {
-            this._process.stderr.removeListener('data', onData);
-            this._process.kill();
-            throw new Error(
-                `Gold Lapel failed to start on port ${this._proxyPort} ` +
-                `within ${STARTUP_TIMEOUT / 1000}s.\nstderr: ${stderr}`
+        let ready;
+        if (portBusy) {
+            const outcome = await Promise.race([
+                closed,
+                new Promise((resolve) => setTimeout(resolve, BUSY_PORT_GRACE, 'running').unref()),
+            ]);
+            ready = outcome === 'running'
+                && await _waitForPort('127.0.0.1', this._proxyPort, STARTUP_TIMEOUT - BUSY_PORT_GRACE);
+        } else {
+            ready = await Promise.race([
+                _waitForPort('127.0.0.1', this._proxyPort, STARTUP_TIMEOUT),
+                closed.then(() => false),
+            ]);
+        }
+        // The port answering only counts if our child is the one alive behind it.
+        const settle = spawnedAt + READY_SETTLE - Date.now();
+        if (ready && settle > 0) {
+            await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, settle).unref())]);
+        }
+        if (!ready || !alive()) {
+            if (alive()) {
+                proc.kill();
+                proc.stderr.removeListener('data', onData);
+                throw new Error(
+                    `Gold Lapel failed to start on port ${this._proxyPort} ` +
+                    `within ${STARTUP_TIMEOUT / 1000}s.\nstderr: ${stderr.slice(-STDERR_TAIL)}`
+                );
+            }
+            await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 1000).unref())]);
+            const status = proc.signalCode ? `signal ${proc.signalCode}`
+                : proc.exitCode !== null ? `code ${proc.exitCode}` : `could not run ${binary}`;
+            const err = new Error(
+                `Gold Lapel exited (${status}) before it was ready on port ` +
+                `${this._proxyPort}.\nstderr: ${stderr.trim().slice(-STDERR_TAIL)}`
             );
+            err.portInUse = /is already in use/.test(stderr);
+            throw err;
         }
 
-        this._process.stderr.removeListener('data', onData);
+        proc.stderr.removeListener('data', onData);
+        proxy.proxyUrl = _makeProxyUrl(this._upstream, this._proxyPort, this._clientTls());
+    }
 
-        this._proxyUrl = _makeProxyUrl(this._upstream, this._proxyPort);
+    // Whether this proxy serves TLS to clients itself (given a certificate),
+    // in which case the app's URL keeps its TLS parameters.
+    _clientTls() {
+        return !!this._config.tlsCert
+            || this._extraArgs.some(a => a === '--tls-cert' || String(a).startsWith('--tls-cert='));
+    }
+
+    _attach(proxy) {
+        this._proxy = proxy;
+        this._process = proxy.process;
+        this._proxyPort = proxy.proxyPort;
+        this._dashboardPort = proxy.dashboardPort;
+        this._dashboardToken = proxy.dashboardToken;
+        this._proxyUrl = proxy.proxyUrl;
+    }
+
+    // Detach from the proxy; the last holder out stops it.
+    _release() {
+        const proxy = this._proxy;
+        const proc = this._process;
+        this._proxy = null;
+        this._process = null;
+        this._proxyUrl = null;
+        this._dashboardToken = null;
+        if (proxy) _dropHolder(proxy, this);
+        else _terminate(proc);
     }
 
     async _openDefaultConn() {
@@ -666,8 +1021,6 @@ export class GoldLapel {
         if (this._stopped) return;
         this._stopped = true;
 
-        _liveInstances.delete(this);
-
         // Drop any cached DDL patterns — they're tied to the proxy we're
         // about to kill.
         try {
@@ -682,18 +1035,7 @@ export class GoldLapel {
             try { await close(); } catch {}
         }
 
-        const proc = this._process;
-        this._process = null;
-        this._proxyUrl = null;
-        this._dashboardToken = null;
-        if (proc && proc.exitCode === null) {
-            proc.kill('SIGTERM');
-            setTimeout(() => {
-                if (proc.exitCode === null) {
-                    proc.kill('SIGKILL');
-                }
-            }, 5000);
-        }
+        this._release();
     }
 
     async [Symbol.asyncDispose]() {
@@ -731,11 +1073,11 @@ export class GoldLapel {
     }
 
     get running() {
-        return this._process !== null && this._process.exitCode === null;
+        return this._process !== null && _alive(this._process);
     }
 
     get dashboardUrl() {
-        if (this._dashboardPort && this._process && this._process.exitCode === null) {
+        if (this._dashboardPort && this.running) {
             return `http://127.0.0.1:${this._dashboardPort}`;
         }
         return null;
@@ -849,8 +1191,12 @@ function _call(gl, fn, args) {
  *
  * @param {string} upstream  Postgres connection string (upstream database).
  * @param {object} [opts]
- * @param {number} [opts.proxyPort=7932]  Proxy listen port.
- * @param {number} [opts.dashboardPort]  Dashboard port. Defaults to `proxyPort + 1` (7933 when `proxyPort` is the 7932 default). `0` disables.
+ * A second start() for an upstream this process is already running shares
+ * that proxy (each returned instance stops independently; the proxy stops
+ * with the last one). Unknown options throw.
+ *
+ * @param {number} [opts.proxyPort]  Proxy listen port. Default: 7932, or for further upstreams the next port whose pair (proxy + dashboard) is free — 7934, 7936, ….
+ * @param {number} [opts.dashboardPort]  Dashboard port. Defaults to `proxyPort + 1`. `0` disables.
  * @param {'trace'|'debug'|'info'|'warn'|'error'} [opts.logLevel]  Binary log level.
  * @param {string} [opts.mode]  Operating mode (`waiter`, `consideration`, etc).
  * @param {string} [opts.license]  Path to the license file.
@@ -869,12 +1215,6 @@ function _call(gl, fn, args) {
  */
 export async function start(upstream, opts = {}) {
     const gl = new GoldLapel(upstream, opts);
-    _liveInstances.add(gl);
-    if (!_cleanupRegistered) {
-        process.on('exit', _cleanup);
-        _cleanupRegistered = true;
-    }
-
     try {
         await gl._spawn();
         await gl._openDefaultConn();
@@ -927,7 +1267,7 @@ export {
 //   import * as goldlapel from 'goldlapel';
 // Every name available as a named export is also reachable via the default.
 export default {
-    GoldLapel, start, configKeys, _configToArgs, _logLevelToVerboseFlag,
+    GoldLapel, start, configKeys, startOptionKeys, _configToArgs, _logLevelToVerboseFlag,
     DocumentsAPI, StreamsAPI,
     CountersAPI, ZsetsAPI, HashesAPI, QueuesAPI, GeosAPI,
     publish, subscribe,

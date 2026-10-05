@@ -55,7 +55,7 @@ describe('withGoldLapel', () => {
 
         assert.strictEqual(calls.length, 1)
         assert.strictEqual(calls[0].upstream, 'postgresql://user:pass@host:5432/mydb')
-        assert.deepStrictEqual(calls[0].opts, { config: undefined, proxyPort: undefined, extraArgs: undefined, noConnect: true })
+        assert.deepStrictEqual(calls[0].opts, { noConnect: true })
         assert(client instanceof MockPrismaClient)
         assert.strictEqual(client._opts.datasources.db.url, 'postgresql://user:pass@localhost:7932/mydb')
         assert.strictEqual(process.env.DATABASE_URL, 'postgresql://user:pass@localhost:7932/mydb')
@@ -282,4 +282,52 @@ describe('re-exports', () => {
             assert.strictEqual(plugin[name], undefined, `${name} should not be re-exported`)
         }
     })
+})
+
+
+describe('goldlapel options', () => {
+    const origUrl = process.env.DATABASE_URL
+
+    beforeEach(() => {
+        process.env.DATABASE_URL = 'postgresql://user:pass@host:5432/mydb'
+    })
+
+    afterEach(() => {
+        if (origUrl !== undefined) {
+            process.env.DATABASE_URL = origUrl
+        } else {
+            delete process.env.DATABASE_URL
+        }
+    })
+
+    // Every start() option, as a caller might set it.
+    const allOptions = {
+        proxyPort: 9000, dashboardPort: 9100, logLevel: 'debug', mode: 'waiter',
+        license: '/etc/gl.pem', client: 'my-app', configFile: 'goldlapel.toml',
+        config: { poolSize: 5 }, extraArgs: ['--verbose'], silent: true,
+        mesh: true, meshTag: 'eu', disableProxyCache: true,
+        disableSqloptimize: true, disableAutoIndexes: true,
+    }
+
+    it('covers every start() option', async () => {
+        const { startOptionKeys } = await import('goldlapel')
+        const keys = new Set(Object.keys(allOptions))
+        keys.add('noConnect')
+        assert.deepStrictEqual([...keys].sort(), [...startOptionKeys()].sort())
+    })
+
+    for (const [name, fn] of [['withGoldLapel', withGoldLapel], ['init', init]]) {
+        it(`${name} forwards every start() option as given`, async () => {
+            const { _start, calls } = mockStart('postgresql://user:pass@localhost:9000/mydb')
+            await fn({ ...allOptions, _start, _PrismaClient: MockPrismaClient })
+            assert.deepStrictEqual(calls[0].opts, { ...allOptions, noConnect: true })
+        })
+
+        it(`${name} rejects options start() removed, naming why`, async () => {
+            await assert.rejects(
+                () => fn({ invalidationPort: 7934, _PrismaClient: MockPrismaClient }),
+                /Unknown options: invalidationPort \(removed with the in-process cache/,
+            )
+        })
+    }
 })

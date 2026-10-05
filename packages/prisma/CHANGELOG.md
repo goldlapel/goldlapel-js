@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+**Every `goldlapel` start option is forwarded.** Besides `proxyPort`,
+`config` and `extraArgs`, the plugin now passes `dashboardPort`, `logLevel`,
+`mode`, `license`, `client`, `configFile`, `silent`, `mesh`, `meshTag` and
+the `disable*` switches through to `start()` as given (and `proxyPort` only
+when you set one, so several databases get their own ports). Unknown and
+removed options are an error, from `start()`.
+
 **The in-process cache is gone.** `cacheExtension()` and the
 `NativeCache` re-export are removed, and `withGoldLapel()` no longer takes
 `invalidationPort`. `withGoldLapel()` returns a plain `PrismaClient`

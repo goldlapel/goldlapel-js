@@ -440,7 +440,7 @@ describe('silent option', () => {
     });
 
     it('_printBanner includes dashboard URL when dashboardPort is set', async () => {
-        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { port: 7932, dashboardPort: 7933 });
+        const gl = new GoldLapel('postgresql://localhost:5432/mydb', { proxyPort: 7932, dashboardPort: 7933 });
         const { stdout, stderr } = await captureStreams(() => gl._printBanner());
         assert.strictEqual(stdout, '');
         assert.match(stderr, /:7932 \(proxy\)/);
