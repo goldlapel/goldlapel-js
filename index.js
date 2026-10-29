@@ -84,7 +84,7 @@ export function _applicationNameMarker() {
 // raises at argv build time.
 const VALID_CONFIG_KEYS = new Set([
     'minPatternCount', 'deepPaginationThreshold',
-    'reportIntervalSecs', 'proxyCacheSize', 'batchCacheSize',
+    'reportIntervalSecs', 'proxyCacheSize', 'proxyCacheMaxBytes', 'proxyCacheMaxEntryBytes', 'batchCacheSize',
     'batchCacheTtlSecs', 'poolSize', 'poolTimeoutSecs',
     'poolMode', 'mgmtIdleTimeout', 'fallback', 'readAfterWriteSecs',
     'n1Threshold', 'n1WindowMs', 'n1CrossThreshold',
